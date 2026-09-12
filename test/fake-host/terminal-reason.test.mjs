@@ -368,9 +368,24 @@ const ROWS = [
   },
 ];
 
+/**
+ * The generated case name for one row.
+ *
+ * Extracted into a function, and the resulting list exported as `names` below, so that the
+ * requirement-to-test gate (`test/unit/matrix-gate.test.mjs`) can resolve a citation of one of these
+ * cases WITHOUT re-deriving it from this template. That matters: the gate first tried to predict
+ * these names from the template text and got it wrong in several ways, and the alternative — a
+ * second implementation of this naming scheme living in the gate — would let the documentation and
+ * the tests drift apart while both kept looking consistent.
+ * @param {{ path: string, reason: string }} row one table row
+ * @returns {string} the case name that row's suite is registered under
+ */
+const caseNameFor = (row) =>
+  `FR-EXEC-3 ${row.path}: the terminal reason is '${row.reason}', with the operation and turn facts under it`;
+
 /** One suite per row, generated from the table above. */
 const rowSuites = Object.fromEntries(ROWS.map((row) => [
-  `FR-EXEC-3 ${row.path}: the terminal reason is '${row.reason}', with the operation and turn facts under it`,
+  caseNameFor(row),
   async () => {
     const ctx = await rig(row.path, row.autoTurn);
     try {
@@ -386,6 +401,10 @@ const rowSuites = Object.fromEntries(ROWS.map((row) => [
 ]));
 
 export default {
+  // The generated names, declared so a documentation citation resolves against an authoritative list
+  // rather than against the gate's guess at how this file builds them. `$` marks it as metadata; the
+  // runner skips such keys instead of trying to run them.
+  $names: ROWS.map(caseNameFor),
   ...rowSuites,
 
   'FR-EXEC-3 the set of terminal reasons is closed, and no two paths share a reason': async () => {

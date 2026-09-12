@@ -176,7 +176,7 @@ numbering. Test ids are `<layer>/<file>::<case name>` — exactly what the runne
 | FR-MCP-5 | P1 | partial | `mcp-e2e/stdio::the gateway fails closed and stays silent on stdout when the daemon is absent` (diagnostic on stderr, no stdout noise); `unit/core::the daemon refuses to start when the state directory is already owned` (exit 4, `OWNER_HELD`); `src/bin/dsh-pilot-daemon.ts` guards a real-state-dir target and exits 3 | Two startup failures fail closed. **Not covered:** an unwritable state directory (`EACCES`) is not exercised, and an unreachable Host is deliberately **not** a startup failure — the daemon runs with `connection != ready`, so "host reachability fails closed" is not a property of this build. |
 | FR-MCP-6 | P2 | partial | `mcp-e2e/stdio::cancelling a wait does not cancel the turn, and the server keeps serving` (a `notifications/cancelled` is sent for a wait request; the turn is still `running` afterwards; the gateway keeps serving with `rejectedToolCalls === 0`) | Cancelling a caller's wait is not cancelling work, and the server stays healthy. **Not covered:** an in-flight wait is not interrupted early — the gateway records the cancelled id and answers `-32800` only when a request carrying that id arrives — and no progress notifications are emitted. |
 | FR-SEC-1 | P0 | measured | `fake-host/contract::concurrent sessions: 8 sessions run 3 rounds each with per-session isolation`; `property/model::generated event streams: stored sequences and gap conclusions match an independent model` (every stored event's `sessionId` must be the session asked for); `isolated-host/turns::two sessions on one real Host stay isolated…`; `live/live::three real sessions recall only their own planted fact`; `live/live::sessions run in parallel at widths 2, 4 and 8 without cross-contamination` | No marker or event crosses a session boundary, on the fixture, on a real Host, and against a real model. |
-| FR-SEC-2 | P0 | partial | `security/bounds::IPC is a local socket with 0600 permissions, not a network listener`; `security/bounds::the daemon refuses to bind anything on a TCP port` (`lsof -a -iTCP -sTCP:LISTEN` for the daemon's pid finds no listener); `isolated-host/host::an isolated Host boots on an OS-assigned port, in its own home` (the home is inside the test's scratch dir; never `:3080`) | The daemon exposes exactly one endpoint, the socket file, and the real Host is never the operator's. **Not covered:** there is no audit of the write paths recorded by the whole suite against the allowed roots, and the `~/.dsh` / `~/.local/state` refusal (`src/lib/config.ts`) is a startup guard with no test asserting a refused attempt. |
+| FR-SEC-2 | P0 | partial | `security/bounds::IPC is a local socket with 0600 permissions, not a network listener`; `security/bounds::the daemon refuses to bind anything on a TCP port` (`lsof -a -iTCP -sTCP:LISTEN` for the daemon's pid finds no listener); `isolated-host/host::an isolated Host boots on an OS-assigned port, in its own home, and answers host.describe` (the home is inside the test's scratch dir; never `:3080`) | The daemon exposes exactly one endpoint, the socket file, and the real Host is never the operator's. **Not covered:** there is no audit of the write paths recorded by the whole suite against the allowed roots, and the `~/.dsh` / `~/.local/state` refusal (`src/lib/config.ts`) is a startup guard with no test asserting a refused attempt. |
 | FR-SEC-3 | P0 | partial | `security/bounds::state directory contents contain no credential values, only references` (scans the durable database and the raw file for credential-shaped markers and key-shaped literals); `security/bounds::the authority token is never readable through the IPC surface`; `persistence/crash::state directory permissions: the authority token is private to the operator account` (mode `0600`, directory not group/world accessible); CI's `package-shape` job (credential-shaped literals and internal endpoints in tracked files); the live layer resolves a credential by environment-variable **name** and never reads the value back (`test/live/live-route.mjs`) | Durable state and the token are measured clean, and no value is ever committed. **Not covered:** no synthetic sentinel is planted in config/env/host responses and traced through logs, error messages and tool results, so "never in logs or errors" rests on those scans plus code inspection rather than on a test of that path. |
 | FR-SEC-4 | P1 | not-implemented | — | No symlink or workspace-escape handling exists, and no test attempts one. `cwd` is recorded and replayed; it is not resolved or bounded. |
 | FR-SEC-5 | P1 | partial | `security/bounds::an event page is bounded by the configured maximum…`; `security/bounds::an oversized event frame is refused as oversize rather than buffered`; `security/bounds::host error details are bounded before they reach a caller`; `security/bounds::a hostile IPC line is refused without taking the daemon down` (a > 4 MiB line closes the connection and the daemon keeps serving); mutation `host-error-text-unbounded` (production) | Each declared bound is enforced at a real boundary. **Not covered:** no long randomized run asserts memory or per-session retention growth, or counters agreeing with observed growth. |
@@ -390,15 +390,31 @@ The seeded property layer prints its seed on every run, e.g.
 
 ### 7.2 The requirement-to-test mapping is enforced, not maintained
 
-`test/unit/matrix-gate.test.mjs` reads `docs/requirements.md` and this document and cross-checks them
-in both directions: every P0/P1 requirement must have a row, every row must name a real requirement
-the two documents must agree on its priority, and — the part that matters — **every test id cited by a
-row claiming `measured` must resolve to a real case under `test/`**. A citation naming a deleted or
-renamed test fails the build rather than keeping its claim forever. The gate has already caught one:
-`FR-EV2-2` claimed `measured` while citing no test id at all, and the row was corrected rather than
-the rule relaxed. Abbreviated citations are allowed only when the abbreviation is a unique prefix of
-exactly one real case name in that file; an ambiguous abbreviation is refused rather than guessed at,
-and the gate's own refusals are themselves tested (five negative cases plus two positive controls).
+`test/unit/matrix-gate.test.mjs` cross-checks `docs/requirements.md`, this document and
+`docs/architecture.md` **in both directions**:
+
+- every P0/P1 requirement must have a row, every row must name a real requirement, and the two
+  documents must agree on its priority;
+- **every citation in every audited document must resolve to a real case under `test/`** — 142 of them
+  at the time of writing. A citation naming a deleted or renamed test fails the build rather than
+  keeping its claim forever;
+- a row may only claim `measured` when it cites at least one id and every id resolves.
+
+The gate has already earned its keep. It caught `FR-EV2-2` claiming `measured` while citing no test id
+at all, and it caught 14 further citations in rows the `measured`-only check did not cover. Both were
+corrected; the rule was not relaxed.
+
+Abbreviated citations are allowed only when the abbreviation is a unique prefix of exactly one real
+case name in that file, and an ambiguous abbreviation is refused rather than guessed at. For a suite
+whose cases are **generated at runtime**, the gate reads the names the suite declares (`$names`,
+skipped by the runner as metadata) by importing the module — not by predicting them from the
+generator's template text. That distinction is the whole point: predicting a generated name is a
+second implementation of the generator, and this gate's first two attempts at it were both wrong,
+once reporting four real citations as naming nothing. Importing cannot disagree with the suite.
+
+The gate's own refusals are tested too — five negative cases, three positive controls, and a check
+that a corrupted generated name is refused while the real one resolves — because a resolver that
+cannot say no is decoration.
 
 ---
 

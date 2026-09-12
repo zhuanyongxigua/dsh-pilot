@@ -94,6 +94,12 @@ for (const layer of layers) {
       root: resolve('.'),
     };
     for (const [suiteName, run] of Object.entries(suites)) {
+      // A suite may declare metadata instead of a case. `$names` is the one such key today: a suite
+      // whose cases are generated at runtime lists the names it will register, so that a document
+      // citing one of them can be checked against a declared name rather than against a guess at how
+      // the suite builds it. Skipping is explicit and keyed on the `$` prefix, so a real case whose
+      // name happens to start with `$` is impossible to write by accident.
+      if (suiteName.startsWith('$')) continue;
       const caseId = `${id}::${suiteName}`;
       const started = Date.now();
       try {
