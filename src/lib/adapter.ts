@@ -143,6 +143,20 @@ export interface ServerResponseEnvelope {
   };
 }
 
+/**
+ * The action `session.updateQueue` applies to ONE pending inbox occurrence.
+ *
+ * Pinned to the Host's own union rather than accepted as an opaque `object`: the action is a
+ * closed three-arm union on the wire (`edit` carrying replacement content, `remove`, `steer`),
+ * and an open `object` here would let a caller send an arm the Host has no branch for while the
+ * type checker stayed silent. Written out rather than imported, because this project takes no
+ * dependency on the Host's packages (see AGENTS.md section 4).
+ */
+export type QueueAction =
+  | { readonly kind: 'edit'; readonly content: readonly object[] }
+  | { readonly kind: 'remove' }
+  | { readonly kind: 'steer' };
+
 /** The carrier receipt `/api/respond` answers with: the answer was taken, or why it was not. */
 export interface RespondReceipt {
   readonly accepted?: boolean;
@@ -489,12 +503,15 @@ export class DshHostAdapter {
   }): Promise<Result> { return this.call('session.prompt', payload); }
 
   /**
-   * @param payload the queued item and the action to apply to it
+   * @param payload the queued item and the action to apply to it. `sessionId` and `itemId` are the
+   *   Host's own ids: `itemId` is a `MessageId` observed from a `session/queue` frame, which is the
+   *   only place a usable one comes from — queued work is not durable until the Agent claims it, so
+   *   there is no other id to address it by.
    */
   updateQueue(payload: {
     readonly sessionId: string;
     readonly itemId: string;
-    readonly action: object;
+    readonly action: QueueAction;
   }): Promise<Result> { return this.call('session.updateQueue', payload); }
 
   /** @param payload the session whose active turn is cancelled */
@@ -525,15 +542,56 @@ export class DshHostAdapter {
 }
 
 /**
- * Bound and clean a peer-supplied string before it enters our own error surface.
+ * Credential shapes as they appear in TEXT a peer hands us: a provider token, an authorization
+ * header, a `key=value` assignment, or a bare JWT. Deliberately shape-based and deliberately
+ * narrow: this redacts material that is recognisably a credential and leaves ordinary diagnostic
+ * prose intact, because an error that has been scrubbed into uselessness is a second bug.
+ */
+const CREDENTIAL_SHAPES: readonly RegExp[] = [
+  // Provider-style tokens, including the sentinel shape the security suite plants. The longest
+  // forms are tried first so `sk-ant-...` is consumed as a whole rather than leaving its tail.
+  /\bsk-[A-Za-z0-9_-]{12,}/g,
+  /\b(?:gh[pousr]|glpat|xox[baprs])-[A-Za-z0-9_-]{12,}/g,
+  /\bBearer\s+[A-Za-z0-9._~+/-]{12,}=*/gi,
+  // A `key=value` or `"key": "value"` pair whose NAME says it is a credential.
+  /((?:api[-_]?key|auth[-_]?token|access[-_]?token|client[-_]?secret|password|passwd|secret)["']?\s*[:=]\s*["']?)[^\s"',;}]{8,}/gi,
+  // A bare JWT: three base64url segments, the first of which decodes to a JSON header.
+  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g,
+];
+
+/** What replaces redacted material. Named so a reader of a log can tell a redaction from a blank. */
+const REDACTION = '[redacted:credential]';
+
+/**
+ * Remove credential-shaped material from peer-supplied text.
+ *
+ * Why this exists: the Host, and anything behind it, authors text that this bridge copies into its
+ * own error surface and its own outbox. That text can quote a provider token — a failed
+ * authorization is exactly the situation in which a token gets echoed — so the copy is a leak that
+ * this project would be performing itself, not one it merely failed to prevent. FR-SEC-3 says a
+ * secret never appears in state, logs or errors, so the copy is redacted at the boundary.
+ * @param text the peer's text
+ * @returns the text with credential-shaped runs replaced
+ */
+export function redactCredentials(text: string): string {
+  let out = text;
+  for (const shape of CREDENTIAL_SHAPES) out = out.replace(shape, REDACTION);
+  return out;
+}
+
+/**
+ * Bound, clean and REDACT a peer-supplied string before it enters our own error surface.
  * @param value the peer's value, of any type
  * @param max the longest string to keep
- * @returns the cleaned, bounded string
+ * @returns the cleaned, bounded, redacted string
  */
 export function boundText(value: unknown, max = 400): string {
   const text = typeof value === 'string' ? value : String(value);
   const cleaned = text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '');
-  return cleaned.length > max ? `${cleaned.slice(0, max)}…[truncated ${cleaned.length - max} chars]` : cleaned;
+  // Redact BEFORE truncating, and the order is load-bearing: truncating first can cut a credential
+  // in half, and half a credential is still a leak of the half that survived.
+  const redacted = redactCredentials(cleaned);
+  return redacted.length > max ? `${redacted.slice(0, max)}…[truncated ${redacted.length - max} chars]` : redacted;
 }
 
 /**

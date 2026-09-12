@@ -193,9 +193,13 @@ const MUTATIONS = [
     protects: 'bounded output: a peer cannot make our error surface arbitrarily large',
     why: 'Removing the bound lets a Host error message of any size flow into a tool result, an operator log and the durable operation record, which is a memory and log-growth path an untrusted peer controls (a ~200 KB message was observed in practice).',
     file: 'src/lib/adapter.ts',
-    find: `  return cleaned.length > max ? \`\${cleaned.slice(0, max)}…[truncated \${cleaned.length - max} chars]\` : cleaned;`,
+    // ANCHOR RETARGETED, not a changed control. `boundText` now redacts credentials before it
+    // truncates, so the returned value is `redacted` rather than `cleaned`. The defect this control
+    // injects is unchanged — the bound is still what is removed — and the replacement returns
+    // `redacted` so that removing the bound is still the ONLY defect under test.
+    find: `  return redacted.length > max ? \`\${redacted.slice(0, max)}…[truncated \${redacted.length - max} chars]\` : redacted;`,
     replace: `  // MUTATION: no bound is applied, so a peer's size becomes our size.
-  return cleaned;`,
+  return redacted;`,
     target: 'test/security',
     expectFailure: 'bounded',
   },

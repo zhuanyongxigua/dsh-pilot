@@ -426,11 +426,368 @@ export default {
     }
   },
 
+  // ---------------------------------------------------------------------------------------------
+  // FR-CANCEL-1: turn cancellation and queue cancellation are separate operations with separate
+  // effects and separate reports.
+  //
+  // The oracle for the whole group is the Host's own `session/queue` snapshot: pending inbox work
+  // is not durable, so a queued occurrence exists only for as long as the authoritative snapshot
+  // says it does. Every case below therefore checks BOTH sides — what the fixture's queue holds
+  // (the effect) and what the bridge reports it observed (the report) — because a test that read
+  // only the report would pass on a bridge that reported without acting, and a test that read only
+  // the fixture would pass on a bridge that acted without reporting.
+  // ---------------------------------------------------------------------------------------------
+
+  'FR-CANCEL-1: cancelling the turn stops it and leaves the queued items reported as remaining': async () => {
+    // `autoTurn` stays ON here on purpose: this case needs the fixture to answer a cancel the way
+    // the Host does, with an authoritative `turn/end`, because the oracle is "the turn really
+    // stopped AND the queue really did not change". With the fixture's scripted turn ended, the
+    // two effects can be observed against the same session.
+    const { host, ipc, daemon, teardown } = await rig();
+    try {
+      const { taskId, sessionId, hostSessionId } = await newSession(ipc, 'queue-scope-turn');
+      await waitFor(async () => (await daemonStatus(daemon)) === 'ready', { timeoutMs: 5000, what: 'mux ready' });
+      host.emitTurnStart(hostSessionId);
+      await waitFor(async () => {
+        const st = await ipc.request({ op: 'session.state', taskId, sessionId });
+        return st.execution.state === 'running';
+      }, { timeoutMs: 5000, what: 'turn open' });
+      // Two pending occurrences, observed only through the authoritative snapshot.
+      const first = host.enqueue(hostSessionId, { text: 'queued one' });
+      const second = host.enqueue(hostSessionId, { text: 'queued two' });
+      await waitFor(async () => observedQueue(await ipc.request({
+        op: 'session.state', taskId, sessionId,
+      })).length === 2, { timeoutMs: 5000, what: 'both queue items observed' });
+
+      // SCOPE 1 — the turn.
+      const cancelled = await ipc.request({ op: 'session.cancel', taskId, sessionId, clientKey: 'turn-only' });
+      assert.equal(cancelled.operation.state, 'succeeded');
+      assert.equal(cancelled.target.scope, 'local-open-turn');
+      await waitFor(async () => {
+        const st = await ipc.request({ op: 'session.state', taskId, sessionId });
+        return st.execution.state === 'idle';
+      }, { timeoutMs: 5000, what: 'turn closed by the authoritative cancelled turn/end' });
+
+      // SCOPE 2 — untouched, and reported as remaining rather than assumed away.
+      const state = await ipc.request({ op: 'session.state', taskId, sessionId });
+      assert.deepEqual(
+        observedQueue(state).map((item) => item.itemId).sort(),
+        [first.id, second.id].sort(),
+        'a turn cancellation must preserve pending inbox work and report it as remaining',
+      );
+      assert.deepEqual(observedQueue(state).map((item) => item.placement), ['queued', 'queued']);
+      assert.equal(state.queue.remoteObserved, true);
+      // The effect on the Host's own queue: still two.
+      assert.deepEqual(host.queueItems(hostSessionId).map((item) => item.id).sort(), [first.id, second.id].sort());
+      // And the cancel path never touched the queue on the wire: the two scopes are separate
+      // operations, so this one must not have quietly done the other's work.
+      assert.equal(host.requestsFor('session.updateQueue').length, 0, 'cancelling a turn must not remove queued work');
+      assert.equal(host.queueMutations.length, 0);
+    } finally {
+      await teardown();
+    }
+  },
+
+  'FR-CANCEL-1: a removal bound to the observed snapshot makes the item disappear from it': async () => {
+    const { host, ipc, daemon, teardown } = await rig({ autoTurn: false });
+    try {
+      const { taskId, sessionId, hostSessionId } = await newSession(ipc, 'queue-remove');
+      await waitFor(async () => (await daemonStatus(daemon)) === 'ready', { timeoutMs: 5000, what: 'mux ready' });
+      const keep = host.enqueue(hostSessionId, { text: 'stays' });
+      const drop = host.enqueue(hostSessionId, { text: 'goes' });
+      await waitFor(async () => observedQueue(await ipc.request({
+        op: 'session.state', taskId, sessionId,
+      })).length === 2, { timeoutMs: 5000, what: 'both queue items observed' });
+
+      const cleared = await ipc.request({ op: 'queue.clear', taskId, sessionId, itemIds: [drop.id] });
+      assert.equal(cleared.localScope, 'daemon');
+      assert.equal(cleared.remoteScope.status, 'cleared', JSON.stringify(cleared.remoteScope));
+      assert.equal(cleared.remoteScope.cleared, true);
+      assert.equal(cleared.remoteScope.requested, 1);
+      assert.equal(cleared.remoteScope.removedCount, 1, 'the report states how many items were actually removed');
+      assert.deepEqual(cleared.remoteScope.removed, [drop.id]);
+      assert.deepEqual(cleared.remoteScope.refused, []);
+      assert.deepEqual(cleared.remoteScope.uncertain, []);
+      // What the binding was checked against: the snapshot the daemon actually held.
+      assert.deepEqual(
+        cleared.remoteScope.observed.map((item) => item.itemId).sort(),
+        [keep.id, drop.id].sort(),
+      );
+      // The turn scope is reported, and reported as unaffected.
+      assert.equal(cleared.turnScope.effect, 'none');
+      assert.equal(cleared.turnScope.observed.state, 'idle');
+
+      // EFFECT 1 — the Host's own queue.
+      assert.deepEqual(host.queueItems(hostSessionId).map((item) => item.id), [keep.id]);
+      // EFFECT 2 — the authoritative snapshot the bridge holds, once the frame has landed.
+      await waitFor(async () => observedQueue(await ipc.request({
+        op: 'session.state', taskId, sessionId,
+      })).map((item) => item.itemId).join(',') === keep.id,
+      { timeoutMs: 5000, what: 'the removed item to disappear from the observed queue snapshot' });
+
+      // Exactly one request, addressed the way the contract says: the observed item id, on the
+      // current session's HOST id, with the `remove` action.
+      const sent = host.requestsFor('session.updateQueue');
+      assert.equal(sent.length, 1);
+      assert.equal(sent[0].payload.sessionId, hostSessionId);
+      assert.equal(sent[0].payload.itemId, drop.id);
+      assert.deepEqual(sent[0].payload.action, { kind: 'remove' });
+    } finally {
+      await teardown();
+    }
+  },
+
+  'FR-CANCEL-1: a removal is bound to the current session and leaves a sibling session alone': async () => {
+    const { host, ipc, daemon, teardown } = await rig({ autoTurn: false });
+    try {
+      const a = await newSession(ipc, 'iso-a');
+      const b = await newSession(ipc, 'iso-b');
+      await waitFor(async () => (await daemonStatus(daemon)) === 'ready', { timeoutMs: 5000, what: 'mux ready' });
+      const itemA = host.enqueue(a.hostSessionId, { text: 'belongs to A' });
+      const itemB = host.enqueue(b.hostSessionId, { text: 'belongs to B' });
+      await waitFor(async () => observedQueue(await ipc.request({
+        op: 'session.state', taskId: a.taskId, sessionId: a.sessionId,
+      })).length === 1 && observedQueue(await ipc.request({
+        op: 'session.state', taskId: b.taskId, sessionId: b.sessionId,
+      })).length === 1, { timeoutMs: 5000, what: 'both sessions observed their own item' });
+
+      // B's item id, asked for THROUGH A. An id observed for another session is not observed for
+      // this one, so the binding refuses it and nothing reaches the wire.
+      const crossSession = await ipc.request({
+        op: 'queue.clear', taskId: a.taskId, sessionId: a.sessionId, itemIds: [itemB.id],
+      });
+      assert.equal(crossSession.remoteScope.status, 'refused', JSON.stringify(crossSession.remoteScope));
+      assert.equal(crossSession.remoteScope.cleared, false);
+      assert.deepEqual(crossSession.remoteScope.removed, []);
+      assert.equal(crossSession.remoteScope.refused[0].code, 'queue-item-not-found');
+      assert.equal(host.requestsFor('session.updateQueue').length, 0, 'a cross-session id must not be sent');
+      assert.deepEqual(host.queueItems(b.hostSessionId).map((item) => item.id), [itemB.id],
+        "session B's queue must be untouched by a request made for session A");
+
+      // A's own item, through A: removed, and B is still untouched.
+      const own = await ipc.request({
+        op: 'queue.clear', taskId: a.taskId, sessionId: a.sessionId, itemIds: [itemA.id],
+      });
+      assert.equal(own.remoteScope.status, 'cleared');
+      assert.deepEqual(own.remoteScope.removed, [itemA.id]);
+      assert.deepEqual(host.queueItems(a.hostSessionId), []);
+      assert.deepEqual(host.queueItems(b.hostSessionId).map((item) => item.id), [itemB.id],
+        "session B's queue must be untouched by a removal performed for session A");
+      // B still observes its own item, so the isolation holds on the bridge side too.
+      const bState = await ipc.request({ op: 'session.state', taskId: b.taskId, sessionId: b.sessionId });
+      assert.deepEqual(observedQueue(bState).map((item) => item.itemId), [itemB.id]);
+      assert.equal(host.requestsFor('session.updateQueue').length, 1);
+      assert.equal(host.requestsFor('session.updateQueue')[0].payload.sessionId, a.hostSessionId);
+    } finally {
+      await teardown();
+    }
+  },
+
+  'FR-CANCEL-1: a repeated removal is refused with queue-item-not-found, never reported as a success': async () => {
+    const { host, ipc, daemon, teardown } = await rig({ autoTurn: false });
+    try {
+      const { taskId, sessionId, hostSessionId } = await newSession(ipc, 'queue-duplicate');
+      await waitFor(async () => (await daemonStatus(daemon)) === 'ready', { timeoutMs: 5000, what: 'mux ready' });
+      const item = host.enqueue(hostSessionId, { text: 'removed exactly once' });
+      await waitFor(async () => observedQueue(await ipc.request({
+        op: 'session.state', taskId, sessionId,
+      })).length === 1, { timeoutMs: 5000, what: 'the item observed' });
+
+      const first = await ipc.request({ op: 'queue.clear', taskId, sessionId, itemIds: [item.id] });
+      assert.equal(first.remoteScope.status, 'cleared');
+      assert.deepEqual(first.remoteScope.removed, [item.id]);
+
+      // Wait for the authoritative snapshot to agree, so the repeat below is judged against what
+      // the daemon has actually observed rather than against a frame that is still in flight.
+      await waitFor(async () => observedQueue(await ipc.request({
+        op: 'session.state', taskId, sessionId,
+      })).length === 0, { timeoutMs: 5000, what: 'the snapshot to show the removal' });
+
+      // (a) The item is no longer in the observed snapshot, so the second request is refused by the
+      // binding and is NOT sent.
+      const repeat = await ipc.request({ op: 'queue.clear', taskId, sessionId, itemIds: [item.id] });
+      assert.equal(repeat.remoteScope.status, 'refused', JSON.stringify(repeat.remoteScope));
+      assert.equal(repeat.remoteScope.cleared, false);
+      assert.deepEqual(repeat.remoteScope.removed, [], 'a refusal must never be reported as a removal');
+      assert.equal(repeat.remoteScope.refused.length, 1);
+      assert.equal(repeat.remoteScope.refused[0].code, 'queue-item-not-found',
+        'the refusal must surface its own code rather than collapsing into a generic failure');
+      assert.equal(repeat.remoteScope.refused[0].itemId, item.id);
+      assert.equal(repeat.remoteScope.refused[0].sent, false);
+      assert.equal(host.requestsFor('session.updateQueue').length, 1,
+        'a second send is exactly the duplicate this binding exists to prevent');
+
+      // (b) The HOST's own answer for the same refusal is reachable whenever the snapshot frame has
+      // not been delivered yet, which is a real ordering on the wire (the reply rides HTTP, the
+      // snapshot rides the WebSocket). Delivery is held explicitly rather than slept on.
+      const second = host.enqueue(hostSessionId, { text: 'removed twice' });
+      await waitFor(async () => observedQueue(await ipc.request({
+        op: 'session.state', taskId, sessionId,
+      })).length === 1, { timeoutMs: 5000, what: 'the second item observed' });
+      host.holdQueueSnapshots(hostSessionId);
+      const held = await ipc.request({ op: 'queue.clear', taskId, sessionId, itemIds: [second.id] });
+      assert.equal(held.remoteScope.status, 'cleared');
+      // The daemon still holds the pre-removal snapshot, so this one really is sent to the Host.
+      const again = await ipc.request({ op: 'queue.clear', taskId, sessionId, itemIds: [second.id] });
+      assert.equal(again.remoteScope.status, 'refused', JSON.stringify(again.remoteScope));
+      assert.equal(again.remoteScope.cleared, false);
+      assert.equal(again.remoteScope.refused[0].code, 'queue-item-not-found',
+        "the host's own queue-item-not-found must be surfaced as its own code");
+      assert.equal(again.remoteScope.refused[0].sent, true, 'this refusal came from the Host, not from the binding');
+      assert.equal(host.requestsFor('session.updateQueue').length, 3, 'the second attempt really did reach the wire');
+      assert.deepEqual(host.queueItems(hostSessionId), []);
+      host.releaseQueueSnapshots(hostSessionId);
+      await waitFor(async () => observedQueue(await ipc.request({
+        op: 'session.state', taskId, sessionId,
+      })).length === 0, { timeoutMs: 5000, what: 'the released snapshot to converge' });
+    } finally {
+      await teardown();
+    }
+  },
+
+  'FR-CANCEL-1: an item id that was never observed is refused without being sent upstream': async () => {
+    const { host, ipc, daemon, teardown } = await rig({ autoTurn: false });
+    try {
+      const { taskId, sessionId, hostSessionId } = await newSession(ipc, 'queue-unobserved');
+      await waitFor(async () => (await daemonStatus(daemon)) === 'ready', { timeoutMs: 5000, what: 'mux ready' });
+      const real = host.enqueue(hostSessionId, { text: 'the only item that exists' });
+      await waitFor(async () => observedQueue(await ipc.request({
+        op: 'session.state', taskId, sessionId,
+      })).length === 1, { timeoutMs: 5000, what: 'the real item observed' });
+
+      // An id that no snapshot ever carried: a caller-invented one, not merely a stale one.
+      const invented = 'msg_00000000-0000-4000-8000-000000000000';
+      const refused = await ipc.request({ op: 'queue.clear', taskId, sessionId, itemIds: [invented] });
+      assert.equal(refused.remoteScope.status, 'refused', JSON.stringify(refused.remoteScope));
+      assert.equal(refused.remoteScope.cleared, false);
+      assert.deepEqual(refused.remoteScope.removed, []);
+      assert.equal(refused.remoteScope.refused[0].itemId, invented);
+      assert.equal(refused.remoteScope.refused[0].code, 'queue-item-not-found');
+      assert.equal(refused.remoteScope.refused[0].sent, false);
+      // The fake Host records every request it received, so this is a statement about the wire.
+      assert.equal(
+        host.requestsFor('session.updateQueue').some((row) => row.payload?.itemId === invented),
+        false,
+        'an unobserved id must never be sent upstream',
+      );
+      assert.equal(host.requestsFor('session.updateQueue').length, 0);
+      assert.deepEqual(host.queueItems(hostSessionId).map((item) => item.id), [real.id]);
+
+      // A valid id mixed with an invented one: the valid removal happens, the invented one is
+      // reported as refused, and exactly one request reaches the wire.
+      const mixed = await ipc.request({ op: 'queue.clear', taskId, sessionId, itemIds: [real.id, invented] });
+      assert.equal(mixed.remoteScope.status, 'partial', JSON.stringify(mixed.remoteScope));
+      assert.equal(mixed.remoteScope.cleared, false);
+      assert.deepEqual(mixed.remoteScope.removed, [real.id]);
+      assert.deepEqual(mixed.remoteScope.refused.map((row) => row.itemId), [invented]);
+      const sent = host.requestsFor('session.updateQueue');
+      assert.equal(sent.length, 1);
+      assert.equal(sent[0].payload.itemId, real.id);
+      assert.deepEqual(host.queueItems(hostSessionId), []);
+    } finally {
+      await teardown();
+    }
+  },
+
+  'FR-CANCEL-1: a lost receipt is reported as uncertain and never as removed': async () => {
+    const { host, ipc, daemon, teardown } = await rig({ autoTurn: false });
+    try {
+      const { taskId, sessionId, hostSessionId } = await newSession(ipc, 'queue-uncertain');
+      await waitFor(async () => (await daemonStatus(daemon)) === 'ready', { timeoutMs: 5000, what: 'mux ready' });
+      const item = host.enqueue(hostSessionId, { text: 'may or may not have been removed' });
+      await waitFor(async () => observedQueue(await ipc.request({
+        op: 'session.state', taskId, sessionId,
+      })).length === 1, { timeoutMs: 5000, what: 'the item observed' });
+
+      // The Host applies the removal and the reply is lost: the outcome is unprovable from here.
+      host.dropResponseFor('session.updateQueue');
+      const result = await ipc.request({ op: 'queue.clear', taskId, sessionId, itemIds: [item.id] });
+
+      assert.equal(result.remoteScope.status, 'uncertain', JSON.stringify(result.remoteScope));
+      assert.equal(result.remoteScope.cleared, false);
+      assert.deepEqual(result.remoteScope.removed, [], 'an unproven removal must never be reported as removed');
+      assert.deepEqual(result.remoteScope.refused, []);
+      assert.equal(result.remoteScope.uncertain.length, 1);
+      assert.equal(result.remoteScope.uncertain[0].itemId, item.id);
+      assert.match(result.remoteScope.reason, /outcome unknown/);
+      // The durable record carries the same verdict, so the uncertainty survives the call.
+      assert.equal(result.operations.length, 1);
+      assert.equal(result.operations[0].state, 'uncertain');
+      // The effect really is ambiguous, which is what makes the honest answer "unknown" rather than
+      // either confident direction: the Host DID apply it.
+      assert.deepEqual(host.queueItems(hostSessionId), [], 'the fixture applied the removal, so only "unknown" is true');
+      // And it was not retried behind the caller's back.
+      assert.equal(host.requestsFor('session.updateQueue').length, 1);
+    } finally {
+      await teardown();
+    }
+  },
+
+  'FR-CANCEL-1: a host that cannot be reached is reported as not-sent, not as uncertain': async () => {
+    const { host, ipc, teardown } = await rig({ autoTurn: false });
+    try {
+      const { taskId, sessionId, hostSessionId } = await newSession(ipc, 'queue-unreachable');
+      const item = host.enqueue(hostSessionId, { text: 'never sent anywhere' });
+      await waitFor(async () => observedQueue(await ipc.request({
+        op: 'session.state', taskId, sessionId,
+      })).length === 1, { timeoutMs: 5000, what: 'the item observed' });
+      // The Host is gone, so the request cannot even be written. "We never sent it" is provable,
+      // and must not be reported as the same thing as "we sent it and cannot tell".
+      await host.stop();
+
+      const result = await ipc.request({ op: 'queue.clear', taskId, sessionId, itemIds: [item.id] });
+      assert.equal(result.remoteScope.status, 'refused', JSON.stringify(result.remoteScope));
+      assert.equal(result.remoteScope.cleared, false);
+      assert.deepEqual(result.remoteScope.removed, []);
+      assert.equal(result.remoteScope.refused.length, 1);
+      assert.equal(result.remoteScope.refused[0].sent, false, 'nothing was written to the wire');
+      assert.notEqual(result.remoteScope.refused[0].code, 'queue-item-not-found',
+        'this refusal is a transport failure, not a queue-scope refusal');
+      assert.equal(result.remoteScope.uncertain.length, 0,
+        'a request that was never written is not an unknown outcome');
+      assert.equal(result.operations[0].state, 'refused');
+    } finally {
+      await teardown();
+    }
+  },
+
+  'FR-CANCEL-1: an ok envelope that is not the contract confirmation is not reported as a removal': async () => {
+    const { host, ipc, daemon, teardown } = await rig({ autoTurn: false });
+    try {
+      const { taskId, sessionId, hostSessionId } = await newSession(ipc, 'queue-odd-answer');
+      await waitFor(async () => (await daemonStatus(daemon)) === 'ready', { timeoutMs: 5000, what: 'mux ready' });
+      const item = host.enqueue(hostSessionId, { text: 'the answer will be odd' });
+      await waitFor(async () => observedQueue(await ipc.request({
+        op: 'session.state', taskId, sessionId,
+      })).length === 1, { timeoutMs: 5000, what: 'the item observed' });
+      // The contract's response for this method is `{accepted: true}`. An `ok` envelope carrying
+      // anything else is not that confirmation, so it cannot be read as a completed removal.
+      host.respondWith('session.updateQueue', { accepted: false, reason: 'fixture: not a confirmation' });
+
+      const result = await ipc.request({ op: 'queue.clear', taskId, sessionId, itemIds: [item.id] });
+      assert.equal(result.remoteScope.status, 'uncertain', JSON.stringify(result.remoteScope));
+      assert.equal(result.remoteScope.cleared, false);
+      assert.deepEqual(result.remoteScope.removed, []);
+      assert.equal(result.remoteScope.uncertain[0].reason, 'host-answer-was-not-a-removal-confirmation');
+      // Nothing was removed on the Host either, so "not removed" and "not confirmed" agree here —
+      // the point is that the REPORT does not claim a removal it cannot support.
+      assert.deepEqual(host.queueItems(hostSessionId).map((row) => row.id), [item.id]);
+    } finally {
+      await teardown();
+    }
+  },
+
   'an approval decision requires the operator token and cannot be replayed': async () => {
     const { host, ipc, daemon, teardown } = await rig();
     try {
       const { taskId, hostSessionId } = await newSession(ipc, 'authority');
       const approval = host.emitApprovalRequested(hostSessionId);
+      // The fixture answers `not-pending` for a request it is not holding pending, and since the
+      // bridge now carries answers to the Host, that receipt is what this interaction would get. So
+      // the fixture is told to hold it, which is the honest setup for a test about the DECISION path:
+      // with a request the Host still has, a correct answer is applied AND accepted. (The not-pending
+      // receipt has its own dedicated case in `approval-binding.test.mjs`.)
+      host.markApprovalPending(approval.rpcId);
       await waitFor(async () => {
         const list = await ipc.request({ op: 'interaction.list', taskId });
         return list.interactions.length >= 1;
@@ -460,6 +817,8 @@ export default {
         decision: 'allowed-once', authorityToken: token,
       });
       assert.equal(applied.interaction.state, 'allowed-once');
+      assert.equal(applied.delivered, true, 'the Host held the request, so the answer must be delivered and accepted');
+      assert.equal(applied.receipt, 'accepted');
       // A conflicting second decision is stale, not silently overwritten.
       /** @type {{code?: string}|null} */
       let conflicting = null;
@@ -523,6 +882,19 @@ export default {
     }
   },
 };
+
+/**
+ * The Host queue the bridge last OBSERVED for a session, read off its own reported state.
+ *
+ * This is deliberately the bridge's view rather than the fixture's: the FR-CANCEL-1 cases must show
+ * that the two agree, and reading the fixture's queue for both sides of that comparison would make
+ * the agreement vacuous.
+ * @param {object} state the reply of the `session.state` op
+ * @returns {Array<{itemId: string, placement: string}>}
+ */
+function observedQueue(state) {
+  return state.queue.remote;
+}
 
 /** @param {object} daemon */
 async function daemonStatus(daemon) {

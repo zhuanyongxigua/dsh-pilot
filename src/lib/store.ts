@@ -57,6 +57,20 @@ export const INTERACTION_STATES = Object.freeze([
  */
 export type InteractionState = (typeof INTERACTION_STATES)[number];
 
+/**
+ * The states this bridge writes when an operator answers an interaction. Used by
+ * `markAnswerNotPending` to refuse a receipt re-classification on a row that carries no answer, and
+ * to keep the compare-and-set's own list and this one visibly the same set.
+ */
+export const ANSWER_STATES: readonly string[] = Object.freeze(['allowed-once', 'rejected', 'expired']);
+
+/**
+ * Where an answered interaction lands when the Host's carrier receipt says the request was no longer
+ * pending. Distinct from every other state on purpose: it records that we answered AND that the
+ * answer had nothing to apply to, which no other single state says.
+ */
+export const ANSWER_NOT_PENDING = 'answer-not-pending';
+
 /** The states an outbox row may hold. The DDL check constraint lists the same set. */
 export type OutboxState = 'pending' | 'dispatching' | 'acknowledged' | 'uncertain';
 
@@ -1316,6 +1330,43 @@ export class Store {
   /** @param taskId @param hostRpcId */
   getResponseDelivery(taskId: string, hostRpcId: string): ResponseDedupeRow | null {
     return this.get<ResponseDedupeRow>('select * from response_dedupe where task_id = ? and host_rpc_id = ?', taskId, hostRpcId) ?? null;
+  }
+
+  /**
+   * Re-classify an interaction after the HOST's carrier receipt arrives, when that receipt says the
+   * request was no longer pending.
+   *
+   * Why this needs its own transition rather than a second `decideInteraction` call: that call is a
+   * compare-and-set that only moves a row out of `pending`, and the answer we just sent has already
+   * taken the row out of `pending`. So the second call is *refused by design* — measured, not
+   * assumed: it returns `applied: false, previous: 'allowed-once'`, and the row would silently keep
+   * the operator's decision. That guard is correct and must not be weakened, because it is what
+   * stops a replay from overwriting a settled interaction.
+   *
+   * So the receipt gets its own transition, permitted only from the states this bridge writes as an
+   * answer, and it lands on a state that says both things that are true: the operator answered, AND
+   * the Host had nothing pending to apply the answer to. Either half alone would be a lie —
+   * `allowed-once` would claim the answer was used, and a bare `resolved-by-host` would hide that a
+   * decision was made and went nowhere.
+   * @param input the interaction and the receipt reason
+   * @returns the row as it now stands, or undefined when the row was not in an answerable state
+   */
+  markAnswerNotPending({ interactionId, reason = null }: {
+    readonly interactionId: string; readonly reason?: string | null;
+  }): InteractionRow | null {
+    return this.write(() => {
+      const current = this.get<InteractionRow>('select * from interactions where interaction_id = ?', interactionId);
+      if (!current) throw new BridgeError(ERROR_CODES.NOT_FOUND, 'interaction not found', { interactionId });
+      // Only the states this bridge writes as an answer may move here. A row still `pending` means no
+      // answer was ever recorded, which is a different situation and is deliberately left alone.
+      if (!ANSWER_STATES.includes(current.state)) return null;
+      this.run(
+        `update interactions set state = ?, reason = ?, generation = generation + 1
+         where interaction_id = ? and state = ?`,
+        ANSWER_NOT_PENDING, reason, interactionId, current.state,
+      );
+      return this.getInteraction(interactionId);
+    });
   }
 
   // ---- turns ------------------------------------------------------------------------

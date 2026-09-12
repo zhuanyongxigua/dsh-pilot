@@ -36,6 +36,20 @@ export class FakeHost {
   #seq = 0;
   #received = [];
   #sessions = new Map();
+  /** sessionId -> pending inbox occurrences, in the Host's own FIFO order. */
+  #queues = new Map();
+  /**
+   * Sessions whose `session/queue` broadcasts are being held back.
+   *
+   * Why this exists: the snapshot rides the WebSocket while the mutation's reply rides HTTP, so on
+   * the real Host the frame can still be in flight when the next request arrives. A test cannot
+   * reproduce that race honestly with sleeps (section 8 forbids sleep-based synchronization), so
+   * delivery is controlled explicitly: the fixture applies the mutation to its own queue either
+   * way, and only the BROADCAST is held. That models delivery, never semantics.
+   */
+  #queueSnapshotsHeld = new Set();
+  /** sessionId -> the queue mutations the fixture actually applied, for assertions. */
+  #queueMutations = [];
   #respondReceipts = [];
   #nextRpcId = null;
   /** ws -> raw TCP socket, so dropping a downlink is a real disconnect at both ends. */
@@ -79,6 +93,81 @@ export class FakeHost {
     return this.#received.filter((row) => row.method === method);
   }
 
+  // ---- the pending inbox --------------------------------------------------------------
+  //
+  // The real Host holds queued occurrences that are NOT durable: they are not model-visible and
+  // are not written to the session log until the Agent claims one. The only signal about them is
+  // the complete `session/queue` snapshot the Host re-sends after every enqueue, mutation, claim
+  // or discard, and the only mutation of a single occurrence is `session.updateQueue` addressed
+  // by its `MessageId`. This fixture mirrors exactly that: no durable event, one snapshot per
+  // change, one id-addressed mutation.
+
+  /** The fixture's current pending inbox for one session, as a test-side oracle (not a wire shape). */
+  queueItems(hostSessionId) {
+    return this.#queueItems(hostSessionId).map((item) => ({ ...item }));
+  }
+
+  /** Every queue mutation the fixture applied, in order, for assertions. */
+  get queueMutations() { return this.#queueMutations.map((row) => ({ ...row })); }
+
+  /**
+   * Enqueue one occurrence, the way the real Host does: the item id is minted by the Host, the
+   * FIFO placement is resolved by the Agent, and the WHOLE snapshot is re-broadcast.
+   * @param {string} hostSessionId
+   * @param {{text?: string, placement?: 'queued'|'steering'|'context'}} [options]
+   */
+  enqueue(hostSessionId, { text = 'fixture queued message', placement = 'queued' } = {}) {
+    if (!this.#sessions.has(hostSessionId)) throw new Error(`unknown fixture session ${hostSessionId}`);
+    const item = { id: `msg_${randomUUID()}`, placement, message: { role: 'user', content: [{ type: 'text', text }] } };
+    this.#queueItems(hostSessionId).push(item);
+    this.emitQueueSnapshot(hostSessionId);
+    return { ...item };
+  }
+
+  /**
+   * Broadcast a session's complete pending-inbox snapshot, as the real Host does after every
+   * change. Held back for a session whose delivery a test has deliberately paused.
+   * @param {string} hostSessionId
+   */
+  emitQueueSnapshot(hostSessionId) {
+    const items = this.#queueItems(hostSessionId).map((item) => ({ ...item }));
+    if (!this.#queueSnapshotsHeld.has(hostSessionId)) {
+      this.#broadcast({ type: 'session/queue', sessionId: hostSessionId, items });
+    }
+    return items.length;
+  }
+
+  /**
+   * Pause `session/queue` DELIVERY for one session: the fixture keeps applying changes to its own
+   * queue, it just does not tell anyone yet.
+   * @param {string} hostSessionId
+   */
+  holdQueueSnapshots(hostSessionId) { this.#queueSnapshotsHeld.add(hostSessionId); }
+
+  /**
+   * Resume delivery and send the current snapshot, one per held session (or one named session).
+   * @param {string} [hostSessionId]
+   */
+  releaseQueueSnapshots(hostSessionId) {
+    const sessions = hostSessionId === undefined
+      ? [...this.#queueSnapshotsHeld]
+      : [hostSessionId];
+    for (const id of sessions) {
+      this.#queueSnapshotsHeld.delete(id);
+      this.emitQueueSnapshot(id);
+    }
+  }
+
+  /** @param {string} hostSessionId */
+  #queueItems(hostSessionId) {
+    let items = this.#queues.get(hostSessionId);
+    if (!items) {
+      items = [];
+      this.#queues.set(hostSessionId, items);
+    }
+    return items;
+  }
+
   /** Requests that actually carried a business effect, i.e. were not refused client-side. */
   get mutationCount() {
     return this.#received.filter((row) => row.method !== 'host.describe').length;
@@ -89,7 +178,12 @@ export class FakeHost {
   stopDropping(method) { this.#dropped.delete(method); }
   /** @param {string} method @param {number} ms */
   delayFor(method, ms) { this.#delayed.set(method, ms); }
-  /** @param {string} method @param {{code: string, message?: string}} error */
+  /**
+   * Script a refusal for one method. `details` is part of the real Host's error envelope
+   * (`{code, message, details}`), and the details bag is a first-class leak surface for the
+   * bridge's sanitiser, so the fixture's type states it rather than hiding it.
+   * @param {string} method @param {{code: string, message?: string, details?: object}} error
+   */
   rejectWith(method, error) { this.#rejections.set(method, error); }
   /** @param {string} method @param {object} value */
   respondWith(method, value) { this.#results.set(method, value); }
@@ -394,7 +488,60 @@ export class FakeHost {
         }
         return { type: 'server-response', rpcId, result: { ok: true, value: { accepted: true } } };
       }
-      case 'session.updateQueue':
+      case 'session.updateQueue': {
+        const session = [...this.#sessions.values()].find((s) => s.sessionId === payload.sessionId);
+        if (!session) {
+          return { type: 'server-response', rpcId, result: { ok: false, error: { code: 'session-not-found', message: 'no such session', details: {} } } };
+        }
+        const items = this.#queueItems(session.sessionId);
+        const index = items.findIndex((item) => item.id === payload.itemId);
+        // The contract's own refusal for an occurrence that is not pending any more: already
+        // claimed, already removed, or never this session's. It is a DEFINITE refusal, which is
+        // why it must never be reported as a removal and never as an unknown outcome.
+        if (index < 0) {
+          return {
+            type: 'server-response',
+            rpcId,
+            result: {
+              ok: false,
+              error: {
+                code: 'queue-item-not-found',
+                message: `no pending queue item ${String(payload.itemId)} in this session`,
+                details: { itemId: payload.itemId },
+              },
+            },
+          };
+        }
+        const action = payload.action ?? {};
+        if (action.kind === 'remove') {
+          items.splice(index, 1);
+        } else if (action.kind === 'steer') {
+          // Steering is only meaningful for an occurrence the Agent still holds as queued work.
+          if (items[index].placement === 'context') {
+            return {
+              type: 'server-response',
+              rpcId,
+              result: {
+                ok: false,
+                error: { code: 'steer-unavailable', message: 'a context occurrence cannot be steered', details: { itemId: payload.itemId } },
+              },
+            };
+          }
+          items[index].placement = 'steering';
+        } else if (action.kind === 'edit') {
+          items[index].message = { role: 'user', content: action.content ?? [] };
+        } else {
+          return {
+            type: 'server-response',
+            rpcId,
+            result: { ok: false, error: { code: 'bad-request', message: `fixture does not implement queue action ${String(action.kind)}`, details: {} } },
+          };
+        }
+        this.#queueMutations.push({ sessionId: session.sessionId, itemId: payload.itemId, action });
+        // Every mutation re-sends the COMPLETE snapshot: that is the only signal a caller has.
+        this.emitQueueSnapshot(session.sessionId);
+        return { type: 'server-response', rpcId, result: { ok: true, value: { accepted: true } } };
+      }
       case 'session.rename':
       case 'session.selectModel':
         return { type: 'server-response', rpcId, result: { ok: true, value: { accepted: true } } };
