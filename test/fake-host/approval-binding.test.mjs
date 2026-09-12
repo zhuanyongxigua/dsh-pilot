@@ -185,12 +185,17 @@ function emitResolved(host, hostSessionId, rpcId, outcome) {
  * @param {import('../fixtures/fake-host.mjs').FakeHost} host
  * @param {string} what the refused answer, named so a failure says which one leaked
  */
-async function assertNoRespondDelivery(host, what) {
+async function assertNoRespondDelivery(host, what, options = {}) {
   await new Promise((resolve) => setTimeout(resolve, NO_DELIVERY_WINDOW_MS));
+  // A case that has ALREADY produced a legitimate delivery (the lost-receipt case) cannot assert an
+  // empty log; it asserts the stronger, narrower thing — that no ADDITIONAL delivery appeared. The
+  // expected count is named by the caller rather than inferred, so this helper never quietly relaxes
+  // the assertions of the cases that do assert an empty log.
+  const expected = options.expectOnly ? host.respondReceipts.filter((row) => row.rpcId === options.expectOnly).length : 0;
   assert.equal(
     host.respondReceipts.length,
-    0,
-    `${what} must not reach POST /api/respond, but the fake Host's log holds ${JSON.stringify(host.respondReceipts)}`,
+    expected,
+    `${what} must not reach POST /api/respond again, but the fake Host's log holds ${JSON.stringify(host.respondReceipts)}`,
   );
 }
 
@@ -501,21 +506,30 @@ export default {
       assert.equal((await interactionById(ipc, taskId, interaction.interactionId)).state, 'allowed-once',
         'a refused replay must not overwrite the settled decision');
 
-      // An IDENTICAL second decision is idempotent by design, and it says so: `delivered: false` with
-      // receipt `duplicate`. It is reported as a no-op, never as a fresh answer.
+      // An IDENTICAL second decision is ALSO a typed refusal, not a success-shaped no-op.
+      //
+      // This replaces an assertion that pinned the opposite, and the change is worth recording: the
+      // original contract claimed an identical replay was "idempotent by design" and returned
+      // `receipt: 'duplicate'` with `delivered: false` — but on the SAME success-shaped reply as a
+      // first decision that worked. A caller could therefore not distinguish "your approval was
+      // applied and delivered" from "you already answered", and an operator's second click reported
+      // as a success is exactly the wrong signal on a safety surface. `ERROR_CODES.APPROVAL_REPLAYED`
+      // existed for this path with no callers. A replay is now refused with that code, and the detail
+      // says whether the FIRST decision reached the Host, since that is the fact an operator needs.
       const identical = await decide(ipc, {
         taskId, interactionId: interaction.interactionId, decision: 'allowed-once', authorityToken: token,
       });
-      assert.equal(identical.error, null, 'an identical replay is the idempotent case, not an error');
-      assert.equal(identical.result.receipt, 'duplicate', `expected receipt duplicate, got ${identical.result.receipt}`);
-      assert.equal(identical.result.delivered, false, 'a duplicate must not be reported as delivered');
-
-      // The decide result is not a success shape: it carries no `delivery: 'pending-async'`, which is
-      // how a genuine first application reports itself. Asserted so that a repeat cannot masquerade
-      // as one.
-      assert.equal('delivery' in identical.result, false,
-        'the duplicate path must not look like a first application');
-      assert.equal(identical.result.delivered, false, 'a duplicate is not a delivery');
+      assert.equal(identical.result, null, 'a replay must not be returned as a success');
+      assert.equal(identical.error?.code, 'APPROVAL_REPLAYED',
+        `expected APPROVAL_REPLAYED, got ${JSON.stringify(identical.error)}`);
+      // The error is cast once at the wire boundary and then read, because a cast over an
+      // already-erroring expression still checks the expression inside it.
+      const replayError = /** @type {{code?: string, details?: {deliveredToHost?: string, hint?: string}}|null} */ (identical.error);
+      const replayDetails = replayError?.details;
+      assert.equal(replayDetails?.deliveredToHost, 'accepted',
+        'the refusal must say the first decision DID reach the Host, so an operator knows nothing is left to deliver');
+      assert.match(String(replayDetails?.hint ?? ''), /already delivered/i,
+        'the refusal must state what the operator should do about it');
 
       // Neither the conflicting nor the identical repeat put another receipt on the wire.
       assert.equal(deliveriesAfterFirst, 1,
@@ -603,28 +617,48 @@ export default {
       // Zero deliveries for the interaction nothing decided. This is the requirement's own oracle.
       await assertNoRespondDelivery(host, 'an interaction nothing decided');
 
-      // Where the requirement's second half — "zero for the one whose receipt was lost" — cannot be
-      // tested, and why, is evidenced rather than asserted: the fixture's `/api/respond` handler
-      // returns before its fault-injection block, so `delayFor`/`dropResponseFor`/`rejectWith` have
-      // no effect on that path and a lost receipt cannot be simulated at all. The probe below is
-      // fixture evidence (not bridge evidence): a 3 s delay is injected for `respond` and a real
-      // POST still answers immediately with the fixture's own `not-pending` receipt.
-      host.delayFor('respond', 3000);
-      const started = Date.now();
-      const probe = await fetch(`${host.baseUrl}/api/respond`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ type: 'client-response', rpcId: 'rpc-never-pending', result: { ok: true, value: {} } }),
+      // The requirement's second half — "zero for the one whose receipt was lost" — is tested here
+      // rather than documented as untestable. It READ as untestable because the fixture's
+      // `/api/respond` branch returned before its fault-injection block, so `dropResponseFor` could
+      // not reach that path; that was a gap in OUR fixture, not a fact about the requirement, and it
+      // is fixed. A lost receipt now means exactly what it should: the Host APPLIED the answer and
+      // then the socket died before the client could learn the outcome.
+      const lost = host.emitApprovalRequested(session.hostSessionId);
+      host.markApprovalPending(lost.rpcId);
+      await waitFor(async () => (await interactions(ipc, taskId)).some((row) => row.hostRpcId === lost.rpcId),
+        { timeoutMs: 5000, what: 'the lost-receipt approval to be recorded' });
+      const lostRow = (await interactions(ipc, taskId)).find((row) => row.hostRpcId === lost.rpcId);
+      const token = await authorityToken(daemon);
+      host.dropResponseFor('respond');
+      const { result: decided } = await decide(ipc, {
+        taskId, interactionId: lostRow.interactionId, decision: 'allowed-once', authorityToken: token,
       });
-      const elapsed = Date.now() - started;
-      assert.equal(probe.status, 200);
-      assert.deepEqual(await probe.json(), { accepted: false, reason: 'not-pending' });
-      assert.ok(elapsed < 1000,
-        `delayFor('respond', 3000) did not delay /api/respond (${elapsed}ms): the fixture cannot make /api/respond time out`);
-      // That probe is the only delivery this host will ever see, and it is ours, not the bridge's:
-      // the log holds exactly one row and its rpcId is the one this test chose.
-      assert.deepEqual(host.respondReceipts.map((row) => row.rpcId), ['rpc-never-pending'],
-        'the only /api/respond row on this host must be the probe this test sent itself');
+      host.stopDropping('respond');
+      assert.ok(decided, 'the decision itself must succeed even when its receipt is lost');
+
+      // The Host has the answer — so this is NOT a "nothing was delivered" case — and the bridge must
+      // report the outcome as unproven rather than as either success or failure.
+      assert.equal(host.respondReceipts.filter((row) => row.rpcId === lost.rpcId).length, 1,
+        'the answer reached the Host before the receipt was lost');
+      assert.equal(decided.delivered, false, 'a lost receipt is not a delivery the bridge can call done');
+      assert.equal(decided.receipt, 'uncertain',
+        `a lost receipt must be reported as unproven, got ${JSON.stringify(decided.receipt)}`);
+      const afterLoss = (await interactions(ipc, taskId)).find((row) => row.hostRpcId === lost.rpcId);
+      assert.equal(afterLoss.state, 'allowed-once', 'the operator decision stands');
+      assert.equal(afterLoss.delivery?.state, 'uncertain',
+        `the durable record must keep the unproven outcome, got ${JSON.stringify(afterLoss.delivery)}`);
+
+      // And the second half itself: NOTHING may be delivered again. The count stays at exactly one,
+      // across a reconnect, because an unproven outcome is never retried automatically.
+      // A reconnect, using the same downlink teardown the earlier half of this case uses, so the
+      // "nothing is re-delivered" claim is made across exactly the event that would trigger a naive
+      // retry. `NO_DELIVERY_WINDOW_MS` elapses inside the helper before the count is read.
+      host.dropDownlinks();
+      await waitFor(async () => (await ipc.request({ op: 'health' })).connection !== 'ready',
+        { timeoutMs: 5000, what: 'the downlink to be observed as lost' });
+      await waitFor(async () => (await ipc.request({ op: 'health' })).connection === 'ready',
+        { timeoutMs: 15000, what: 'the downlink to be re-established' });
+      await assertNoRespondDelivery(host, 'the interaction whose receipt was lost', { expectOnly: lost.rpcId });
     } finally {
       await teardown();
     }

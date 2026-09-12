@@ -27,16 +27,25 @@
  *     convention `test/unit/core.test.mjs` documents ("proves the row was committed, not just
  *     staged in this process's memory"), because only the store holds a turn's terminal state.
  *
- * FINDING, recorded here rather than hidden (the full report ships with this file): the two
- * IP-facing surfaces do NOT carry which terminal state a turn reached. For all three turn paths
- * the surfaced reason is the same sentence — `authoritative turn/end at seq N` — and
- * `session.wait` answers `turn-ended` for all three, so a caller reading `session.state` cannot
- * tell a failed turn from a completed one. The classification survives only in the `turns.state`
- * column and in the raw `turn/end` payload the event log serves. These rows pin what each surface
- * does report (that is how the collapse is visible in one place) and assert the classification
- * everywhere it does exist. The requirement's own vocabulary also spells the refusal path
- * `host-rejected`, while the bridge records the operation state `refused`; that is the alias
- * `REQUIREMENT_SPELLING` below.
+ * THE DEFECT THESE ROWS FOUND, AND ITS FIX. As first written, the two IPC-facing surfaces did NOT
+ * carry which terminal state a turn reached: for all three turn paths the surfaced reason was the
+ * same sentence — `authoritative turn/end at seq N` — and `session.wait` answered `turn-ended` for
+ * all three, so a caller could not tell a failed turn from a completed one. The classification
+ * survived only in the `turns.state` column (which no operation serves) and in the raw `turn/end`
+ * payload. The rows below pinned that collapse so it was visible rather than hidden.
+ *
+ * It is now fixed, and these rows assert the FIXED semantics rather than the defect:
+ *   - the reason leads with the terminal state — `<state>: authoritative turn/end at seq N` — so a
+ *     caller reading only the string can tell the paths apart;
+ *   - `session.state.execution.lastTerminalState` and `session.wait`'s `terminalState` carry the same
+ *     fact from the store's own closed set, so no caller has to parse prose;
+ *   - the final case asserts all five paths report DISTINCT observable terminal states, which is
+ *     precisely what failed before.
+ * Both surfaces are read here through the real daemon, and the MCP face passes these replies through
+ * unchanged, so the same facts are what an MCP client sees.
+ *
+ * The requirement's own vocabulary also spells the refusal path `host-rejected`, while the bridge
+ * records the operation state `refused`; that is the alias `REQUIREMENT_SPELLING` below.
  */
 
 import { assert, ipcClient, must, scratchDir, startDaemon, waitFor } from '../helpers.mjs';
@@ -79,6 +88,9 @@ const REQUIREMENT_SPELLING = { refused: 'host-rejected' };
  * @property {string} waitReason      `session.wait`'s closed-set reason for this session
  * @property {string} terminalOutcome the authoritative `turn/end` outcome, or `''` if the path has none
  * @property {string} operationState  the operation row's state, or `''` if the path has no operation
+ * @property {string} [surfacedState] `session.state.execution.lastTerminalState`; absent on a
+ *   path that observes no turn, which is why it is optional rather than `''`
+ * @property {string} [waitState]     `session.wait`'s `terminalState`; absent for the same reason
  */
 
 /**
@@ -174,17 +186,25 @@ async function turnFacts(ctx, ids, expectedTerminal) {
   assert.equal(state.execution.currentTurnId, null, 'no turn may still be reported as current');
   const surfacedReason = String(state.execution.lastTerminalReason);
   // Deliberately not anchored at the end: the rule being asserted is that the reason names the
-  // authoritative terminal event it was derived from, not that it is exactly that sentence. A
-  // reason that also named the terminal state (which it does not today — see FINDING above) would
-  // still satisfy this, while a reason that stopped naming its evidence would not.
+  // authoritative terminal event it was derived from, not that it is exactly that sentence.
   assert.match(surfacedReason, /authoritative turn\/end at seq \d+/,
     'the terminal reason is only ever recorded from an authoritative terminal event');
+  // And the reason must LEAD with the terminal state, so the three turn paths are distinguishable
+  // from the string alone. This is the assertion that would have caught the original collapse.
+  assert.equal(surfacedReason.split(':')[0], expectedTerminal,
+    `the surfaced reason must name the terminal state first, so '${expectedTerminal}' is distinguishable ` +
+    `from every other path; got ${JSON.stringify(surfacedReason)}`);
+  assert.equal(state.execution.lastTerminalState, expectedTerminal,
+    `session.state must report the terminal state '${expectedTerminal}' in the store's closed set`);
 
   const waited = await ctx.ipc.request({ op: 'session.wait', taskId: ids.taskId, sessionId: ids.sessionId, timeoutMs: 500 });
   assert.ok(DOCUMENTED_WAIT_REASONS.includes(waited.reason),
     `session.wait returned '${waited.reason}', which is outside the documented closed set ${DOCUMENTED_WAIT_REASONS.join('/')}`);
   assert.equal(waited.reason, 'turn-ended');
   assert.equal(waited.terminalReason, surfacedReason, 'both surfaces must report the same terminal reason');
+  assert.equal(waited.terminalState, expectedTerminal,
+    `session.wait must report HOW the turn ended, not only that it did: a caller seeing 'turn-ended' ` +
+    `cannot tell a completed turn from a failed one. Expected '${expectedTerminal}', got ${JSON.stringify(waited.terminalState)}`);
 
   return {
     reason: turn.state,
@@ -193,6 +213,8 @@ async function turnFacts(ctx, ids, expectedTerminal) {
     waitReason: String(waited.reason),
     terminalOutcome: expectedTerminal,
     operationState: '',
+    surfacedState: String(state.execution.lastTerminalState ?? ''),
+    waitState: String(waited.terminalState ?? ''),
   };
 }
 
@@ -217,6 +239,10 @@ async function noTurnFacts(ctx, ids) {
     `session.wait returned '${waited.reason}', which is outside the documented closed set ${DOCUMENTED_WAIT_REASONS.join('/')}`);
   assert.equal(waited.reason, 'no-turn-observed');
   assert.equal(waited.terminalReason, null);
+  assert.equal(state.execution.lastTerminalState, null,
+    'no terminal STATE may be reported for a turn that was never observed either');
+  assert.equal(waited.terminalState, null,
+    'a wait that observed no turn must not invent a terminal state');
   return { waitReason: String(waited.reason) };
 }
 
@@ -380,8 +406,11 @@ const ROWS = [
  * @param {{ path: string, reason: string }} row one table row
  * @returns {string} the case name that row's suite is registered under
  */
-const caseNameFor = (row) =>
-  `FR-EXEC-3 ${row.path}: the terminal reason is '${row.reason}', with the operation and turn facts under it`;
+function caseNameFor(row) {
+  return (
+    `FR-EXEC-3 ${row.path}: the terminal reason is '${row.reason}', with the operation and turn facts under it`
+  );
+}
 
 /** One suite per row, generated from the table above. */
 const rowSuites = Object.fromEntries(ROWS.map((row) => [
@@ -422,6 +451,28 @@ export default {
     const reasons = observations.map((observation) => observation.reason);
     const shared = reasons.filter((reason, index) => reasons.indexOf(reason) !== index);
     assert.deepEqual(shared, [], `two termination paths reported the same terminal reason: ${shared.join(', ')}`);
+
+    // Distinctness of what each PUBLIC surface reports too — the store column being distinct is not
+    // enough, because the column was always distinct while both IPC surfaces collapsed. The turn
+    // paths must be distinguishable through the reason string a caller reads and through the
+    // structured state, and the two surfaces must agree with each other.
+    // Rows with no observed turn record no state at all, so the comparison is over the rows that do.
+    const turnObservations = observations.filter((observation) => (observation.surfacedState ?? '') !== '');
+    assert.ok(turnObservations.length >= 3,
+      `at least the three turn paths must report a terminal state; got ${turnObservations.length}`);
+    const surfacedStates = turnObservations.map((observation) => observation.surfacedState);
+    assert.equal(new Set(surfacedStates).size, surfacedStates.length,
+      `the turn paths report the same terminal state through session.state: ${surfacedStates.join(', ')}. ` +
+      'A caller could not tell a completed turn from a failed one.');
+    const waitStates = turnObservations.map((observation) => observation.waitState);
+    assert.equal(new Set(waitStates).size, waitStates.length,
+      `the turn paths report the same terminal state through session.wait: ${waitStates.join(', ')}`);
+    for (const observation of turnObservations) {
+      assert.equal(observation.waitState, observation.surfacedState,
+        'the two IPC surfaces must report the same terminal state');
+      assert.equal(observation.surfacedState, observation.reason,
+        'the surfaced terminal state must be the classification the store recorded');
+    }
 
     // Closure, against the documented set each reason belongs to — not against the table's own list.
     for (const [index, row] of ROWS.entries()) {

@@ -36,6 +36,8 @@ export interface ToolSchema {
   readonly maxLength?: number;
   readonly minimum?: number;
   readonly maximum?: number;
+  /** For `type: 'array'`: the schema every element must satisfy. */
+  readonly items?: ToolSchema;
 }
 
 /** One advertised tool: its schema, and the single daemon request it maps onto. */
@@ -164,12 +166,28 @@ export const MCP_TOOLS: readonly McpTool[] = [
   },
   {
     name: 'dsh_queue_clear',
-    description: 'Clear the daemon-local pending queue for a session and report the remote queue scope separately (the remote scope is not cleared by this call).',
+    description: 'Clear the daemon-local pending queue for a session, and optionally ask the Host to ' +
+      'remove specific queued items. A queued item is removed only by naming it in `itemIds`, and only ' +
+      'if it appears in the last `session/queue` snapshot observed for THAT session; an id that was ' +
+      'never observed is refused without being sent, because the Host has no idempotency key for this ' +
+      'call and a guessed id would be a destructive guess. Turn cancellation is a separate operation ' +
+      '(`dsh_session_cancel`) and never removes pending work.',
     inputSchema: objectSchema({
       taskId: stringSchema({}),
       sessionId: stringSchema({}),
+      itemIds: arraySchema(stringSchema({
+        description: 'Host queue item ids to remove, as observed in this session\'s `session/queue` ' +
+          'snapshot. Omit to leave the Host queue untouched.',
+      })),
     }, ['taskId', 'sessionId']),
-    op: (args) => ({ op: 'queue.clear', taskId: args.taskId, sessionId: args.sessionId }),
+    op: (args) => ({
+      op: 'queue.clear',
+      taskId: args.taskId,
+      sessionId: args.sessionId,
+      // Forwarded only when the caller named ids, so a call that omits the field is indistinguishable
+      // at the daemon from one made before this parameter existed.
+      ...(args.itemIds === undefined ? {} : { itemIds: args.itemIds }),
+    }),
   },
   {
     name: 'dsh_operation_get',
@@ -249,6 +267,22 @@ function validateAgainst(schema: ToolSchema, value: unknown, path: string, error
   }
   if (value === undefined) return;
   switch (schema.type) {
+    case 'array': {
+      if (!Array.isArray(value)) { errors.push(`${where}: expected array`); return; }
+      const items = schema.items;
+      if (items === undefined) {
+        // An array schema with no `items` cannot check anything, so saying so beats accepting every
+        // element and implying a check happened.
+        errors.push(`${where}: array schema declares no items`);
+        return;
+      }
+      // Read into a local first: a narrowing test does not survive into the closure below, and
+      // asserting the type back would be a cast where a plain `const` is available.
+      value.forEach((element, index) => {
+        validateAgainst(items, element, `${where}[${index}]`, errors);
+      });
+      break;
+    }
     case 'string':
       if (typeof value !== 'string') { errors.push(`${where}: expected string`); return; }
       if (schema.maxLength !== undefined && value.length > schema.maxLength) errors.push(`${where}: exceeds maxLength ${schema.maxLength}`);
@@ -304,6 +338,15 @@ function objectSchema(properties: Record<string, ToolSchema>, required: readonly
 /** @param extra optional keywords merged over the defaults */
 function stringSchema(extra: StringSchemaExtras = {}): ToolSchema {
   return { type: 'string', minLength: 1, ...extra };
+}
+
+/**
+ * An array of values each matching `items`.
+ * @param items the schema every element must satisfy
+ * @returns the schema
+ */
+function arraySchema(items: ToolSchema): ToolSchema {
+  return { type: 'array', items };
 }
 
 /** @param extra optional keywords merged over the defaults */

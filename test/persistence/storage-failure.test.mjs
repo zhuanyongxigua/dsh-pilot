@@ -508,15 +508,23 @@ export default {
       assert.notEqual(
         exit.code, 0,
         'the daemon must refuse to run against an unwritable state directory, got '
-        + `${JSON.stringify({ code: exit.code, signal: exit.signal, stderr: exit.stderr.slice(0, 300) })}. `
-        // Recorded plainly, because it is a real defect and not behaviour this file wants to
-        // bless: on THIS path the entry point throws while CONSTRUCTING the Daemon, outside the
-        // handler that turns a BridgeError into `{ok:false, code}` plus exit 5, so the process
-        // dies with an unhandled BridgeError and exit 1. The refusal itself is typed and correct;
-        // it is the REPORTING contract at the process boundary that is not met. The test
-        // deliberately does not encode the broken exit code as expected behaviour. Reported
-        // alongside this file rather than fixed here (a src/ change was out of scope).
+        + `${JSON.stringify({ code: exit.code, signal: exit.signal, stderr: exit.stderr.slice(0, 300) })}.`,
       );
+      // The process-boundary contract, asserted exactly. Construction of the Daemon is where the
+      // store is opened, and it used to sit OUTSIDE the entry point's typed handler, so this path
+      // died with an unhandled error and exit 1 — indistinguishable, to a caller, from a crash in
+      // unrelated code. It now reports the same typed refusal as every other startup failure.
+      assert.equal(
+        exit.code, 5,
+        'a storage refusal at startup must use the defined storage exit code (5), got '
+        + `${JSON.stringify({ code: exit.code, signal: exit.signal, stderr: exit.stderr.slice(0, 300) })}`,
+      );
+      const startupRefusal = refusalPayload(exit.stderr);
+      assert.ok(startupRefusal,
+        `the refusal must be a typed payload, got stderr ${JSON.stringify(exit.stderr.slice(0, 300))}`);
+      assert.equal(startupRefusal.ok, false, 'a refusal payload must report ok:false');
+      assert.match(String(startupRefusal.code), /STORAGE_UNAVAILABLE|STORAGE_CORRUPT|STORAGE_FULL/,
+        `the refusal must name a storage code, got ${JSON.stringify(startupRefusal.code)}`);
       assert.equal(
         host.received.length, 0,
         'a daemon that cannot write durable state must not contact the Host at all, saw '

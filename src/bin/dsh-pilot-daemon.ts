@@ -58,26 +58,49 @@ if (!guard.safe) {
   process.exit(3);
 }
 
-const daemon = new Daemon({
-  stateDir,
-  hostBase,
-  hostScope: args.hostScope ?? config.hostScope,
-  limits: config.limits,
-});
-
-// The startup report, as `Daemon.start` returns it. Declared rather than inferred because the value
-// is produced inside the `try` below, and the catch arm exits the process.
-let started: Awaited<ReturnType<Daemon['start']>>;
-try {
-  started = await daemon.start();
-} catch (error) {
+/**
+ * Report a startup failure in the defined shape and end the process.
+ *
+ * The exit code is chosen from the TYPED error rather than from the failure's message, and every
+ * startup step below routes through here. Before this, only `Daemon.start()` was inside the handler:
+ * CONSTRUCTING the Daemon opens the store and takes the ownership lock, so a storage failure there —
+ * an unwritable state directory, for instance — escaped as an unhandled `BridgeError` and killed the
+ * process with exit 1 and no typed payload at all. A caller could not tell a storage refusal from a
+ * crash in unrelated code, which is the one distinction this boundary exists to make.
+ * @param error the thrown value, of unknown shape
+ * @returns never
+ */
+function failStartup(error: unknown): never {
   const bridgeError = toBridgeError(error);
   const payload = { ok: false, ...bridgeError.toJSON() };
   process.stderr.write(`${JSON.stringify(payload)}\n`);
+  // 4 is the documented OWNERSHIP refusal (another process owns the directory) and 5 is the
+  // documented storage refusal; anything else is a storage-class refusal too, because by this point
+  // every other class of startup failure has been handled above.
   process.exit(bridgeError instanceof BridgeError && bridgeError.code === 'OWNER_HELD' ? 4 : 5);
 }
 
-await daemon.startEventIngest();
+// Construction is inside the boundary, because it is where the store is opened and the lock is
+// taken. `Daemon` is declared before it is assigned so the value survives the `try` for the code
+// below; the assignment cannot fail to have happened, since a failure exits the process.
+/** @type {Daemon} */
+let daemon;
+/** @type {Awaited<ReturnType<Daemon['start']>>} */
+let started;
+try {
+  daemon = new Daemon({
+    stateDir,
+    hostBase,
+    hostScope: args.hostScope ?? config.hostScope,
+    limits: config.limits,
+  });
+  started = await daemon.start();
+  // Also inside the boundary: the event ingest opens the downlinks, and a failure here must be
+  // reported the same typed way rather than surfacing as an unhandled rejection.
+  await daemon.startEventIngest();
+} catch (error) {
+  failStartup(error);
+}
 
 const ready = {
   ok: true,

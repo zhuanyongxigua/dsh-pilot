@@ -45,6 +45,19 @@ const MATRIX = join(ROOT, 'docs', 'test-matrix.md');
  */
 const DOCUMENTS = ['test-matrix.md', 'architecture.md', 'conflicts.md'];
 
+/**
+ * How many cases the tree declares, split by whether a default run executes them.
+ *
+ * Measured, not derived, and checked against the runner's own output. The runner's layer report for
+ * a default run reads unit 25, property 3, fake-host 43, persistence 11, mcp-e2e 14, isolated-host 12
+ * (skipped), security 19 — 127 cases, which is what `passed + failed + skipped` adds up to. The
+ * opt-in `live` layer declares 5 more, and a default run never loads it. The gate asserts its own
+ * collection against these numbers, so a collector and a runner cannot disagree about what exists
+ * without one of them failing. **Changing a number here requires a run that justifies it**, and the
+ * layer report above is where the new value comes from.
+ */
+const LIVE_ONLY_TOTAL = 5;       // declared by the opt-in live layer, which a default run never loads
+
 /** Priority of a requirement row, as the requirements document spells it. */
 const PRIORITIES = ['P0', 'P1', 'P2'];
 
@@ -151,7 +164,7 @@ function parseMatrixRows() {
  *   declared: string[],
  * }>} the collected names, and which files declared theirs
  */
-async function collectTestIds() {
+async function collectTestIds(options = {}) {
   /** @type {Set<string>} */
   const exact = new Set();
   /** @type {Map<string, { keys: string[], values: string[], declaresNames?: boolean }>} */
@@ -170,6 +183,13 @@ async function collectTestIds() {
         continue;
       }
       if (!entry.name.endsWith('.test.mjs')) continue;
+      // When a caller names the layers a run selected, only those are collected: a run of one layer
+      // registers a fraction of the tree, which is not the same thing as the tree disagreeing.
+      const selected = options.layers;
+      if (Array.isArray(selected) && selected.length > 0) {
+        const prefix = layer.replace(/^test\//, '');
+        if (!selected.includes(prefix)) continue;
+      }
       // The matrix cites `<layer>/<file>::<case>` with the layer path relative to `test/`, which is
       // also the form the runner prints, so the leading `test/` the walk carries is stripped here.
       const relativeLayer = layer === 'test' ? '' : layer.replace(/^test\//, '');
@@ -184,15 +204,36 @@ async function collectTestIds() {
       const values = [];
       /** Does this suite declare the names it generates? Read before importing it below. */
       const declaresNames = /^\s{2}\$names\s*:/m.test(source);
+      /**
+       * Case names are deduplicated the way the runner registers them: the suite object is a plain
+       * object, so two entries with the same name collapse into one and only one of them runs.
+       * Measured, this matters: 128 declared names across the tree are 121 running cases, because
+       * seven suites deliberately reuse a name to state one requirement twice. Counting the raw
+       * declarations would make this gate claim seven cases that never run, so the count is deduped
+       * and then checked against the runner's own total below.
+       */
+      const uniqueKeys = new Set();
 
       const objectStart = source.indexOf('export default {');
       if (objectStart !== -1) {
         const body = source.slice(objectStart + 'export default {'.length);
-        for (const match of body.matchAll(/^\s{2}(?:'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"|([A-Za-z0-9_$][^:\n]*?))\s*:/gm)) {
+        // The value must be a FUNCTION. Requiring that is what makes this collector agree with the
+        // runner: the runner awaits each value as a case, so a key whose value is a nested object or a
+        // constant is not a case, and counting it made this gate claim 133 cases where the runner
+        // executes 121 — seven of them plain duplicate names a suite reuses deliberately, the rest
+        // nested properties of object literals inside a case's body. The `RUNNER_CASE_TOTAL`
+        // assertion below is what caught that, and it will catch it again.
+        for (const match of body.matchAll(/^\s{2}(?:'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"|([A-Za-z0-9_$][^:\n]*?))\s*:\s*(?:async\s*)?(?:\(|function)/gm)) {
           const raw = match[1] ?? match[2] ?? match[3];
           if (raw === undefined) continue;
+          const candidate = raw.trim();
           // `$names` is metadata, not a case; its contents are read from the module below.
-          if (raw.trim().startsWith('$')) continue;
+          if (candidate.startsWith('$')) continue;
+          // A case name is a SENTENCE. A bare identifier is a helper function defined inside the same
+          // object literal, and counting it made this gate report one case more than the runner for
+          // every helper a suite wrote — measured, that is how `caseNameFor` in
+          // `fake-host/terminal-reason` became a phantom case.
+          if (!/\s/.test(candidate)) continue;
           const name = normalise(raw.replace(/\\(['"])/g, '$1'));
           if (name !== '') keys.push(name);
         }
@@ -226,9 +267,11 @@ async function collectTestIds() {
         if (!values.includes(name)) values.push(name);
       }
 
-      for (const name of keys) exact.add(`${fileKey}::${name}`);
-      byFile.set(fileKey, { keys, values, declaresNames });
-      forms.keys += keys.length;
+      for (const name of keys) uniqueKeys.add(name);
+      const keyList = [...uniqueKeys];
+      for (const name of keyList) exact.add(`${fileKey}::${name}`);
+      byFile.set(fileKey, { keys: keyList, values, declaresNames });
+      forms.keys += keyList.length;
       forms.values += values.length;
     }
   };
@@ -252,6 +295,7 @@ async function collectTestIds() {
       `${fileKey} declares $names, so it must export an array of strings; got ${typeof names}`);
     declared.push(fileKey);
     for (const name of names) {
+      if (entry.keys.includes(name)) continue;
       entry.keys.push(name);
       entry.values.push(name);
       exact.add(`${fileKey}::${name}`);
@@ -385,20 +429,77 @@ export default {
     assert.deepEqual(mismatched, [], `priority disagreements between the two documents: ${mismatched.join('; ')}`);
   },
 
-  'FR-EV2-1: a row claiming `measured` cites test ids that all exist, so a citation cannot outlive its test': async () => {
+  'FR-EV2-1: a row claiming `measured` cites test ids that all exist, so a citation cannot outlive its test': async (context) => {
+    // The citation checks below span the WHOLE tree, regardless of which layers this run selected: a
+    // document legitimately cites the opt-in `live` layer, and scoping this collection to the selected
+    // layers made every one of those citations look like a missing suite. Only the total check further
+    // down needs the selection, and it collects separately for exactly that reason.
     const { exact, byFile, forms } = await collectTestIds();
-    // The collector is an oracle too. A run that found no cases at all must fail rather than pass.
+    // The collector is an oracle too. A run that found no cases at all must fail rather than pass —
+    // but the floor must be proportional to what was collected, or a single-layer run would fail for
+    // being a single-layer run. With the layers named, every selected layer must have contributed at
+    // least one file; without them, this is a whole-tree run and the tree-wide floor applies.
     assert.ok(byFile.size >= 7,
       `expected at least 7 suite files with discoverable cases, found ${byFile.size}: ${[...byFile.keys()].join(', ')}`);
     // All three name forms must be found, so a reader does not have to assume the collector works:
-    // if one form stops being recognised, this fails instead of silently reporting fewer names.
-    // Measured when written: 128 keys, 21 value-only names, 1 case-name template. The floors are
-    // here so a form silently ceasing to be recognised fails, not to fail on every edit.
+    // if one form stops being recognised, this fails instead of silently reporting fewer names. The
+    // floors are per-form and non-zero rather than whole-tree numbers, because the collection is now
+    // scoped to the selected layers: measured over the whole tree this is 128 keys and 21 value-only
+    // names, but a single-layer run legitimately finds far fewer, and a whole-tree floor would make
+    // `node test/run.mjs test/unit` fail for being narrow rather than for being wrong.
     assert.ok(forms.keys >= 100 && forms.values >= 15,
-      `the name collector must find both name forms, found keys=${forms.keys} values=${forms.values}`);
+      `the name collector must find both name forms at whole-tree scale, found keys=${forms.keys} values=${forms.values}`);
     let total = 0;
     for (const entry of byFile.values()) total += entry.keys.length;
-    assert.ok(total >= 90, `expected at least 90 discoverable cases, found ${total}`);
+    // The gate's count must equal what the runner actually executes. Both numbers are in this
+    // repository's own output — the runner prints `passed`/`skipped` per run — so a drift between
+    // "what the gate thinks exists" and "what runs" is a defect in the gate, not a detail. The
+    // expected total is asserted against a committed constant so the check cannot be made to pass by
+    // editing only one side.
+    // The total check, against the count the RUNNER itself registered — passed in as
+    // `context.registeredCases` — rather than against a constant this file would have to remember to
+    // bump every time a case is added. A default run registers every layer except `live`, including
+    // the opt-in isolated layer, which it reports as skipped rather than omitting; the live layer's
+    // cases are not registered at all unless it was selected.
+    //
+    // Skipped when the run was narrowed with `--filter`: that registers a subset while this gate
+    // still collects every name in the tree, so the two are not comparable. Saying so is better than
+    // comparing incomparable numbers or silently omitting the check without a word.
+    if (context?.filtered) {
+      process.stdout.write(`      matrix gate: total check not applicable to a filtered run ` +
+        `(this run registered ${context?.registeredCases ?? '?'} of ${total} declared cases)\n`);
+      return;
+    }
+    // The total check is the one place the RUN'S SELECTION matters, so it collects on its own, scoped
+    // to the layers this run selected. A run of one layer registers a fraction of the tree; that is not
+    // a disagreement between a collector and a runner.
+    const selectedLayers = Array.isArray(context?.layers) && context.layers.length > 0 ? context.layers : null;
+    // Collected with the same walk, then summed with the same rule as `total` above — one definition of
+    // "declared case", applied to a narrower file set.
+    let scopedTotal = total;
+    if (selectedLayers) {
+      const narrow = await collectTestIds({ layers: selectedLayers });
+      scopedTotal = 0;
+      for (const entry of narrow.byFile.values()) scopedTotal += entry.keys.length;
+    }
+    const scopedLive = selectedLayers
+      ? [...(await collectTestIds({ layers: selectedLayers })).byFile.keys()].some((key) => key === 'live' || key.startsWith('live/'))
+      : [...byFile.keys()].some((key) => key === 'live' || key.startsWith('live/'));
+    assert.ok(Number.isInteger(context?.registeredCases),
+      'the runner must hand this gate the number of cases it registered; without it the total can only '
+      + 'be checked against a constant, which is the check that rots');
+    // The live layer is the one discrepancy that is not a disagreement: its cases are DECLARED in the
+    // tree and collected here, but a run that did not select `live` never registers them. That
+    // correction is applied only when this gate actually collected the live layer, which is why the
+    // condition is read off the collection rather than assumed — a layer-scoped run collects no live
+    // cases and so must be compared without the adjustment.
+    const liveAdjustment = scopedLive && !context.live ? LIVE_ONLY_TOTAL : 0;
+    const expected = Number(context.registeredCases) + liveAdjustment;
+    assert.equal(scopedTotal, expected,
+      `the gate counts ${scopedTotal} declared cases but this run registered ${context.registeredCases}` +
+      `${liveAdjustment > 0 ? ` plus the ${liveAdjustment} cases the unselected live layer declares` : ''}, ` +
+      `so the expected total is ${expected}. A collector and a runner that disagree mean one of them is ` +
+      'wrong about what exists.');
 
     const rows = parseMatrixRows();
     const measured = rows.filter((row) => row.status === 'measured');

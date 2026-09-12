@@ -220,8 +220,36 @@ export class FakeHost {
       sessionId: hostSessionId,
       event: { seq: session ? session.eventSeq : this.#seq, ...event },
     };
+    // Recorded into the session's history as well as broadcast, because the real Host serves
+    // `session.history` from the same log it streams. A fixture that only broadcasts makes history a
+    // mirror of the live stream, which is precisely the state in which a broken history refetch
+    // cannot be distinguished from a working one — the daemon recovers the event live and the test
+    // passes without the refetch ever doing anything. Existing cases are unaffected: they assert on
+    // what the daemon STORED, and nothing reads the fixture's history length.
+    if (session) session.events.push(envelope.event);
     this.#broadcast(envelope);
     return envelope.event;
+  }
+
+  /**
+   * Record an event in a session's history WITHOUT broadcasting it.
+   *
+   * This models the one case history exists for: something the Host did while our downlink was down.
+   * The event is in the Host's log, so `session.history` serves it, and it was never on the wire, so
+   * the ONLY way the bridge can learn it is by refetching. That is what makes an assertion about the
+   * refetch non-decorative. Broadcasting it instead — the obvious thing to write — lets the live
+   * socket deliver it and the test then proves nothing about history at all.
+   * @param {string} hostSessionId
+   * @param {object} event the event body, without `seq`
+   * @returns {object} the recorded event, with its `seq`
+   */
+  recordSessionEvent(hostSessionId, event) {
+    const session = this.#sessions.get(hostSessionId);
+    if (!session) throw new Error(`unknown fixture session ${hostSessionId}`);
+    session.eventSeq = (session.eventSeq ?? 0) + 1;
+    const recorded = { seq: session.eventSeq, ...event };
+    session.events.push(recorded);
+    return recorded;
   }
 
   /** Emit raw text onto the mux downlink (used to send hazards such as broken JSON). */
@@ -331,11 +359,35 @@ export class FakeHost {
         try { parsed = JSON.parse(bodyText); } catch { /* malformed */ }
         const rpcId = parsed?.rpcId;
         const pending = this.#pendingApprovals?.has(rpcId) ?? false;
-        const outcome = pending ? 'accepted' : 'not-pending';
+        // The forced reason lets a test drive the OTHER values of the Host's closed refusal set —
+        // `bad-response` above all, which the bridge must not report as `not-pending` — and a reason
+        // outside the set entirely, which the bridge must report as unrecognised rather than assume.
+        // Held only for the next receipt, so one case cannot leak into another.
+        const forced = this.#forcedRespondReason;
+        this.#forcedRespondReason = null;
+        const outcome = forced ?? (pending ? 'accepted' : 'not-pending');
         this.#respondReceipts.push({ rpcId, outcome, result: parsed?.result ?? null });
         if (pending) this.#pendingApprovals.delete(rpcId);
+        // The delay sits HERE, after the answer has been APPLIED and recorded, and before the reply is
+        // written. That ordering is the whole point of the feature: it reproduces the window a real
+        // crash opens — the Host holds the answer, the client has not yet learned its outcome — and
+        // only in that window can a test observe whether the bridge treats a delivery it never got a
+        // receipt for as "not sent" (which would invite a duplicate) or as unproven (which is the
+        // truth). A delay placed before this point would instead delay the answer's application and
+        // measure nothing.
+        const respondDelay = this.#delayed.get('respond');
+        if (respondDelay) await new Promise((resolvePromise) => setTimeout(resolvePromise, respondDelay));
+        // `dropResponseFor('respond')` means the answer was APPLIED — the lines above already ran —
+        // and the receipt is lost with the socket. That is the lost-receipt case FR-APPR-1's second
+        // half is about, and it is injectable here rather than only on the `/api/<method>` path: this
+        // branch used to return before the fault-injection block below, so the requirement could not
+        // be exercised at all and a test had to document that as an evidenced limitation.
+        if (this.#dropped.has('respond')) {
+          req.socket.destroy();
+          return;
+        }
         res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify(outcome === 'accepted' ? { accepted: true } : { accepted: false, reason: 'not-pending' }));
+        res.end(JSON.stringify(outcome === 'accepted' ? { accepted: true } : { accepted: false, reason: outcome }));
         return;
       }
       if (!url.pathname.startsWith('/api/')) {
@@ -556,9 +608,22 @@ export class FakeHost {
 
   /** Approvals awaiting an answer, keyed by rpc id. */
   #pendingApprovals = new Set();
+  /** @type {string|null} one-shot override for the next `/api/respond` reason */
+  #forcedRespondReason = null;
+  /** @type {string[]} approvals this Host applied, so a test can prove recovery applied none */
+  #appliedApprovals = [];
 
   /** Mark an approval rpc id as pending so /api/respond accepts it exactly once. */
   markApprovalPending(rpcId) { this.#pendingApprovals.add(rpcId); }
+
+  /**
+   * Force the reason on the NEXT `/api/respond` receipt, whatever the request's pending state is.
+   * @param {string|null} reason a reason from the Host's closed set, or any other string
+   */
+  forceRespondReason(reason) { this.#forcedRespondReason = reason; }
+
+  /** The approval decisions the Host actually APPLIED, for a "did recovery approve anything?" oracle. */
+  get appliedApprovals() { return [...this.#appliedApprovals]; }
 
   /**
    * @param {import('node:http').IncomingMessage} req

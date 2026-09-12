@@ -12,6 +12,11 @@
   //     stdio TRANSPORT and genuinely needs stdin/stdout, a pid and signal handlers, so nothing defined
   //     in it could be gated. Leaving the constants and the mapping in the transport would have made
   //     this gate either vacuous or a lie.
+  //   - `src/lib/redact.ts` is the inbound normalisation boundary. It is compiled here because its
+  //     Node-freeness is a design requirement rather than a happy accident: it runs over data that
+  //     arrives from the Host, it is shared by the ingest path and anything that formats evidence, and
+  //     a boundary that could reach the filesystem or the environment would be a boundary that can
+  //     leak. It also imports nothing at all, and this gate keeps it that way.
   //
   // `src/lib/gateway.ts` is deliberately NOT included: needing streams is legitimate for a transport, and
   // claiming otherwise would force a false abstraction. The checked property is that every wire shape,
@@ -25,6 +30,7 @@
   "include": [
     "src/lib/errors.ts",
     "src/lib/mcp-tools.ts",
-    "src/lib/mcp-protocol.ts"
+    "src/lib/mcp-protocol.ts",
+    "src/lib/redact.ts"
   ]
 }

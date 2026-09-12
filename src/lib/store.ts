@@ -193,6 +193,26 @@ create table if not exists cursors (
   primary key (task_id, session_id, scope)
 );
 
+-- What the bridge has done about each Host queue item it was asked to remove.
+--
+-- Why this is durable rather than in-memory: session.updateQueue has no host-side idempotency key
+-- beyond rpcId, so the only thing standing between a retry and a second destructive request is what
+-- the bridge remembers about the FIRST attempt. A 'removed' row means the Host confirmed the
+-- removal; an 'uncertain' row means bytes reached the socket and the outcome was never proven. Both
+-- must survive a restart, because the process that would otherwise remember is exactly the process
+-- that may have died mid-request. Neither is ever re-sent blindly. (No backticks in this comment:
+-- it lives inside the schema template literal, where one would end the string.)
+create table if not exists queue_removals (
+  task_id      text not null references tasks(task_id) on delete cascade,
+  session_id   text not null references sessions(session_id) on delete cascade,
+  item_id      text not null,
+  state        text not null,
+  operation_id text,
+  updated_at   integer not null,
+  primary key (task_id, session_id, item_id),
+  check (state in ('removed','uncertain','not-pending'))
+);
+
 create table if not exists response_dedupe (
   task_id    text not null,
   host_rpc_id text not null,
@@ -371,6 +391,29 @@ export interface ResponseDedupeRow {
   readonly answer_digest: string;
   readonly outcome: string;
   readonly created_at: number;
+}
+
+/**
+ * The closed set of states a recorded queue removal can be in.
+ *
+ * All three mean "do not send another request for this item", and they are kept distinct because
+ * they are different facts: `removed` was confirmed by the Host, `uncertain` reached the socket and
+ * was never proven, and `not-pending` is the Host's own definite answer that the item was not in its
+ * queue — so no removal happened and none is needed. Collapsing `not-pending` into `removed` would
+ * report a removal that never occurred; collapsing it into `uncertain` would leave a settled item
+ * unresolved forever.
+ */
+export const QUEUE_REMOVAL_STATES = Object.freeze(['removed', 'uncertain', 'not-pending']);
+
+/** One row of `queue_removals`: what the bridge knows about one Host queue item's removal. */
+export interface QueueRemovalRow {
+  readonly task_id: string;
+  readonly session_id: string;
+  readonly item_id: string;
+  /** `removed` when the Host confirmed it, `uncertain` when the outcome was never proven. */
+  readonly state: string;
+  readonly operation_id: string | null;
+  readonly updated_at: number;
 }
 
 /** One row of `audit`. */
@@ -576,6 +619,19 @@ export interface DecideInteractionInput {
 }
 
 /** Input of `recordResponseDelivery`. */
+/**
+ * The closed set of states a recorded answer delivery can be in.
+ *
+ * `dispatching` is the one that makes a crash recoverable, and it is written BEFORE the POST: it
+ * means bytes may have reached the Host and no answer was observed. Its absence is equally
+ * meaningful — a decision with NO delivery row had no delivery attempted, which is a different fact
+ * from "we sent it and do not know the outcome". Collapsing those two is how a crash between the
+ * decision and the send gets reported as an unprovable outcome, or worse, as delivered.
+ */
+export const RESPONSE_DELIVERY_STATES = Object.freeze([
+  'dispatching', 'accepted', 'not-pending', 'bad-response', 'refused', 'uncertain', 'unclassified', 'unrecognised',
+]);
+
 export interface RecordResponseDeliveryInput {
   readonly taskId: string;
   readonly hostRpcId: string;
@@ -1314,6 +1370,17 @@ export class Store {
    * @param input the delivery attempt
    * @returns the stored dedupe row
    */
+  /**
+   * Record what happened to one answer delivery, overwriting any earlier value.
+   *
+   * The caller's FIRST write for an rpc id must be `dispatching`, made durable before the request is
+   * written, and the later write must be the observed outcome. Two writes rather than one is the
+   * whole point: a process that dies in between leaves `dispatching` behind, and that row is the only
+   * evidence that bytes may have been sent. Without it a crash is indistinguishable from a decision
+   * that was never delivered — and "never delivered" invites a retry that a `dispatching` row
+   * correctly forbids.
+   * @param input the rpc id, the answer digest, and the state just reached
+   */
   recordResponseDelivery({ taskId, hostRpcId, answerDigest, outcome }: RecordResponseDeliveryInput): ResponseDedupeRow | undefined {
     this.write(() => {
       this.run(
@@ -1325,6 +1392,68 @@ export class Store {
       );
     });
     return this.get<ResponseDedupeRow>('select * from response_dedupe where task_id = ? and host_rpc_id = ?', taskId, hostRpcId);
+  }
+
+  /**
+   * Did a delivery for this rpc id leave the `dispatching` state, and what is it now?
+   *
+   * Returns the row, so a caller can tell all three cases apart: `null` means no delivery was ever
+   * attempted (the decision is durable and NOT sent), `dispatching` means bytes may have reached the
+   * Host and the outcome was never observed, and any terminal state means the question is answered.
+   * The distinction is what AGENTS.md section 6 requires a caller be able to make.
+   * @param taskId @param hostRpcId
+   */
+  getResponseDeliveryState(taskId: string, hostRpcId: string): ResponseDedupeRow | null {
+    return this.getResponseDelivery(taskId, hostRpcId) ?? null;
+  }
+
+  /**
+   * Record what the bridge knows about one Host queue item's removal, overwriting any earlier state.
+   *
+   * Overwriting is deliberate: the ONLY transition that may replace a value is a later, better
+   * observation — `uncertain` becoming `removed` once the Host's own queue snapshot no longer lists
+   * the item. A caller that wants to avoid re-sending must therefore read this first and treat BOTH
+   * states as settled. See `getQueueRemoval`.
+   * @param input the item, its session, and the state just observed
+   */
+  recordQueueRemoval({ taskId, sessionId, itemId, state, operationId = null }: {
+    taskId: string; sessionId: string; itemId: string; state: string; operationId?: string | null;
+  }): QueueRemovalRow | null {
+    this.write(() => {
+      this.run(
+        `insert into queue_removals(task_id, session_id, item_id, state, operation_id, updated_at)
+         values (?,?,?,?,?,?)
+         on conflict(task_id, session_id, item_id) do update set state = excluded.state,
+           operation_id = excluded.operation_id, updated_at = excluded.updated_at`,
+        taskId, sessionId, itemId, state, operationId, Date.now(),
+      );
+    });
+    return this.getQueueRemoval(taskId, sessionId, itemId);
+  }
+
+  /**
+   * What is already known about this item's removal, or null when nothing is.
+   *
+   * The caller's rule, stated here because it is the whole point of the table: a non-null row means a
+   * request for this item has ALREADY been sent, so sending another would be a second destructive
+   * request for the same occurrence. `null` is the only value that may be sent.
+   * @param taskId @param sessionId @param itemId
+   */
+  getQueueRemoval(taskId: string, sessionId: string, itemId: string): QueueRemovalRow | null {
+    // `get` answers `undefined` for no row and the row interfaces are nullable, so the two
+    // spellings of "nothing" are reconciled here rather than at every call site.
+    return this.get<QueueRemovalRow>(
+      'select * from queue_removals where task_id = ? and session_id = ? and item_id = ?',
+      taskId, sessionId, itemId,
+    ) ?? null;
+  }
+
+  /** Every recorded removal for one session, oldest first. @param taskId @param sessionId */
+  listQueueRemovals(taskId: string, sessionId: string): QueueRemovalRow[] {
+    return this.all<QueueRemovalRow>(
+      'select * from queue_removals where task_id = ? and session_id = ? order by updated_at asc',
+      taskId, sessionId,
+    );
   }
 
   /** @param taskId @param hostRpcId */

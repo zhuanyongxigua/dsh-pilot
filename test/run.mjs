@@ -61,6 +61,43 @@ if (!existsSync(resolve('dist/lib/ids.js'))) {
   process.exit(2);
 }
 
+/**
+ * Register every case this run WILL execute, before executing any of them.
+ *
+ * Why a pre-pass: the matrix gate has to check that the set of names its own static collection finds
+ * equals the set the runner actually registers. A hand-maintained total in the gate could only be
+ * kept honest by remembering to bump it, which is a check that rots; handing the gate the runner's
+ * own count makes disagreement impossible to hide. Modules are imported here and again in the main
+ * loop, and Node's module cache makes the second import free.
+ */
+let registeredCases = 0;
+for (const layer of layers) {
+  const dir = resolve(layer);
+  let names;
+  try {
+    names = readdirSync(dir).filter((name) => name.endsWith('.test.mjs')).sort();
+  } catch { continue; }
+  for (const name of names) {
+    const id = `${layer.replace(/^test\//, '')}/${name.replace(/\.test\.mjs$/, '')}`;
+    if (args.filter && !id.includes(args.filter)) continue;
+    try {
+      const mod = await import(pathToFileURL(join(dir, name)).href);
+      const suites = mod.default ?? {};
+      if (typeof suites !== 'object') continue;
+      for (const key of Object.keys(suites)) {
+        // The same rule the runner applies below, and the ONLY rule: a `$`-prefixed key is metadata,
+        // not a case. `$names` deliberately does not add to this count — it declares the sub-cases a
+        // generated suite will report INSIDE the suite keys it already exports, so counting both
+        // inflated this total by exactly the number of declared names. The matrix gate keeps its own
+        // collection that counts both forms, because a document may cite either; this is the number
+        // the runner registers and executes, which is what the gate compares against.
+        if (key.startsWith('$')) continue;
+        registeredCases += 1;
+      }
+    } catch { /* a module that cannot be imported is reported by the main loop */ }
+  }
+}
+
 /** @type {{id: string, layer: string, status: string, ms: number, detail?: string, stack?: string}[]} */
 const results = [];
 const startedAt = new Date();
@@ -92,6 +129,16 @@ for (const layer of layers) {
       layer,
       file,
       root: resolve('.'),
+      // What this run registered, and whether it was narrowed: the matrix gate compares its own
+      // static collection against these rather than against a constant nobody would remember to
+      // update. A filtered run registers a subset while the gate still collects every name, so the
+      // total check is only meaningful when nothing was filtered out.
+      registeredCases,
+      filtered: Boolean(args.filter),
+      // Which layers this run selected, so a check that compares the runner's count against a static
+      // collection of the tree can restrict itself to the same layers. `node test/run.mjs test/unit`
+      // legitimately registers a fraction of the tree; that is not a disagreement.
+      layers: layers.map((layer) => layer.replace(/^test\//, '')),
     };
     for (const [suiteName, run] of Object.entries(suites)) {
       // A suite may declare metadata instead of a case. `$names` is the one such key today: a suite

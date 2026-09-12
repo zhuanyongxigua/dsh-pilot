@@ -157,11 +157,20 @@ export type QueueAction =
   | { readonly kind: 'remove' }
   | { readonly kind: 'steer' };
 
-/** The carrier receipt `/api/respond` answers with: the answer was taken, or why it was not. */
+/**
+ * The carrier receipt `/api/respond` answers with: the answer was taken, or why it was not.
+ *
+ * The Host's contract for `reason` is a CLOSED set — `not-pending` when it holds no request for that
+ * rpc id, and `bad-response` when the answer itself was malformed — and the values are named here so
+ * that the mapping below can be checked against them instead of against a recollection.
+ */
 export interface RespondReceipt {
   readonly accepted?: boolean;
   readonly reason?: unknown;
 }
+
+/** The closed set of reasons the Host's own contract names for a refused carrier receipt. */
+export const RESPOND_REFUSAL_REASONS = Object.freeze(['not-pending', 'bad-response']);
 
 /** The answer to deliver: the server-request's rpc id and the payload to answer with. */
 export interface RespondInput {
@@ -453,7 +462,17 @@ export class DshHostAdapter {
         return refused(new BridgeError(ERROR_CODES.HOST_PROTOCOL, 'respond receipt is not json', {}));
       }
       if (receipt?.accepted === true) return ok({ receipt: 'accepted' });
-      return ok({ receipt: 'not-pending', reason: receipt?.reason ?? 'unknown' });
+      // `accepted: false` carries WHY, and the why is not one thing. Collapsing every refusal into
+      // `not-pending` told the caller "the host has no pending request for this rpc id" for a
+      // `bad-response` too — which is the opposite fact: the Host DID have the request and rejected
+      // the ANSWER as malformed, i.e. this bridge sent something wrong. Reporting that as "nothing was
+      // pending" hides a defect in the very code path being reported on, so the reasons are mapped
+      // explicitly and an unrecognised one is named as unrecognised rather than defaulted.
+      const reason = typeof receipt?.reason === 'string' ? receipt.reason : 'unknown';
+      if (reason === 'not-pending' || reason === 'bad-response') {
+        return ok({ receipt: reason, reason });
+      }
+      return ok({ receipt: 'unclassified', reason });
     } catch (error) {
       if (bytesWritten) {
         return uncertain('respond-transport-after-send', {

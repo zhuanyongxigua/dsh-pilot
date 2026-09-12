@@ -446,11 +446,22 @@ with the database, the marker and the audit rows alone, without asking the bridg
 - Losing the carrier sets connection to down and leaves execution state as the last observed fact.
   Reconnect reopens the downlinks and refetches history, then dedupes; the fake-Host layer asserts
   convergence to the no-disconnect control state.
-- **Two cancellation scopes, and only one of them is implemented against the Host.**
-  `session.cancel` stops the turn (`target.scope` = `local-open-turn`) and freezes the next local
-  dispatch while it checks; `queue.clear` clears the **daemon's own** pending queue and reports
-  `remoteScope.cleared: false`, because removing a Host-side queue item needs an item id observed
-  from the Host's `session/queue` snapshot, which this build does not do. §11 lists that gap.
+- **Two cancellation scopes, and both reach the Host.** `session.cancel` stops the turn
+  (`target.scope` = `local-open-turn`) and freezes the next local dispatch while it checks.
+  `queue.clear` clears the daemon's own pending queue *and* removes the named item from the Host's
+  with `session.updateQueue` (`action: {kind: 'remove'}`), addressed to the Host session and to an
+  item id read from the last observed `session/queue` snapshot; `remoteScope.cleared` is therefore
+  a real result rather than a constant, and items the daemon has never observed are refused locally
+  without a request.
+  The removal is deliberately hard to do twice. The snapshot read, the session/item binding and the
+  durable `queue_removals` ledger are all read **inside** the per-session serialization boundary,
+  because a snapshot taken outside it lets two concurrent clears of one item both decide they may
+  send — the boundary only serializes the sends, it cannot un-decide them. The ledger, not the
+  snapshot, is the defence: `removed` on a confirmed removal, `uncertain` when the Host's answer did
+  not confirm (which blocks a blind re-send until the item's absence is seen in a fresh snapshot),
+  `not-pending` when the Host itself says it holds no such item, and *nothing at all* when the
+  refusal happened before anything was sent — so a legitimate retry stays possible. §11 lists what
+  remains open.
 - **A cancel acknowledgement is not process evidence.** The cancel result carries
   `processEvidence: {observed: false, reason: 'the Host exposes no receipt for tool subprocess
   termination; only a turn-level ack is available'}`, and the note scopes the acknowledgement to the
@@ -493,7 +504,7 @@ Named here so no reader infers them from the layer names.
 
 | Not built | Why, and what is reported instead |
 | --- | --- |
-| Host-side queue removal (`session.updateQueue` with `action.kind: "remove"`) | needs a queue item id observed from the Host's `session/queue` snapshot; `queue.clear` clears the daemon queue and reports `remoteScope.cleared: false` with that reason (measured in `fake-host/contract::cancel is turn-scoped, reports subprocess evidence honestly, and holds local dispatch while checking`) |
+| Host-side queue removal (`session.updateQueue` with `action.kind: "remove"`) | **Implemented.** `queue.clear` accepts explicit `itemIds` (MCP tool `dsh_queue_clear`) and removes them from the Host, reporting `remoteScope` with the per-item outcome; an item the daemon has never observed is refused locally with `queue-item-not-observed` instead of being guessed at. The once-only guarantee is the durable ledger described in §9, measured in `fake-host/queue-removal-once::two concurrent callers naming one item produce at most one removal request on the wire` and its three siblings. |
 | Positive process-level evidence for a subprocess stop | the Host contract has no receipt for child-process termination; the bridge reports `observed: false` rather than implying one |
 | A timeout lease for ownership | rejected in ADR 0002: a paused owner must keep ownership, so a hung owner holds it until it is killed |
 | `session.export` | the Host route exists (`GET`/`HEAD /api/session.export`) and the bridge does not call it; a session-log ZIP is sensitive by definition and is never produced, committed or published |

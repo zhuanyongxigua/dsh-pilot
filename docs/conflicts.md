@@ -12,7 +12,41 @@ collide, what was done in the meantime, and what resolving it would require.
 
 ## C-1 — FR-SEC-3 ("a secret never appears in state") versus the event archive's fidelity
 
-**Status: OPEN. Decision needed from the task owner.**
+**Status: RESOLVED, by decision. Resolved by ADR 0003
+(`docs/adr/0003-inbound-normalisation-and-redaction-boundary.md`) and implemented in
+`src/lib/redact.ts` + the two ingest sites in `src/lib/daemon.ts`.
+
+The resolution is *not* the one this file previously recommended. It was reached by asking what
+FR-SEC-3 is actually for, and the answer changed the shape of the fix: the requirement is not that
+the bytes on disk match the peer's, it is that a credential never sits in state this bridge can
+show. Byte fidelity was never the requirement — **semantic replay fidelity** is, and the two are
+not the same thing. What follows records the decision, the reasoning that replaced the earlier
+one, and the evidence.
+
+### The decision
+
+**One inbound normalisation/redaction boundary, applied once per event, whose output is what every
+consumer sees.** The same redacted object is written to `events.payload_json` *and* folded into
+live state, so the live reduction and a post-crash replay of the archive reduce the same input and
+cannot diverge. The previous design kept two payloads for one event — the peer's frame in memory
+and a stored copy — which is precisely the divergence this conflict was about.
+
+Redaction is **semantic-preserving, not content-preserving**: `seq`, `type`, `turn`, session and
+interaction ids, ordering, array lengths and every non-string value pass through byte-identical,
+because those are what replay and reconciliation read. Only credential-shaped *text* and
+credential-shaped *object keys* are replaced. Fidelity is preserved in the dimension the durability
+model depends on and dropped in the dimension it does not.
+
+### Why the earlier "redaction is the wrong fix" reasoning was not decisive
+
+The argument recorded below assumed redaction must be lossy in a way that breaks replay. That is
+true of a redaction that changes *structure*; it is not true of one that only removes
+credential-shaped strings, because no part of the reconciliation path is keyed on a credential's
+value. The three options this file listed all accepted the premise that the archive must hold the
+peer's bytes; option 4 — normalise once, at ingress, for every consumer — does not, and it is the
+one implemented. The earlier reasoning is kept below verbatim rather than deleted, because a
+resolved conflict that erases its own history is indistinguishable from one that was never
+examined.
 
 ### The two rules
 
@@ -57,12 +91,24 @@ The claim was made **precise instead of broad**, and each half is now measured:
 | Text the bridge **authors** into its own error surface (`BoundText`, `sanitizeDetails`, the outbox `errorMessage`) | Redacted. A credential is replaced with `[redacted:credential]` before bounding, and redaction happens **before** truncation because half a credential is still a leak of the half that survived. | `security/secret-leakage::a secret in a host error never reaches a caller, a log, or durable state` |
 | Text the bridge **copies** into its own interaction payload (the approval `reason`) | Redacted, with the pre-existing 500-character bound preserved. | `security/secret-leakage::a secret in an approval reason never reaches durable state or a caller` |
 | Ambient provider credentials in the daemon's environment | Never read, and asserted absent from the Host's request log, from durable state and from the daemon's output. | `security/secret-leakage::the bridge never reads a provider credential value, only the variable name` |
-| The **upstream event archive** | **Verbatim, deliberately.** Asserted to be verbatim, so a future reader cannot mistake the omission for an oversight. | `security/secret-leakage::the upstream event archive keeps payload bytes verbatim, and that is a documented conflict` |
+| The **upstream event archive** | **Normalised at ingress, once.** The stored payload is the boundary's output, so a credential in a tool input, a command string, an error bag or an object key is replaced before storage while the replay-critical fields are asserted byte-identical. | `security/secret-leakage::the upstream event archive holds the NORMALISED payload, keeps every replay-critical field, and the secret is gone` |
+| Text arriving from the Host through any other ingest path (the history refetch) | The same single boundary, so a row written by a refetch is indistinguishable from the same row written live. | `security/redaction-boundary::the sentinel is absent from a deeply nested object, an array element and an error-detail bag` |
 
 So FR-SEC-3 is satisfied for every surface the bridge **authors**, and is **not** satisfied for the
 archive of upstream bytes. That distinction is in the test names, not just in this file.
 
-### Mitigations currently in place for the archive
+### What the resolution does NOT cover, stated as a limit
+
+`src/lib/redact.ts` recognises credential-shaped material by pattern and by key name. It is
+therefore **not a guarantee that every credential is stripped**, and no test claims otherwise: a
+form nobody has written a pattern for is not recognised. This is recorded as an explicit LIMIT case
+in `security/redaction-boundary` (a 40-character hex blob is *not* redacted, asserted as a known
+limit rather than left to be discovered), and the false positive of the `Basic` header shape is
+asserted too. What is claimed is bounded and checkable: the credential shapes this project knows
+about, in the places it looked, including object keys, nested tool input, error details, cycles and
+inputs deep enough to exhaust the depth or node budget.
+
+### Mitigations that remain in place for the archive
 
 - The state directory is created `0700` and the IPC socket `0600`; `security/filesystem-scope`
   asserts the daemon writes nothing outside the root it was given.
@@ -70,20 +116,28 @@ archive of upstream bytes. That distinction is in the test names, not just in th
   `session.export` output is treated as a session log by definition and never published.
 - The daemon's own logging does not print event payloads; the log assertion above measures that.
 
-### What resolving it would require
-
-One of the following, as a decision rather than an implementation detail:
+### Options that were considered and rejected
 
 1. **Restrict FR-SEC-3's scope in `docs/requirements.md`** to text the bridge authors, and add a
    separate P0 for archive confidentiality (for example at-rest encryption of `events.payload_json`
    keyed by an operator-provided key, which would keep replay parity because the redaction would be
-   reversible by the same process).
+   reversible by the same process). Rejected as a *narrowing*: it would have closed this conflict by
+   editing the requirement to match the implementation, which is exactly what the task's instructions
+   forbid. It also would have added key management, which this project explicitly does not carry.
 2. **Archive a reversible transform** — store the payload under a key the daemon holds, so the
    bytes on disk are not the credential while the reconciliation path still sees the original
-   exactly.
+   exactly. Rejected: it protects the archive from a reader who lacks the key while leaving the
+   credential fully present in state the daemon can show, and it buys that at the cost of a key
+   management story and a new failure mode (a lost key makes history unreplayable — the durability
+   model, traded for confidentiality, again).
 3. **Accept the exposure explicitly**, with the file-permission boundary named as the control.
-
-Option 3 is the current de facto position, and it is recorded here rather than assumed.
+   Rejected once the alternative above existed: "the directory is 0700" is a weaker control than
+   "the credential is not there", and this option also required asserting the exposure positively in
+   a test, i.e. writing a test whose passing state documented a leak.
+4. **One boundary at ingress, shared by every consumer** — implemented. It keeps the commit-time
+   guarantee that motivated the original position (the live path and the replay path see the same
+   payload, so they cannot disagree) while removing the credential, and it requires no key, no
+   configuration, and no new failure mode.
 
 ---
 

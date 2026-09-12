@@ -583,7 +583,7 @@ export default {
     }
   },
 
-  'FR-CANCEL-1: a repeated removal is refused with queue-item-not-found, never reported as a success': async () => {
+  'FR-CANCEL-1: a repeated removal is refused locally from the durable ledger, never sent twice and never reported as a success': async () => {
     const { host, ipc, daemon, teardown } = await rig({ autoTurn: false });
     try {
       const { taskId, sessionId, hostSessionId } = await newSession(ipc, 'queue-duplicate');
@@ -627,14 +627,27 @@ export default {
       host.holdQueueSnapshots(hostSessionId);
       const held = await ipc.request({ op: 'queue.clear', taskId, sessionId, itemIds: [second.id] });
       assert.equal(held.remoteScope.status, 'cleared');
-      // The daemon still holds the pre-removal snapshot, so this one really is sent to the Host.
+      // The daemon still holds the pre-removal snapshot, so the OBSERVED snapshot alone would say
+      // this item is still there and send a second request. The durable removal ledger is what stops
+      // it — the first request was confirmed by the Host, so the item is settled and there is nothing
+      // left to remove.
+      //
+      // This replaces an assertion that the second attempt really DID reach the wire and was refused
+      // by the Host instead. Relying on that was wrong in a way worth naming: it made the bridge's
+      // safety depend on the Host refusing a request it should never have received, so a Host that
+      // answered `accepted: true` a second time — or a lost first answer — would turn a duplicate
+      // into a duplicate destructive effect. The bridge must not need the Host's refusal to be safe.
       const again = await ipc.request({ op: 'queue.clear', taskId, sessionId, itemIds: [second.id] });
       assert.equal(again.remoteScope.status, 'refused', JSON.stringify(again.remoteScope));
       assert.equal(again.remoteScope.cleared, false);
-      assert.equal(again.remoteScope.refused[0].code, 'queue-item-not-found',
-        "the host's own queue-item-not-found must be surfaced as its own code");
-      assert.equal(again.remoteScope.refused[0].sent, true, 'this refusal came from the Host, not from the binding');
-      assert.equal(host.requestsFor('session.updateQueue').length, 3, 'the second attempt really did reach the wire');
+      assert.equal(again.remoteScope.refused.length, 1);
+      assert.equal(again.remoteScope.refused[0].code, 'queue-item-already-removed',
+        'a second removal of an item the Host already confirmed must be refused locally by its own code');
+      assert.equal(again.remoteScope.refused[0].state, 'removed');
+      assert.equal(again.remoteScope.refused[0].sent, false,
+        'the second attempt must NOT be sent: that is the duplicate this ledger exists to prevent');
+      assert.equal(host.requestsFor('session.updateQueue').length, 2,
+        'exactly the two first attempts may reach the wire; the duplicate must be stopped here');
       assert.deepEqual(host.queueItems(hostSessionId), []);
       host.releaseQueueSnapshots(hostSessionId);
       await waitFor(async () => observedQueue(await ipc.request({
@@ -829,12 +842,23 @@ export default {
         });
       } catch (error) { conflicting = /** @type {{code?: string}} */ (error); }
       assert.equal(conflicting?.code, 'APPROVAL_STALE');
-      // The identical decision is idempotent.
-      const duplicate = await ipc.request({
-        op: 'interaction.decide', taskId, interactionId: interaction.interactionId,
-        decision: 'allowed-once', authorityToken: token,
-      });
-      assert.equal(duplicate.receipt, 'duplicate');
+      // The identical decision is refused too, with its OWN code, so a replay is never mistaken for
+      // an application. The detail names whether the first decision reached the Host.
+      /** @type {{code?: string, details?: {deliveredToHost?: string|null}}|null} */
+      let replayed = null;
+      try {
+        await ipc.request({
+          op: 'interaction.decide', taskId, interactionId: interaction.interactionId,
+          decision: 'allowed-once', authorityToken: token,
+        });
+      } catch (error) { replayed = /** @type {{code?: string}} */ (error); }
+      assert.equal(replayed?.code, 'APPROVAL_REPLAYED',
+        `a replay must be its own typed refusal, got ${JSON.stringify(replayed)}`);
+      assert.equal(replayed?.details?.deliveredToHost, 'accepted',
+        'the refusal must report that the first decision was already delivered');
+      // And the whole episode sent exactly one answer to the Host.
+      assert.equal(host.respondReceipts.length, 1,
+        `one decision was applied, so exactly one answer may be on the wire, got ${JSON.stringify(host.respondReceipts)}`);
     } finally {
       await teardown();
     }

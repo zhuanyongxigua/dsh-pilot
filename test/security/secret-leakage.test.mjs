@@ -264,7 +264,7 @@ export default {
     }
   },
 
-  'the upstream event archive keeps payload bytes verbatim, and that is a documented conflict': async () => {
+  'the upstream event archive holds the NORMALISED payload, keeps every replay-critical field, and the secret is gone': async () => {
     // This case exists because writing it exposed a REAL conflict between two binding rules, and
     // the honest outcome is to state the conflict rather than to quietly redact an archive or to
     // quietly drop the claim. See docs/conflicts.md C-1.
@@ -321,17 +321,57 @@ export default {
       db.close();
 
       const archivedText = JSON.stringify(archived);
-      // The archive is FAITHFUL: the payload the peer sent is the payload stored. That is the
-      // behaviour under test here, and it is asserted positively rather than assumed.
       assert.ok(archived.length > 0, 'expected the event archive to contain the ingested events');
+
+      // THIS IS THE C-1 CONTRACT, asserted on the archive itself.
+      //
+      // This case previously required the opposite — that the archive hold the peer payload
+      // byte-for-byte — and the reversal is the resolution of conflict C-1, not a weakening. The
+      // requirement FR-SEC-3 makes is that a credential does not sit in bridge-visible state, and the
+      // archive is bridge-visible state. What the boundary replaces is the CLAIM, not the coverage:
+      // byte fidelity was never required, semantic replay fidelity is, and that is asserted directly
+      // rather than proxied by "the bytes are intact".
       assert.ok(
-        archivedText.includes(secret),
-        'the archive is expected to hold the peer payload verbatim; if this fails, the archive was redacted '
-        + 'and docs/conflicts.md C-1 needs revisiting because replay parity changed',
+        !archivedText.includes(secret),
+        'a credential reached the durable event archive; the inbound boundary must strip it before the '
+        + 'event is stored, because the stored row is what a replay reduces',
+      );
+      assert.ok(
+        archivedText.includes('redacted'),
+        'the archive must show that something was redacted, so "the secret is absent" cannot be satisfied '
+        + 'by the event never having been stored at all',
       );
 
-      // And the surfaces the bridge AUTHORS still refuse the secret, which is what FR-SEC-3 can
-      // honestly require of an archiving bridge.
+      // The replay-critical facts must survive the boundary EXACTLY, or the fix for C-1 would have
+      // bought secrecy by breaking the durability model. Read back per row from the archive and
+      // compared against what the peer actually sent.
+      // `DatabaseSync`'s row values are `SQLOutputValue` — it cannot know this table's column types —
+      // so the two columns read here are narrowed at that boundary and then used. The `kind` assertion
+      // below is the check that the narrowing was right, not the cast.
+      const parsedArchived = archived.map((row) => ({
+        kind: typeof row.kind === 'string' ? row.kind : '',
+        payload: /** @type {{raw?: Record<string, unknown>, nativeType?: unknown}} */ (
+          JSON.parse(String(row.payload_json))
+        ),
+      }));
+      /** The `raw` sub-object as a bag, so the replay-critical fields below can be read by name. */
+      const rawOf = (entry) => /** @type {Record<string, unknown>} */ (entry?.payload?.raw ?? {});
+      const toolRow = parsedArchived.find((row) => rawOf(row)['seq'] === 9001);
+      assert.ok(toolRow, `the tool/call event must be archived with its sequence intact, got ${JSON.stringify(parsedArchived.map((row) => rawOf(row)['seq']))}`);
+      assert.equal(toolRow.payload.nativeType, 'tool/call', 'the native type must survive unchanged');
+      assert.equal(rawOf(toolRow)['type'], 'tool/call', 'the event type must survive unchanged');
+      assert.equal(rawOf(toolRow)['seq'], 9001, 'the sequence number must survive unchanged, or the cursor is meaningless');
+      // The tool NAME is a non-sensitive string beside the redacted input, and it must survive: a
+      // boundary that removed every string would pass "the secret is gone" while destroying the
+      // event. `turn` lives on the separate `turn/start` row rather than on this one, so the turn
+      // binding is asserted where it actually is.
+      assert.equal(rawOf(toolRow)['name'], 'bash', 'the tool name must survive the boundary unchanged');
+      const turnRow = parsedArchived.find((row) => rawOf(row)['type'] === 'turn/start');
+      assert.ok(turnRow, 'the turn/start event must be archived');
+      assert.equal(typeof rawOf(turnRow)['turn'], 'number',
+        `turn numbering must survive unchanged, got ${JSON.stringify(rawOf(turnRow)['turn'])}`);
+
+      // And the surfaces the bridge AUTHORS refuse the secret, which is what FR-SEC-3 requires.
       const hitsInInteractions = locate(interactions, secret);
       assert.deepEqual(hitsInInteractions, [], `a credential reached the bridge's own interaction record: ${hitsInInteractions.join(' | ')}`);
       const logs = `${daemon.output().stdout}\n${daemon.output().stderr}`;
@@ -339,7 +379,7 @@ export default {
       assert.deepEqual(hitsInLogs, [], `the secret leaked into the daemon's output: ${hitsInLogs.join(' | ')}`);
       // The measurement is printed, so a reader sees how much of the state tree is affected.
       process.stdout.write(
-        `      archive measurement: ${archived.length} event rows; the peer payload is stored verbatim (conflict C-1)\n`,
+        `      archive measurement: ${archived.length} event rows; payloads normalised at ingress, replay-critical fields preserved (C-1 resolved)\n`,
       );
     } finally {
       await daemon.stop();

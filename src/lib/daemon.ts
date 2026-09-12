@@ -45,6 +45,7 @@ import type {
 } from './store.ts';
 import { OwnerLock } from './owner-lock.ts';
 import { DshHostAdapter, boundText } from './adapter.ts';
+import { redactInbound } from './redact.ts';
 import { startIpcServer, ensureAuthorityToken, readAuthorityToken } from './ipc.ts';
 import type { IpcServer } from './ipc.ts';
 
@@ -496,6 +497,10 @@ export class Daemon {
         currentTurnId: openTurn?.turn_id ?? null,
         // A terminal reason is only ever recorded from an authoritative terminal event.
         lastTerminalReason: lastTerminalReason(this.#store, localId),
+        // The same fact in machine-readable form. FR-EXEC-3 needs a caller to tell a completed turn
+        // from a failed or cancelled one; the reason string above now says so in words, and this says
+        // it in the store's own closed set (`store.TURN_STATES`) so nothing has to parse a sentence.
+        lastTerminalState: lastTerminalState(this.#store, localId),
       },
       cursor: cursor.status === 'expired'
         ? { status: 'CURSOR_EXPIRED', detail: 'cursor was bound to a different store generation' }
@@ -524,10 +529,20 @@ export class Daemon {
          * snapshot is not evidence that the Host's inbox is empty.
          */
         remoteObserved: this.#observedQueue.has(localId),
+        /**
+         * What this bridge has already done about Host queue items, durably. Reported because it is
+         * the answer to the only question a caller has before asking for a removal: has one been
+         * sent for this item already, and was the outcome ever proven? `removed` is settled;
+         * `uncertain` is unresolved and will not be retried on this bridge's own initiative. An item
+         * absent from this list has never had a removal sent.
+         */
+        removalLedger: this.#store.listQueueRemovals(session.task_id, localId)
+          .map((row) => ({ itemId: row.item_id, state: row.state })),
         dispatchHeld: held,
       },
       operations: operations.slice(-20).map(shapeOperation),
-      interactions: interactions.filter((row) => row.session_id === localId).map(shapeInteraction),
+      interactions: interactions.filter((row) => row.session_id === localId)
+        .map((row) => shapeInteraction(row, this.#store.getResponseDelivery(row.task_id, row.host_rpc_id))),
       events: this.#store.countEvents(session.task_id, localId),
     };
   }
@@ -585,6 +600,10 @@ export class Daemon {
         return {
           reason: this.#store.listTurns(session.session_id).length === 0 ? 'no-turn-observed' : 'turn-ended',
           terminalReason: lastTerminalReason(this.#store, session.session_id),
+          // `turn-ended` alone does not say whether the turn completed, failed or was cancelled;
+          // this does. The wait's own closed-set `reason` is unchanged, because it answers a
+          // different question (why did the wait return?) than the terminal state does.
+          terminalState: lastTerminalState(this.#store, session.session_id),
           events: count - startCount,
           connection: this.#connection,
           completeness: cursor?.completeness ?? 'unknown',
@@ -692,8 +711,13 @@ export class Daemon {
     this.#queue.set(session.session_id, []);
     const localRemoved = localItems.length;
 
+    // Read here only for REPORTING. The decision that matters — is this item still observed, and is
+    // it already settled? — is taken INSIDE the per-session serialization boundary below, so that the
+    // decision and the effect it authorises are ordered by the same lock rather than by two different
+    // ones. A pre-lock read is what let two concurrent callers both conclude the same item was
+    // sendable; what actually stops the second send today is the durable ledger, and the in-lock
+    // re-read is the structural fix that removes the class rather than that instance.
     const observedItems = this.#observedQueue.get(session.session_id) ?? [];
-    const observedIds = new Set(observedItems.map((item) => item.itemId));
     const observed = observedItems.map((item) => ({ itemId: item.itemId, placement: item.placement }));
     const openTurn = this.#store.currentOpenTurn(session.session_id);
 
@@ -735,34 +759,71 @@ export class Daemon {
       };
     }
 
-    // The binding check, before anything is sent. This is where an unobserved (or invented) id
-    // stops, and it is also what refuses a cross-session id: `observedIds` is this session's
-    // snapshot and no other.
     const refused: Array<{ itemId: string; code: string; state: string; sent: boolean; message: string }> = [];
-    const sendable: string[] = [];
-    for (const itemId of requested) {
-      if (observedIds.has(itemId)) {
-        sendable.push(itemId);
-      } else {
-        refused.push({
-          itemId,
-          code: 'queue-item-not-found',
-          state: 'refused',
-          sent: false,
-          message: 'item id is not in the last observed session/queue snapshot for this session, so no request was sent',
-        });
-      }
-    }
-
     const removed: string[] = [];
     const uncertain: Array<{ itemId: string; reason: string; operationId: string }> = [];
     const operations: Array<ReturnType<typeof shapeOperation>> = [];
 
-    if (sendable.length > 0) {
-      // Serialized per session, exactly like `session.prompt` and `session.cancel`: two mutating
-      // requests for one session must not interleave.
-      await this.#serialize(session.session_id, async () => {
-        for (const itemId of sendable) {
+    // Serialized per session, exactly like `session.prompt` and `session.cancel`: two mutating
+    // requests for one session must not interleave. Everything that DECIDES whether to send happens
+    // inside, not before.
+    await this.#serialize(session.session_id, async () => {
+      // Re-read the snapshot under the lock. This is the binding check: an id is only ever sent when
+      // the LAST `session/queue` snapshot for THIS session contains it, which is what refuses an
+      // invented id and what keeps a removal for one session out of another's queue.
+      const freshItems = this.#observedQueue.get(session.session_id) ?? [];
+      const observedIds = new Set(freshItems.map((item) => item.itemId));
+      const sendable: string[] = [];
+      for (const itemId of requested) {
+        if (!observedIds.has(itemId)) {
+          refused.push({
+            itemId, code: 'queue-item-not-found', state: 'refused', sent: false,
+            message: 'item id is not in the last observed session/queue snapshot for this session, so no request was sent',
+          });
+          continue;
+        }
+        // The durable ledger, read under the same lock: a request for this item has already been
+        // sent, so sending another would be a second destructive request for the SAME occurrence.
+        // Both settled states block it, and for different reasons that the caller must be able to
+        // tell apart — `removed` is done, `uncertain` is unresolved and must be reconciled against
+        // the Host rather than retried. This is a local refusal, so it never reaches the wire, and
+        // it does not lean on the Host to answer `queue-item-not-found` a second time.
+        const ledger = this.#store.getQueueRemoval(session.task_id, session.session_id, itemId);
+        if (ledger) {
+          /** Every settled state blocks the send; each is reported for what it is. */
+          const settled: Record<string, { code: string; message: string }> = {
+            removed: {
+              code: 'queue-item-already-removed',
+              message: 'this session already had this item removed, confirmed by the host, so it was not sent again',
+            },
+            uncertain: {
+              code: 'queue-item-removal-uncertain',
+              message: 'a removal request for this item was already sent and its outcome was never proven; it is not '
+                + 'retried automatically, because a retry would be a second destructive request for the same item',
+            },
+            'not-pending': {
+              code: 'queue-item-not-pending',
+              message: 'the host has already answered that this item is not pending in this session, so there is '
+                + 'nothing to remove and no request was sent',
+            },
+          };
+          const report = settled[ledger.state];
+          refused.push({
+            itemId,
+            // An unrecognised state cannot happen — the table's own check constraint bounds it — but a
+            // report is built for it anyway rather than crashing, because inventing a code is worse
+            // than naming the gap.
+            code: report?.code ?? 'queue-item-removal-state-unrecognised',
+            state: ledger.state,
+            sent: false,
+            message: report?.message ?? `the ledger holds an unrecognised settled state: ${String(ledger.state)}`,
+          });
+          continue;
+        }
+        sendable.push(itemId);
+      }
+
+      for (const itemId of sendable) {
           // Durable intent BEFORE the send. `session.updateQueue` has no host-side idempotency key
           // beyond `rpcId`, so the key here identifies one ATTEMPT: `#dispatch` persists the intent
           // and records the outcome, and the binding check above — not this key — is what stops a
@@ -794,12 +855,27 @@ export class Daemon {
             // does not carry (which would always read as absent).
             const answer: unknown = result.value;
             if (this.#isPropertyBag(answer) && answer['accepted'] === true) {
+              // Confirmed by the Host's own answer, so it is durably settled as removed. A later
+              // request for the same item is refused locally instead of being sent again.
+              this.#store.recordQueueRemoval({
+                taskId: session.task_id, sessionId: session.session_id, itemId, state: 'removed', operationId,
+              });
               removed.push(itemId);
             } else {
+              // Bytes reached the Host and the answer was not a confirmation. That is an unproven
+              // outcome, and it is recorded as one: the item is blocked from re-sending until
+              // something observes what actually happened.
+              this.#store.recordQueueRemoval({
+                taskId: session.task_id, sessionId: session.session_id, itemId, state: 'uncertain', operationId,
+              });
               uncertain.push({ itemId, reason: 'host-answer-was-not-a-removal-confirmation', operationId });
             }
           } else if (result.status === 'uncertain') {
-            // Sent, and unprovable: the Host may have applied the removal. Never counted as removed.
+            // Sent, and unprovable: the Host may have applied the removal. Never counted as removed,
+            // and never retried on our initiative — it is recorded so a restart cannot forget it.
+            this.#store.recordQueueRemoval({
+              taskId: session.task_id, sessionId: session.session_id, itemId, state: 'uncertain', operationId,
+            });
             uncertain.push({ itemId, reason: result.reason ?? 'unproven-outcome', operationId });
           } else {
             // A definite business refusal, with the Host's own code preserved: `queue-item-not-found`
@@ -815,6 +891,21 @@ export class Daemon {
               ? result.error?.details['hostCode']
               : undefined;
             const sent = typeof hostCode === 'string';
+            // The ledger is written only for a refusal that SETTLES the item, and left untouched for
+            // one that does not. Two cases, and the difference is what makes a retry safe:
+            //
+            //   - `queue-item-not-found` is the Host's definite answer that the item is not in its
+            //     queue. Nothing was removed and nothing needs to be, so the item is settled as
+            //     `not-pending`. Recording it is what removes the last dependence on the HOST refusing
+            //     a second, duplicate request: the duplicate is now refused here, before it is sent.
+            //   - any other refusal decided before a byte was written (an unreachable host, an aborted
+            //     call) is provably NOT applied, so nothing is recorded and the item stays sendable.
+            //     Writing a row here would turn a network blip into a permanently blocked item.
+            if (hostCode === 'queue-item-not-found') {
+              this.#store.recordQueueRemoval({
+                taskId: session.task_id, sessionId: session.session_id, itemId, state: 'not-pending', operationId,
+              });
+            }
             refused.push({
               itemId,
               code: sent ? hostCode : (result.error?.code ?? ERROR_CODES.HOST_REFUSED),
@@ -824,8 +915,7 @@ export class Daemon {
             });
           }
         }
-      });
-    }
+    });
 
     // Uncertainty dominates the summary: a removal whose outcome is unknown is never summarised as
     // a completed clear, and never as a failure either.
@@ -874,7 +964,10 @@ export class Daemon {
     // is a string by contract and anything else cannot name a stored state, so a non-string is
     // filtered as absent — reachable only from a hand-built frame, since the tool schema checks it.
     const stateFilter: string | null = typeof state === 'string' ? state : null;
-    return { interactions: this.#store.listInteractions(task.task_id, stateFilter).map(shapeInteraction) };
+    return {
+      interactions: this.#store.listInteractions(task.task_id, stateFilter)
+        .map((row) => shapeInteraction(row, this.#store.getResponseDelivery(row.task_id, row.host_rpc_id))),
+    };
   }
 
   /**
@@ -931,7 +1024,7 @@ export class Daemon {
     const previousDelivery = this.#store.getResponseDelivery(interaction.task_id, interaction.host_rpc_id);
     if (previousDelivery && previousDelivery.outcome === 'not-pending') {
       return {
-        interaction: shapeInteraction(interaction),
+        interaction: shapeInteraction(interaction, this.#store.getResponseDelivery(interaction.task_id, interaction.host_rpc_id)),
         delivered: false,
         receipt: 'not-pending',
         note: 'the host has no pending request for this rpc id; the interaction was already resolved, expired or replayed',
@@ -946,7 +1039,28 @@ export class Daemon {
       // its fields directly, so the failure mode is a TypeError and stays one.
       const current = this.#presentRow(cas.interaction, 'decision');
       if (current.decision === decision) {
-        return { interaction: shapeInteraction(current), delivered: false, receipt: 'duplicate', note: 'identical decision already applied' };
+        // FR-APPR-1/2: a replayed decision is REFUSED with its own typed error, not reported as a
+        // success carrying a 'duplicate' receipt. That shape made an operator's second, identical
+        // click look like a first one that worked: a caller could not tell "your answer was applied"
+        // from "nothing happened because you already answered", and could not tell either from a real
+        // delivery. `ERROR_CODES.APPROVAL_REPLAYED` existed for this path and had no callers, which is
+        // how the wrong shape survived.
+        //
+        // The detail reports whether the FIRST decision ever reached the Host, because that is the
+        // distinction an operator actually needs: a replay of a decision that was never delivered is
+        // recoverable by retrying DELIVERY, while a replay of one that was delivered is not a problem
+        // at all. `previousDelivery` is the row read above, keyed by this interaction's rpc id.
+        throw new BridgeError(ERROR_CODES.APPROVAL_REPLAYED, 'this interaction was already decided with the same decision', {
+          interactionId,
+          decision,
+          state: current.state,
+          // `null` is meaningful rather than "unknown": the delivery row records what the Host
+          // answered, so its absence means the answer was committed and never delivered.
+          deliveredToHost: previousDelivery?.outcome ?? null,
+          hint: previousDelivery
+            ? 'the decision was already delivered to the Host; re-deciding is a no-op and is refused'
+            : 'the decision is durable but was never delivered to the Host; deliver it rather than re-deciding',
+        });
       }
       throw new BridgeError(ERROR_CODES.APPROVAL_STALE, 'interaction already decided with a different decision', {
         interactionId, previous: current.state,
@@ -979,10 +1093,26 @@ export class Daemon {
       };
     }
     const answerValue = { sessionId: hostSessionId, approvalId: interaction.native_id, outcome: decision };
+    // DURABLE BEFORE SEND, in this order and for the reason AGENTS.md section 6 gives. The decision
+    // was committed above; this row commits THE INTENT TO DELIVER it, before a byte is written. A
+    // process that dies between the send below and the outcome write leaves `dispatching` behind, and
+    // that row is the only thing that can later distinguish "we may have answered the Host" from "we
+    // never tried" — the two cases a crash between the decision and the send would otherwise collapse
+    // into one. Without it, a crash after the POST looked exactly like a decision that was never
+    // delivered, and "never delivered" is an invitation to deliver again.
+    this.#store.recordResponseDelivery({
+      taskId: interaction.task_id,
+      hostRpcId: interaction.host_rpc_id,
+      answerDigest: createDigest(String(interaction.native_id ?? interaction.host_rpc_id)),
+      outcome: 'dispatching',
+    });
     const delivered = await this.#adapter.respond({ rpcId: interaction.host_rpc_id, value: answerValue });
     const receipt = await this.#recordDelivery(interaction, delivered);
     return {
-      interaction: shapeInteraction(this.#store.getInteraction(interaction.interaction_id)),
+      interaction: shapeInteraction(
+        this.#store.getInteraction(interaction.interaction_id),
+        this.#store.getResponseDelivery(interaction.task_id, interaction.host_rpc_id),
+      ),
       decision,
       delivered: receipt.delivered,
       receipt: receipt.receipt,
@@ -1026,10 +1156,15 @@ export class Daemon {
       const atValueValue: unknown = this.#isRecord(delivered.value) && this.#isRecord(delivered.value['value'])
         ? delivered.value['value']['receipt'] : undefined;
       const receiptField: unknown = atTop ?? atValue ?? atValueValue;
-      const observed = typeof receiptField === 'string' ? receiptField : 'accepted';
-      // An unreadable answer is not an acceptance: guessing 'accepted' from a shape nobody
-      // recognised would be the same lie the paragraph above is about.
-      if (typeof receiptField !== 'string') {
+      // A CLOSED set, and nothing is inferred from membership in it. The previous form read
+      // `typeof receiptField === 'string' ? receiptField : 'accepted'` and then special-cased only
+      // `not-pending`, so EVERY other string — `bad-response`, a future Host reason, a typo, any
+      // arbitrary text at all — was recorded as an acceptance with `delivered: true`. On a safety
+      // surface that is the worst possible default: a caller could not tell "the Host took the
+      // answer" from "the Host's answer was a word this bridge had never seen". A receipt this bridge
+      // does not recognise is now reported as unrecognised, and `accepted` must be said explicitly.
+      const receiptName = typeof receiptField === 'string' ? receiptField : null;
+      if (receiptName === null) {
         this.#store.recordResponseDelivery({
           taskId: interaction.task_id, hostRpcId: interaction.host_rpc_id, answerDigest: digest, outcome: 'unclassified',
         });
@@ -1039,6 +1174,36 @@ export class Daemon {
           note: 'the host answered, but its answer carried no receipt this bridge could classify',
         };
       }
+      if (receiptName === 'bad-response') {
+        // The Host HELD the request and rejected the answer as malformed, which is a defect in what
+        // this bridge sent rather than a statement about the request. It is recorded as its own
+        // outcome so it can never be read as "nothing was pending", and it is not a delivery.
+        this.#store.recordResponseDelivery({
+          taskId: interaction.task_id, hostRpcId: interaction.host_rpc_id, answerDigest: digest, outcome: 'bad-response',
+        });
+        this.#store.markAnswerNotPending({
+          interactionId: interaction.interaction_id, reason: 'host-receipt-bad-response',
+        });
+        return {
+          delivered: false,
+          receipt: 'bad-response',
+          note: 'the host rejected the answer as malformed, so the request was NOT answered by this call',
+        };
+      }
+      if (receiptName !== 'accepted' && receiptName !== 'not-pending') {
+        // A recognised SHAPE carrying a word this bridge does not know. Reported as unknown rather
+        // than assumed in either direction: it is neither a delivery nor a proven refusal, and the
+        // interaction is left for reconciliation rather than being marked resolved.
+        this.#store.recordResponseDelivery({
+          taskId: interaction.task_id, hostRpcId: interaction.host_rpc_id, answerDigest: digest, outcome: 'unrecognised',
+        });
+        return {
+          delivered: false,
+          receipt: 'unrecognised',
+          note: `the host answered with a receipt this bridge does not recognise: ${receiptName}`,
+        };
+      }
+      const observed = receiptName;
       if (observed === 'not-pending') {
         // The Host answered, and its answer is that this request is no longer pending. The
         // interaction is resolved BY THE HOST, so it is recorded that way and never as answered.
@@ -1171,7 +1336,17 @@ export class Daemon {
     const task = typeof taskId === 'string' ? this.#store.getTask(taskId) : null;
     if (!task) throw new BridgeError(ERROR_CODES.NOT_FOUND, 'task not found', { taskId });
     if (task.host_base !== this.hostBase) {
-      throw new BridgeError(ERROR_CODES.CONFLICT, 'task belongs to a different host', { taskId });
+      // The host origin is part of a task's identity, and the real Host usually comes back on a NEW
+      // ephemeral port. Refusing is right — a session on another origin is another Host's session —
+      // but the refusal must say what an operator can actually do about it, and must not read like a
+      // corrupted state file when it is really a moved Host.
+      throw new BridgeError(ERROR_CODES.CONFLICT, 'task belongs to a different host', {
+        taskId,
+        taskHostBase: task.host_base,
+        daemonHostBase: this.hostBase,
+        hint: 'the Host this task was attached to is at a different origin; point the daemon at that ' +
+          'origin, or start a new task for the current one',
+      });
     }
     return task;
   }
@@ -1233,14 +1408,19 @@ export class Daemon {
     }
     const result: AdapterCallResult = await this.#adapter.call(method, payload);
     if (result.status === 'ok') {
-      // The `value` read is preserved verbatim from the original: `AdapterCallResult.value` is the
-      // adapter's ok envelope (`{value, rpcId}`), so this reads one level inside it. Narrowing the
-      // envelope rather than casting it keeps a non-object value reading as the absent field the
-      // original produced, instead of putting an `any` back into the durable write.
+      // `result.value` IS the Host's value: `call()` returns `ok({ value: result.value, rpcId })`, so
+      // the envelope's `value` field already holds what the Host sent. This used to read one level
+      // further in (`result.value['value']`), which is a key that never exists — MEASURED against the
+      // fixture, `call('session.create')` gives `r.value === {sessionId: '…'}` and
+      // `r.value['value'] === undefined`. The effect was that every acknowledged operation durably
+      // stored no value at all, so an ack could not be replayed after a crash, which is the whole
+      // point of the record. The comment that justified the old read was simply wrong about the
+      // adapter's shape, which is why the read is now taken verbatim and the shape is asserted by a
+      // test rather than described by a comment.
       this.#store.markAcknowledged({
         operationId: freshRow.operation_id,
         ok: true,
-        value: this.#isPropertyBag(result.value) ? result.value['value'] : undefined,
+        value: this.#isPropertyBag(result.value) || Array.isArray(result.value) ? result.value : undefined,
       });
     } else if (result.status === 'refused') {
       // Preserve the host's own business code (for example `session-conflict`): the generic
@@ -1547,6 +1727,30 @@ export class Daemon {
         items.push({ itemId: id, placement: typeof placement === 'string' ? placement : 'unknown' });
       }
       this.#observedQueue.set(session.session_id, items);
+
+      // Reconcile unproven removals against this snapshot, which is the only authority on what the
+      // Host's queue actually holds. A fresh frame REPLACES the previous set, so an item that had an
+      // unproven removal and is no longer listed is now observed to be gone: the uncertainty is
+      // resolved by observation, and its ledger row moves to `removed`. Without this, an item whose
+      // removal succeeded but whose answer was lost would stay blocked forever — the caller would be
+      // told "unresolved" about an item that is provably not in the queue any more.
+      //
+      // The reverse is deliberately NOT done: a still-listed item stays `uncertain` rather than
+      // being downgraded to "not applied". The frame says the item is queued now, which is consistent
+      // with a removal that never happened AND with one that happened while another enqueue re-added
+      // the same text under a new id; only a new id would be evidence either way, so the row is left
+      // alone and the caller keeps being told the outcome is unproven.
+      const listed = new Set(items.map((item) => item.itemId));
+      for (const row of this.#store.listQueueRemovals(session.task_id, session.session_id)) {
+        if (row.state !== 'uncertain' || listed.has(row.item_id)) continue;
+        this.#store.recordQueueRemoval({
+          taskId: session.task_id,
+          sessionId: session.session_id,
+          itemId: row.item_id,
+          state: 'removed',
+          operationId: row.operation_id,
+        });
+      }
       return;
     }
     if (frame['type'] !== 'session/event') return;
@@ -1566,13 +1770,21 @@ export class Daemon {
       this.#eventStats.duplicates += 1;
       return;
     }
+    // C-1: ONE inbound boundary, applied ONCE, and the resulting value is what BOTH consumers see —
+    // the durable archive below and the state reduction at the end of this method. Two normalised
+    // copies would be two payloads for one event, and the live reduction and a later replay would
+    // then be able to disagree; redacting only the stored copy would leak; redacting only the live
+    // copy would make replay diverge from what was actually reduced. `seq`, `type` and every id are
+    // read from the RAW frame above and survive normalisation unchanged, which is what keeps this a
+    // redaction boundary rather than a reshaping one.
+    const normalisedEvent: unknown = redactInbound(frame['event'] ?? null);
     const before = this.#store.eventCoverage(session.task_id, session.session_id);
     const inserted = this.#store.appendEvent({
       taskId: session.task_id,
       sessionId: session.session_id,
       seq,
       kind: String(eventFields['type'] ?? 'unknown'),
-      payload: { nativeType: eventFields['type'] ?? null, raw: frame['event'] ?? null },
+      payload: { nativeType: eventFields['type'] ?? null, raw: normalisedEvent },
     });
     if (inserted) this.#eventStats.stored += 1;
     else this.#eventStats.duplicates += 1;
@@ -1582,7 +1794,8 @@ export class Daemon {
     if (inserted && after && after.completeness === 'incomplete' && before.missing.length === 0) {
       this.#eventStats.gaps += 1;
     }
-    this.#applyEventToState(session.session_id, frame['event']);
+    // The same value that was stored, so a replay of this row reduces to the same state.
+    this.#applyEventToState(session.session_id, normalisedEvent);
   }
 
   /**
@@ -1633,7 +1846,16 @@ export class Daemon {
       const state = outcome.includes('cancel') ? 'cancelled'
         : outcome.includes('fail') || outcome.includes('error') ? 'failed'
           : 'completed';
-      this.#store.closeTurn({ turnId: open.turn_id, state, reason: `authoritative turn/end at seq ${endSeq}` });
+      // The reason leads with the terminal STATE. FR-EXEC-3 requires the paths to be distinguishable
+      // through the public surfaces, and both surfaces carry this one string: a caller could
+      // previously read `authoritative turn/end at seq N` for a completed turn, a failed turn AND a
+      // cancelled one, so "the turn ended" was all it learned. The evidence sentence is kept after
+      // the state rather than replaced, because the reason must still name what it was derived from.
+      this.#store.closeTurn({
+        turnId: open.turn_id,
+        state,
+        reason: `${state}: authoritative turn/end at seq ${endSeq}`,
+      });
     }
   }
 
@@ -1686,10 +1908,13 @@ export class Daemon {
           maxMessages: this.#limits.eventPageMax,
         });
         if (result.status !== 'ok') continue;
-        // `result.value` is the adapter's ok envelope, so the Host's own page is one level in.
-        // Narrowing rather than casting keeps a non-object envelope reading as the absent field
-        // the original produced.
-        const page: unknown = this.#isPropertyBag(result.value) ? result.value['value'] : undefined;
+        // `result.value` IS the Host's page (see the same correction in `#dispatch`). Reading
+        // `result.value['value']` here was a key that never exists, so `page` was always `undefined`,
+        // `events` was always empty and this whole refetch stored nothing — a silent no-op that
+        // looked like working code and made the mux reconnect path decorative. The reconnect test
+        // passed for the wrong reason: the daemon's backoff reconnects fast enough that the event
+        // arrives live instead of needing history.
+        const page: unknown = result.value;
         const events: readonly unknown[] = this.#isPropertyBag(page) && Array.isArray(page['events'])
           ? page['events']
           : [];
@@ -1702,14 +1927,18 @@ export class Daemon {
           const seq = Number(eventFields['seq']);
           if (!Number.isFinite(seq)) continue;
           observed.push(seq);
+          // The same single boundary as the live path, for the same reason: a row written by the
+          // refetch must be indistinguishable from the same row written live, or a crash-replay of
+          // the archive would reduce differently depending on which path happened to store it.
+          const normalisedEvent: unknown = redactInbound(event ?? null);
           const inserted = this.#store.appendEvent({
             taskId, sessionId: session.session_id, seq,
             kind: String(eventFields['type'] ?? 'unknown'),
-            payload: { nativeType: eventFields['type'] ?? null, raw: event ?? null, source: 'history-refetch' },
+            payload: { nativeType: eventFields['type'] ?? null, raw: normalisedEvent, source: 'history-refetch' },
           });
           if (inserted) {
             appended += 1;
-            this.#applyEventToState(session.session_id, event);
+            this.#applyEventToState(session.session_id, normalisedEvent);
           }
         }
         if (!observed.length) continue;
@@ -1761,6 +1990,22 @@ function lastTerminalReason(store: Store, sessionId: string): string | null {
   const turns: TurnRow[] = store.listTurns(sessionId);
   for (let i = turns.length - 1; i >= 0; i -= 1) {
     if (turns[i].state !== 'open') return turns[i].reason ?? turns[i].state;
+  }
+  return null;
+}
+
+/**
+ * The terminal STATE of the latest closed turn, from the store's own closed set, or null when no
+ * turn has closed. Reads the same rows as `lastTerminalReason` above and walks them the same way, so
+ * the two surfaces cannot disagree about which turn they are describing.
+ * @param store
+ * @param sessionId
+ * @returns the state of the latest closed turn, if any
+ */
+function lastTerminalState(store: Store, sessionId: string): string | null {
+  const turns: TurnRow[] = store.listTurns(sessionId);
+  for (let i = turns.length - 1; i >= 0; i -= 1) {
+    if (turns[i].state !== 'open') return turns[i].state;
   }
   return null;
 }
@@ -1871,13 +2116,22 @@ export interface ShapedInteraction {
   payload: unknown;
   createdAt: number;
   expiresAt: number | null;
+  /**
+   * What happened to the ANSWER, as opposed to what was decided. `null` means the decision is
+   * durable and no delivery was ever attempted; `dispatching` means bytes may have reached the Host
+   * and no answer was observed; every other value is the recorded outcome. See `shapeInteraction`.
+   */
+  delivery: { state: string; at: number } | null;
 }
 
 /**
  * @param row an `interactions` row, or nothing when the rpc id is unknown.
  * @returns the shaped row, or `null` for both a null and an absent row.
  */
-export function shapeInteraction(row: InteractionRow | null | undefined): ShapedInteraction | null {
+export function shapeInteraction(
+  row: InteractionRow | null | undefined,
+  delivery?: ResponseDedupeRow | null,
+): ShapedInteraction | null {
   if (!row) return null;
   return {
     interactionId: row.interaction_id,
@@ -1892,5 +2146,16 @@ export function shapeInteraction(row: InteractionRow | null | undefined): Shaped
     payload: safeJson(row.payload_json),
     createdAt: Number(row.created_at),
     expiresAt: row.expires_at ? Number(row.expires_at) : null,
+    /**
+     * What happened to the ANSWER, which is a different question from what was decided.
+     *
+     * `null` means the decision is durable and no delivery was ever attempted; `dispatching` means
+     * bytes may have reached the Host and no answer was observed; `accepted`/`not-pending`/
+     * `bad-response`/`refused`/`uncertain`/... are the recorded outcomes. Without this a caller saw
+     * `state: 'allowed-once'` and could not tell whether the Host had been told — which is exactly
+     * the equation FR-APPR-3 forbids between "the decision is recorded" and "the answer was
+     * delivered". Optional because only a caller holding a store connection can supply it.
+     */
+    delivery: delivery ? { state: delivery.outcome, at: Number(delivery.created_at) } : null,
   };
 }
