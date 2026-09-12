@@ -67,7 +67,11 @@ export default {
       list: [1, 2, 3],
       nested: { deep: 'value' },
     });
-    assert.equal(details.long.length, 200);
+    // Truncation is visible in the value itself, so a caller can tell a full string from a
+    // shortened one instead of silently receiving a shorter message.
+    assert.ok(details.long.length > 200 && details.long.length < 260, `unexpected truncation length ${details.long.length}`);
+    assert.match(details.long, /\[truncated 800 chars\]$/);
+    assert.equal(details.long.startsWith('x'.repeat(200)), true);
     assert.equal(details.n, 5);
     assert.equal(details.flag, true);
     assert.equal(details.list, '[3 items]');
@@ -270,7 +274,12 @@ export default {
     try {
       const taskId = 'task_55555555-5555-5555-5555-555555555555';
       store.createTask({ taskId, hostBase: 'http://h', hostScope: 'h' });
-      const session = store.createSession({ taskId, hostSessionId: 'session-fixture-0001', clientKey: 'k', cwd: null });
+      const session = store.recordSession({
+        sessionId: 'sess_66666666-6666-6666-6666-666666666666',
+        taskId,
+        hostSessionId: 'session-fixture-0001',
+        cwd: null,
+      });
       const first = store.appendEvent({ taskId, sessionId: session.session_id, seq: 1, kind: 'user/message', payload: { n: 1 } });
       assert.equal(first, true, 'the first write of a sequence must be recorded as inserted');
       const second = store.appendEvent({ taskId, sessionId: session.session_id, seq: 1, kind: 'user/message', payload: { n: 2 } });

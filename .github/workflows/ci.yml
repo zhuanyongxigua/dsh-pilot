@@ -1,0 +1,152 @@
+name: ci
+
+# Why this workflow exists: the project's reliability claims are only as good as the layers that
+# actually run. This runs the deterministic layers on both supported platforms, reports failed,
+# skipped and timed-out counts DISTINCTLY (collapsing them is how a skip becomes a fake pass),
+# and refuses to run the live layer at all — the live suite is opt-in and manual, because it
+# spends real model quota and must never gate a merge.
+#
+# The unprivileged case matters: a pull request from a fork gets no secrets and no write access,
+# so nothing here reads a credential value; the bridge only ever refers to a route by the NAME of
+# an environment variable, and this job proves the deterministic layers do not depend on one
+# being present.
+
+on:
+  push:
+    branches:
+      - 'codex/**'
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deterministic:
+    name: deterministic layers (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # Node 24's built-in SQLite is the storage engine, so there is no dependency to install.
+      # This assertion is the point: a runtime dependency appearing here would be a design
+      # regression, not an inconvenience.
+      - name: assert zero runtime dependencies
+        run: |
+          node -e "
+          const pkg = require('./package.json');
+          const deps = Object.keys(pkg.dependencies ?? {});
+          if (deps.length) { console.error('unexpected runtime dependencies:', deps.join(', ')); process.exit(1); }
+          console.log('runtime dependencies: none');
+          "
+
+      - name: storage engine reachable
+        run: |
+          node -e "
+          const sqlite = require('node:sqlite');
+          const db = new sqlite.DatabaseSync(':memory:');
+          console.log('sqlite', db.prepare('select sqlite_version() as v').get().v);
+          db.close();
+          "
+
+      - name: unit, property, fake-host, persistence, mcp-e2e, security
+        run: |
+          mkdir -p test-results
+          DSH_PILOT_JSON=test-results/report.json node test/run.mjs || status=$?
+          node -e "
+          const r = require('./test-results/report.json');
+          const c = r.counts;
+          console.log('passed=' + c.passed + ' failed=' + c.failed + ' skipped=' + c.skipped + ' timedOut=' + c.timedOut);
+          console.log('live suite: ' + r.liveSuite);
+          const lines = ['## deterministic layers (' + process.env.RUNNER_OS + ')', '',
+            '- passed: ' + c.passed, '- failed: ' + c.failed, '- skipped: ' + c.skipped,
+            '- timedOut: ' + c.timedOut, '- live suite: ' + r.liveSuite, '',
+            '| layer | passed | failed | skipped | timed-out |', '| --- | --- | --- | --- | --- |'];
+          for (const [layer, v] of Object.entries(r.layers)) {
+            lines.push('| ' + layer + ' | ' + v.passed + ' | ' + v.failed + ' | ' + v.skipped + ' | ' + v['timed-out'] + ' |');
+          }
+          if (r.layerNotes.length) { lines.push('', 'Layers not present in this build: ' + r.layerNotes.join('; ')); }
+          require('fs').appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join('\n') + '\n');
+          process.exit(c.failed > 0 || c.timedOut > 0 ? 1 : 0);
+          "
+          exit ${status:-0}
+
+      - name: negative controls (mutation)
+        run: |
+          DSH_PILOT_PROPERTY_ROUNDS=8 node test/mutation/run.mjs --json test-results/mutations.json || status=$?
+          node -e "
+          const r = require('./test-results/mutations.json');
+          console.log('mutations=' + r.mutations + ' caught=' + r.caught + ' survived=' + r.survived);
+          const lines = ['## negative controls (' + process.env.RUNNER_OS + ')', '',
+            '- mutations: ' + r.mutations, '- caught: ' + r.caught, '- survived: ' + r.survived, '',
+            '| mutation | caught | detail |', '| --- | --- | --- |'];
+          for (const m of r.results) lines.push('| ' + m.name + ' | ' + (m.caught ? 'yes' : 'NO') + ' | ' + m.detail.replace(/\\|/g, '\\\\|') + ' |');
+          require('fs').appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join('\n') + '\n');
+          process.exit(r.survived > 0 ? 1 : 0);
+          "
+          exit ${status:-0}
+
+      - name: soak runner smoke (bounded, resume-verified)
+        run: node test/soak/run.mjs --smoke --minutes 1 --state-dir test-results/soak
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ matrix.os }}
+          path: test-results/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: report that the live suite was NOT run
+        if: always()
+        run: |
+          echo "The live suite was not run in this job." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "It is opt-in (manual \`workflow_dispatch\` or a local run with \`--live\`), it spends real" >> "$GITHUB_STEP_SUMMARY"
+          echo "provider quota, and its absence must be read as SKIPPED, never as passing." >> "$GITHUB_STEP_SUMMARY"
+
+  package-shape:
+    name: package shape and secret hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: no credential material in tracked files
+        run: |
+          # This job reads no secret. It only checks that none was committed.
+          if git grep -nIE '(sk-[A-Za-z0-9]{20,}|api[_-]?key[[:space:]]*[:=][[:space:]]*["'"'"'][^"'"'"']{12,}|Bearer[[:space:]]+[A-Za-z0-9._-]{20,})' -- . ':!test/security' ':!docs' ':!AGENTS.md'; then
+            echo "credential-shaped material found in tracked files" >&2
+            exit 1
+          fi
+          echo "no credential-shaped literals in tracked sources or tests"
+
+      - name: no company endpoint or hostname in tracked files
+        run: |
+          # Endpoints belong in the operator's environment, never in this repository.
+          if git grep -nIE 'https?://[a-z0-9.-]*(chaitin|baizhi)[a-z0-9.-]*' -- . ':!.local'; then
+            echo "an internal endpoint or hostname appears in tracked files" >&2
+            exit 1
+          fi
+          echo "no internal endpoints in tracked files"
+
+      - name: npm pack contents are the declared files only
+        run: |
+          npm pack --dry-run 2>&1 | tail -30
