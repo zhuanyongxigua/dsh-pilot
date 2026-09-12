@@ -526,6 +526,19 @@ export default {
       // already-erroring expression still checks the expression inside it.
       const replayError = /** @type {{code?: string, details?: {deliveredToHost?: string, hint?: string}}|null} */ (identical.error);
       const replayDetails = replayError?.details;
+      // The POSITIVE control for the hint: for the one state where the answer really was taken, the hint
+      // must still say it was delivered. Without this, a fix that replaced every hint with "unproven"
+      // would pass the negative cases while telling an operator nothing.
+      //
+      // The assertion deliberately checks the CLAIM and not the exact sentence. An earlier form pinned
+      // the full phrasing, and the negative control then fired on a copy difference instead of on the
+      // defect — a check that fires for the wrong reason is a check that hides the right one. The
+      // claim being asserted is "this hint says the Host has the answer", which is true of any correct
+      // wording and false of every unproven one.
+      assert.match(String(replayDetails?.hint ?? ''), /delivered/i,
+        `an accepted delivery must still be described as delivered, got: ${String(replayDetails?.hint)}`);
+      assert.ok(!/MAY have been applied/.test(String(replayDetails?.hint ?? '')),
+        'and it must not hedge as unproven when the Host accepted the answer');
       assert.equal(replayDetails?.deliveredToHost, 'accepted',
         'the refusal must say the first decision DID reach the Host, so an operator knows nothing is left to deliver');
       assert.match(String(replayDetails?.hint ?? ''), /already delivered/i,

@@ -60,7 +60,13 @@ export default {
       let closed = false;
       socket.on('close', () => { closed = true; });
       socket.write(huge);
-      await waitFor(() => closed, { timeoutMs: 5000, what: 'the daemon to drop an oversized IPC line' });
+      // The bound is deliberately looser than it looks like it needs to be, and the reason is measured
+      // rather than hypothetical: at 5 s this wait timed out once during a full-suite run and passed in
+      // isolation immediately afterwards, twice over. The condition is real (the socket must close) and
+      // the refusal itself is not in question — what the extra headroom covers is the daemon process
+      // being scheduled alongside the rest of the suite. A bound that fails under load reports a
+      // property about the machine as if it were a property about the bridge.
+      await waitFor(() => closed, { timeoutMs: 20_000, what: 'the daemon to drop an oversized IPC line' });
       // The daemon is still alive and serving.
       const client = await ipcClient(daemon.socketPath);
       try {

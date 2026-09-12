@@ -238,14 +238,90 @@ export class Daemon {
   }
 
   /**
-   * Restart recovery: interrupted dispatches become uncertain (possibly sent), never retried.
+   * Restart recovery: interrupted dispatches become uncertain (possibly sent), never retried — and
+   * every removal attempt that could have reached the Host is settled in the removal ledger first.
+   *
+   * The ledger reconciliation runs AFTER the sweep on purpose: the sweep turns an interrupted
+   * `dispatching` operation into `uncertain`, which is exactly the fact this reconciler needs to
+   * classify, so running it first would read the pre-sweep state and have to duplicate that logic.
+   * @returns what was interrupted, and what the ledger reconciliation settled
    */
-  recover(): { interrupted: number; uncertainOperations: string[] } {
+  recover(): {
+    interrupted: number;
+    uncertainOperations: string[];
+    removalAttempts: { settled: number; blocked: number; confirmed: number; retryable: number; items: string[] };
+  } {
     const interrupted = this.#store.sweepInterruptedDispatches('crash-during-dispatch');
+    const removals = this.#reconcileRemovalAttempts();
     return {
       interrupted: interrupted.length,
       uncertainOperations: interrupted.map((row) => row.operation_id),
+      removalAttempts: removals,
     };
+  }
+
+  /**
+   * Settle every durable removal attempt that never got a ledger row.
+   *
+   * Why this exists: the once-only guarantee is enforced by the removal ledger, but the ledger is
+   * written AFTER the Host answers. A process killed in between — the Host has applied the `remove`,
+   * the ledger says nothing — leaves the item looking untouched, and the next `queueClear` would send
+   * a second destructive request for it. The attempt itself is not lost: `#dispatch` persisted the
+   * operation before writing any byte. So the classification is read off the operation, which is the
+   * durable record of how far the attempt actually got:
+   *
+   * | operation state | what it proves | ledger result |
+   * | --- | --- | --- |
+   * | `pending` | no byte was written — `#dispatch` writes `dispatching` before sending | nothing: provably NOT sent, so a retry stays safe |
+   * | `refused` | the Host refused before applying anything | nothing: provably not applied, so a retry stays safe |
+   * | `uncertain`, `dispatching` | bytes may have reached the Host and the outcome was never observed | `uncertain`, which blocks a blind re-send |
+   * | `succeeded` with `{accepted:true}` | the Host's own confirmation was persisted | `removed` |
+   * | `succeeded` without it | an `ok` envelope that was not a removal confirmation | `uncertain` |
+   *
+   * The distinction that matters is the one the review named: an attempt that provably never left the
+   * process must stay RETRYABLE, so this never writes a blanket block. Only an attempt that may have
+   * been applied is recorded, and `#dispatch`'s ordering is what makes "never left the process" a
+   * fact rather than a guess.
+   * @returns counts per classification, with the item ids that were blocked
+   */
+  #reconcileRemovalAttempts(): { settled: number; blocked: number; confirmed: number; retryable: number; items: string[] } {
+    const attempts = this.#store.listUnsettledRemovalAttempts();
+    const blocked: string[] = [];
+    let confirmed = 0;
+    let retryable = 0;
+    for (const attempt of attempts) {
+      const sessionId = attempt.session_id ?? null;
+      // Both the request and the response are nullable columns, so the null is handled rather than
+      // asserted away: the query already requires a valid `request_json`, and a row that somehow
+      // lacks one is skipped below rather than parsed as `null`.
+      const payload: unknown = attempt.request_json === null ? null : safeJson(attempt.request_json);
+      const itemId = this.#isPropertyBag(payload) && typeof payload['itemId'] === 'string' ? payload['itemId'] : null;
+      if (sessionId === null || itemId === null) continue;
+      if (attempt.state === 'pending' || attempt.state === 'refused') {
+        // Provably never applied. Nothing is written, deliberately: a ledger row here would lock an
+        // item that the Host was never asked about out of a legitimate retry.
+        retryable += 1;
+        continue;
+      }
+      let state: 'removed' | 'uncertain' = 'uncertain';
+      if (attempt.state === 'succeeded') {
+        const response: unknown = attempt.response_json === null ? null : safeJson(attempt.response_json);
+        // The same confirmation test `queueClear` applies on the live path, read from the persisted
+        // response instead of from a live result: the Host's contract for this method is
+        // `{accepted: true}`, and anything else is not a confirmation.
+        state = this.#isPropertyBag(response) && response['accepted'] === true ? 'removed' : 'uncertain';
+      }
+      if (state === 'removed') confirmed += 1;
+      else blocked.push(itemId);
+      this.#store.recordQueueRemoval({
+        taskId: attempt.task_id,
+        sessionId,
+        itemId,
+        state,
+        operationId: attempt.operation_id,
+      });
+    }
+    return { settled: attempts.length, blocked: blocked.length, confirmed, retryable, items: blocked };
   }
 
   /** Stop the daemon cleanly: close ingest, close IPC, release ownership. */
@@ -1046,20 +1122,35 @@ export class Daemon {
         // delivery. `ERROR_CODES.APPROVAL_REPLAYED` existed for this path and had no callers, which is
         // how the wrong shape survived.
         //
-        // The detail reports whether the FIRST decision ever reached the Host, because that is the
-        // distinction an operator actually needs: a replay of a decision that was never delivered is
-        // recoverable by retrying DELIVERY, while a replay of one that was delivered is not a problem
-        // at all. `previousDelivery` is the row read above, keyed by this interaction's rpc id.
+        // The detail reports how far the FIRST decision's DELIVERY got, because that is the
+        // distinction an operator actually needs — and it is read off the recorded receipt rather than
+        // inferred from the row's mere existence.
+        //
+        // This is where the previous form was wrong, and wrongly in the dangerous direction: it said
+        // "the decision was already delivered to the Host" whenever a delivery row existed at all.
+        // A row also exists for `dispatching` (bytes may have been written and nothing was observed),
+        // for `uncertain` (the same, after a sweep), for `refused` (the Host was never reached) and
+        // for `bad-response` (the Host HELD the request and rejected the answer). Telling an operator
+        // "already delivered, re-deciding is a no-op" for any of those turns a possible duplicate into
+        // a reassuring no-op, and for `refused` it also suppresses the retry that would actually fix
+        // it. So the hint is now generated per member of the closed set, and it never converts an
+        // unproven outcome into a delivered one.
+        const deliveryState: string | null = previousDelivery?.outcome ?? null;
         throw new BridgeError(ERROR_CODES.APPROVAL_REPLAYED, 'this interaction was already decided with the same decision', {
           interactionId,
           decision,
           state: current.state,
           // `null` is meaningful rather than "unknown": the delivery row records what the Host
           // answered, so its absence means the answer was committed and never delivered.
-          deliveredToHost: previousDelivery?.outcome ?? null,
-          hint: previousDelivery
-            ? 'the decision was already delivered to the Host; re-deciding is a no-op and is refused'
-            : 'the decision is durable but was never delivered to the Host; deliver it rather than re-deciding',
+          deliveredToHost: deliveryState,
+          // `deliveredToHost` is kept for callers that already read it, and `deliveryState` names the
+          // same value as what it is — a state, not a boolean. A caller can then branch on the closed
+          // set instead of on null-ness.
+          deliveryState,
+          // An unlisted state falls back to the explicit unknown entry, not to the delivered wording:
+          // the table is the decision, and a state nobody wrote a meaning for must not inherit the
+          // most reassuring one.
+          hint: APPROVAL_REPLAY_HINTS[deliveryState ?? 'never-attempted'] ?? APPROVAL_REPLAY_HINTS['unrecognised-state'],
         });
       }
       throw new BridgeError(ERROR_CODES.APPROVAL_STALE, 'interaction already decided with a different decision', {
@@ -2128,6 +2219,39 @@ export interface ShapedInteraction {
  * @param row an `interactions` row, or nothing when the rpc id is unknown.
  * @returns the shaped row, or `null` for both a null and an absent row.
  */
+/**
+ * What a replayed decision's delivery state MEANS, one entry per member of the closed set plus the
+ * absence of a row. Written as a total table rather than a chain of conditionals so that adding a
+ * delivery state without deciding what it means for an operator is a visible omission: the index is
+ * typed as `Record<string, string>`, and an unlisted state falls back to the explicit entry for a
+ * state this build does not know, never to the "delivered" wording.
+ *
+ * The one rule these all obey: never tell an operator the answer was delivered unless the Host said
+ * so. `accepted` is the only state that may claim delivery, and `not-pending` is the opposite fact —
+ * the Host had no request to apply it to.
+ */
+const APPROVAL_REPLAY_HINTS: Record<string, string> = {
+  accepted: 'the decision was already delivered to the Host, which accepted it; re-deciding is a no-op and is refused',
+  'not-pending': 'the answer was already sent and the Host answered that it holds no pending request for this '
+    + 'rpc id, so the answer was NOT applied; re-deciding is refused, and the interaction is host-resolved',
+  dispatching: 'an answer was already sent and the Host never answered it back, so it MAY have been applied; '
+    + 're-deciding is refused rather than risk a second approval, and the outcome is unproven until it is reconciled',
+  uncertain: 'an answer was already sent and its outcome was never proven, so it MAY have been applied; '
+    + 're-deciding is refused rather than risk a second approval, and the outcome is unproven until it is reconciled',
+  refused: 'the earlier answer never reached the Host, so it was NOT applied; the decision is durable and '
+    + 'delivering it again is what is needed, not re-deciding it',
+  'bad-response': 'the Host held the request and rejected the earlier answer as malformed, so it was NOT '
+    + 'applied; delivering a corrected answer is what is needed, not re-deciding the interaction',
+  unclassified: 'the Host answered the earlier attempt with a receipt this bridge could not classify, so '
+    + 'whether it was applied is unknown; it is not reported as delivered',
+  unrecognised: 'the Host answered the earlier attempt with a receipt this bridge does not recognise, so '
+    + 'whether it was applied is unknown; it is not reported as delivered',
+  'never-attempted': 'the decision is durable but no answer was ever delivered for it; delivering it is what '
+    + 'is needed, not re-deciding the interaction',
+  'unrecognised-state': 'the recorded delivery state is one this build does not know, so delivery is treated as '
+    + 'unproven rather than assumed',
+};
+
 export function shapeInteraction(
   row: InteractionRow | null | undefined,
   delivery?: ResponseDedupeRow | null,

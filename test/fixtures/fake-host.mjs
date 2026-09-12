@@ -29,6 +29,12 @@ export class FakeHost {
   #hostSockets = [];
   #dropped = new Set();
   #delayed = new Map();
+  /** @type {Map<string, Promise<void>>} responses applied but held */
+  #barriers = new Map();
+  /** @type {Map<string, () => void>} the release for each held response */
+  #barrierReleases = new Map();
+  /** @type {Set<string>} methods whose barrier has been reached at least once */
+  #barriersReached = new Set();
   #rejections = new Map();
   #results = new Map();
   #faults = { malformedFrames: 0, oversizeFrames: 0, duplicateEvery: 0, reorderWindow: 0 };
@@ -114,11 +120,15 @@ export class FakeHost {
    * Enqueue one occurrence, the way the real Host does: the item id is minted by the Host, the
    * FIFO placement is resolved by the Agent, and the WHOLE snapshot is re-broadcast.
    * @param {string} hostSessionId
-   * @param {{text?: string, placement?: 'queued'|'steering'|'context'}} [options]
+   * @param {{text?: string, placement?: 'queued'|'steering'|'context', id?: string}} [options]
    */
-  enqueue(hostSessionId, { text = 'fixture queued message', placement = 'queued' } = {}) {
+  enqueue(hostSessionId, { text = 'fixture queued message', placement = 'queued', id = `msg_${randomUUID()}` } = {}) {
     if (!this.#sessions.has(hostSessionId)) throw new Error(`unknown fixture session ${hostSessionId}`);
-    const item = { id: `msg_${randomUUID()}`, placement, message: { role: 'user', content: [{ type: 'text', text }] } };
+    // An explicit id is allowed so a test can put an occurrence back under the id it already had. That
+    // is not a convenience: the case it exists for is the Host re-reporting the SAME occurrence in a
+    // later snapshot — after a removal whose effect it has not reflected yet — and a test cannot model
+    // that with a fresh id, because a fresh id is a different occurrence that nothing has touched.
+    const item = { id, placement, message: { role: 'user', content: [{ type: 'text', text }] } };
     this.#queueItems(hostSessionId).push(item);
     this.emitQueueSnapshot(hostSessionId);
     return { ...item };
@@ -178,6 +188,29 @@ export class FakeHost {
   stopDropping(method) { this.#dropped.delete(method); }
   /** @param {string} method @param {number} ms */
   delayFor(method, ms) { this.#delayed.set(method, ms); }
+
+  /**
+   * Hold the response to `method` AFTER applying it, until `releaseBarrier(method)`.
+   * @param {string} method
+   */
+  barrierFor(method) {
+    /** @type {() => void} */
+    let release = () => {};
+    const held = new Promise((resolvePromise) => { release = () => resolvePromise(undefined); });
+    this.#barriers.set(method, held);
+    this.#barrierReleases.set(method, release);
+  }
+
+  /** Has a request currently been applied and its response held? The test's own timing oracle. */
+  barrierReached(method) { return this.#barriersReached.has(method); }
+
+  /** Let held responses through, and stop holding. @param {string} method */
+  releaseBarrier(method) {
+    const release = this.#barrierReleases.get(method);
+    if (release) release();
+    this.#barriers.delete(method);
+    this.#barrierReleases.delete(method);
+  }
   /**
    * Script a refusal for one method. `details` is part of the real Host's error envelope
    * (`{code, message, details}`), and the details bag is a first-class leak surface for the
@@ -185,6 +218,8 @@ export class FakeHost {
    * @param {string} method @param {{code: string, message?: string, details?: object}} error
    */
   rejectWith(method, error) { this.#rejections.set(method, error); }
+  /** Lift a rejection, so a later attempt at the same method can succeed. @param {string} method */
+  stopRejecting(method) { this.#rejections.delete(method); }
   /** @param {string} method @param {object} value */
   respondWith(method, value) { this.#results.set(method, value); }
   /** @param {object} faults */
@@ -411,6 +446,17 @@ export class FakeHost {
       if (delay) await new Promise((resolvePromise) => setTimeout(resolvePromise, delay));
 
       const reply = this.#replyFor(method, envelope?.payload ?? {}, rpcId);
+      // A BARRIER, not a delay. The reply above has already been computed, which means the mutation was
+      // APPLIED, and the response is then held until the test releases it. That gives a deterministic
+      // window in which the Host has definitely applied the method and the caller has definitely not
+      // learned the outcome — the window a real SIGKILL opens — without any test guessing at a sleep
+      // duration. `delayFor` cannot serve here: it runs before `#replyFor`, so it delays the mutation
+      // itself and the Host would not yet have applied anything when the process is killed.
+      const barrier = this.#barriers.get(method);
+      if (barrier) {
+        this.#barriersReached.add(method);
+        await barrier;
+      }
       if (this.#dropped.has(method)) {
         // Applied, but the caller never learns: the response is discarded and the socket closed.
         req.socket.destroy();

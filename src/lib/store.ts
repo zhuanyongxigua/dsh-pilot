@@ -1395,6 +1395,42 @@ export class Store {
   }
 
   /**
+   * Removal attempts that are durable but have NO settled row in the removal ledger.
+   *
+   * This is the crash-recoverable index the once-only guarantee depends on. `recordQueueRemoval` is
+   * written after the Host answers, so a process killed between the Host applying a `remove` and that
+   * write leaves the ledger EMPTY for an item the Host may already have removed — and an empty ledger
+   * is what says "safe to send again". The operation row does not have that gap: `#dispatch` persists
+   * the intent as `pending` and then as `dispatching` BEFORE any byte is written, so every removal
+   * attempt that could possibly have reached the Host is on disk with its item id in `request_json`.
+   *
+   * The join is therefore the recovery source of truth, and the `not exists` clause keeps it bounded:
+   * once an attempt's item has a ledger row of any state, that item is no longer a candidate, because
+   * the settled row is the better evidence.
+   *
+   * Only `remove` actions are returned. An `edit` or `steer` shares the method but is not a removal,
+   * and treating one as a removal attempt would invent a block that the Host was never asked about.
+   * @returns the durable removal attempts with no settled ledger row, oldest first
+   */
+  listUnsettledRemovalAttempts(): OperationRow[] {
+    return this.all<OperationRow>(
+      `select o.* from operations o
+        where o.kind = 'session.updateQueue'
+          and o.session_id is not null
+          and json_valid(o.request_json)
+          and json_extract(o.request_json, '$.action.kind') = 'remove'
+          and json_extract(o.request_json, '$.itemId') is not null
+          and not exists (
+            select 1 from queue_removals q
+             where q.task_id = o.task_id
+               and q.session_id = o.session_id
+               and q.item_id = json_extract(o.request_json, '$.itemId')
+          )
+        order by o.created_at asc, o.operation_id asc`,
+    );
+  }
+
+  /**
    * Did a delivery for this rpc id leave the `dispatching` state, and what is it now?
    *
    * Returns the row, so a caller can tell all three cases apart: `null` means no delivery was ever
