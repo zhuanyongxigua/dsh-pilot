@@ -1,0 +1,34 @@
+{
+  // Tests are AUTHORED as plain `.mjs` ESM and typechecked as JavaScript (`allowJs`/`checkJs`).
+  //
+  // Why not `.ts` like `src/`: the tests are the independent oracle, and rewriting them into
+  // TypeScript would edit the very thing that is supposed to be able to contradict the
+  // implementation. They are checked for real type errors, and they get the full type surface of
+  // the compiled implementation through `dist/**/*.d.ts`, so a signature change in `src/` still
+  // fails the tests at typecheck time.
+  //
+  // `noImplicitAny` is off HERE and ON in `tsconfig.json`, deliberately: in tests an un-annotated
+  // `catch (error)` or callback parameter is ordinary JavaScript, while in the implementation a
+  // missing type is the defect the review asked to close.
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": ["node"],
+    "noEmit": true,
+    "allowJs": true,
+    "checkJs": true,
+    "strict": true,
+    "noImplicitAny": false,
+    "noImplicitOverride": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "useUnknownInCatchVariables": true,
+    "forceConsistentCasingInFileNames": true,
+    "exactOptionalPropertyTypes": false,
+    "noUncheckedIndexedAccess": false,
+    "skipLibCheck": true
+  },
+  "include": ["test/**/*.mjs"]
+}

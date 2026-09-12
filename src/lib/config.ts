@@ -12,13 +12,35 @@
 
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { BridgeError, ERROR_CODES } from './errors.js';
+import { BridgeError, ERROR_CODES } from './errors.ts';
+
+/** The environment surface this module reads: `process.env` by default, or a test's own map. */
+export type EnvSource = Readonly<Record<string, string | undefined>>;
+
+/** Bounds the daemon applies to pages, frames and waits. */
+export interface ConfigLimits {
+  readonly eventPageMax: number;
+  readonly frameMaxBytes: number;
+  readonly waitDefaultMs: number;
+  readonly waitMaxMs: number;
+  readonly compactResultBytes: number;
+}
+
+/** Resolved configuration. Every field has an environment variable and an explicit default. */
+export interface ResolvedConfig {
+  readonly stateDir: string;
+  readonly hostBase: string;
+  readonly hostScope: string;
+  /** Explicit socket override; `null` when the caller must derive one from the state directory. */
+  readonly socketPath: string | null;
+  readonly scratchRoot: string;
+  readonly limits: ConfigLimits;
+}
 
 /**
- * @param {object} [env]
- * @returns {object} resolved configuration
+ * @returns resolved configuration
  */
-export function resolveConfig(env = process.env) {
+export function resolveConfig(env: EnvSource = process.env): ResolvedConfig {
   const stateDir = resolve(
     env.DSH_PILOT_STATE_DIR
     || join(env.XDG_STATE_HOME || join(homedir(), '.local', 'state'), 'dsh-pilot'),
@@ -41,12 +63,7 @@ export function resolveConfig(env = process.env) {
   };
 }
 
-/**
- * @param {string|undefined} value
- * @param {number} fallback
- * @returns {number}
- */
-function numberOr(value, fallback) {
+function numberOr(value: string | undefined, fallback: number): number {
   if (value === undefined || value === '') return fallback;
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) {
@@ -55,13 +72,16 @@ function numberOr(value, fallback) {
   return parsed;
 }
 
+/** Verdict of the real-state guard: a refusal carries the reason it refused. */
+export type ScratchDirVerdict =
+  | { readonly safe: true }
+  | { readonly safe: false; readonly reason: string };
+
 /**
  * Guard: refuse to run a suite or tool against a state directory that looks like a real
  * installed one unless the operator says so explicitly.
- * @param {string} stateDir
- * @returns {{safe: boolean, reason?: string}}
  */
-export function assertScratchStateDir(stateDir) {
+export function assertScratchStateDir(stateDir: string): ScratchDirVerdict {
   const forbidden = [join(homedir(), '.dsh'), join(homedir(), '.local', 'state')];
   for (const path of forbidden) {
     if (stateDir === path || stateDir.startsWith(`${path}/`)) {

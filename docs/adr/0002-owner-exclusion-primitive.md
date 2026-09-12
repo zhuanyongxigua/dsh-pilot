@@ -32,7 +32,7 @@ directory.
 
 The daemon:
 
-1. opens `<stateDir>/owner.lock` as a SQLite database;
+1. opens `<stateDir>/owner.lock.sqlite` as a SQLite database;
 2. sets `locking_mode=EXCLUSIVE` and executes a write (`create table if not exists owner(...)`),
    which takes and holds the exclusive file lock for the connection's lifetime;
 3. **never closes that connection** while the daemon runs, and does not pass the file descriptor to
@@ -58,6 +58,20 @@ The file is opened read-write rather than read-only, and it is a **separate file
 SQLite's exclusive locking mode already has exactly the semantics required — it is an OS-level file
 lock held for the connection lifetime and released by the kernel when the process dies — and it is
 reachable from Node 24 with **no dependency at all** (`node:sqlite`).
+
+### A property of that pragma that cost a test to learn
+
+`locking_mode` is **per-connection** state. A second connection to the same file reports `normal`
+however the holder opened it, so "is exclusion configured?" is **not observable from outside the
+holder**. The first version of the unit test probed a fresh connection and therefore measured nothing
+at all — it asserted `exclusive` against a value that could only ever be `normal`.
+
+Two consequences are part of the decision:
+
+- `OwnerLock.describe()` reads `locking_mode` and `journal_mode` back from the holder's **own** handle,
+  so the configuration is observable and therefore testable.
+- The tests that matter assert **effects**, not configuration: an uncooperative second writer is
+  refused by the kernel, and a second daemon process exits non-zero with `OWNER_HELD`.
 
 ## Consequences
 
@@ -85,19 +99,63 @@ Negative and accepted:
 
 ## Verified by
 
-`test/unit/core.test.mjs`, all of which run real processes:
+`test/unit/owner-lock.test.mjs` — the primitive itself, held directly rather than through the daemon,
+because the daemon-level test cannot distinguish "the kernel refused" from any other reason a second
+daemon declines to start:
+
+- `the lock database is held in exclusive locking mode, not merely remembered` — the mode is read back
+  from the holder's own connection, and the database is asserted **not** to be in WAL mode;
+- `a second holder is refused, and an uncooperative connection cannot take the file` — the second half
+  is the load-bearing one: an **independent process**, opening the file with a plain SQLite connection
+  that knows nothing about `OwnerLock` and shares no in-memory state, is refused. A marker file, a PID
+  check or a leases table would pass the neighbours of this assertion and fail this one;
+- `the lock file keeps its inode, so releasing and re-taking cannot split ownership`;
+- `the startup self-check reports real exclusion on this platform, or fails loudly` — `probeLocking`
+  must report `supported`, `secondRefused` and `inodeStable`;
+- `the marker file is informational only: deleting it does not release anything` — the design forbids
+  "delete the stale artefact to take ownership", so this asserts the marker is not load-bearing;
+- `a stale marker left by a dead holder does not block a new owner` — a "refuse because the marker
+  exists" implementation would deadlock after every crash;
+- `a second daemon process started against a held state directory exits instead of running` — a real
+  second daemon is spawned and its **exit** is the observable. Deliberately not written as "wait for
+  the daemon to be ready": a daemon that wrongly acquires never becomes ready, so a readiness wait
+  would turn a wrong result into a timeout instead of a failure.
+
+`test/unit/core.test.mjs`, which runs real processes:
 
 - `exclusive ownership: a second handle is refused, and the holder keeps it while stopped` — an
   alive holder refuses a second handle, a `SIGSTOP`ped holder still refuses, and a `SIGCONT`ped
   holder still refuses;
 - `the daemon refuses to start when the state directory is already owned` — the second daemon exits
-  `4` with `OWNER_HELD`;
+  with `OWNER_HELD`;
 - `lock file inode is stable: nobody unlinks it, so a third party cannot lock a newer file`.
 
 `test/persistence/crash.test.mjs` additionally kills an owner with `SIGKILL` and confirms the next
-process acquires ownership in milliseconds, and that the interrupted operation is reported as
+process acquires ownership immediately, and that the interrupted operation is reported as
 `uncertain` rather than as sent.
 
-These tests run on macOS with Node 24.15.0 and SQLite 3.51.3. **The same tests have not yet been run
-on Linux or Windows**; CI is configured for Linux and macOS, and this ADR's claim is limited to what
-has actually executed.
+`test/mutation/run.mjs` carries a production negative control, `second-owner-not-refused`, which
+neuters the second holder's refusal in `src/lib/owner-lock.ts`. It is **caught as a hang**, not as a
+failed assertion: a refusal path that stops refusing blocks its caller rather than failing it, so the
+defect is observable as non-termination. The mutation runner counts a hang as a detection for exactly
+this reason.
+
+### Platform coverage, stated narrowly
+
+All of the above ran on **macOS (darwin/arm64) with Node 24.15.0 and SQLite 3.51.3**. Measured
+numbers from that run: a second `OwnerLock` was refused **20 times out of 20** with reason `busy`,
+`probeLocking` reported `{supported: true, secondRefused: true, inodeStable: true}`, and a second
+daemon process exited non-zero with `OWNER_HELD`.
+
+**The SIGSTOP and SIGKILL behaviour has not been executed on Linux or Windows.** CI is configured for
+both Linux and macOS, but the workflow has not yet been run on a runner, so no Linux result exists to
+cite. This ADR's claim is limited to what has actually executed.
+
+### Superseded formulation
+
+An earlier revision of this ADR said the lock was held by `pragma locking_mode=EXCLUSIVE` **plus one
+committed write**, and named the lock file `owner.lock`. Both statements were true but incomplete: the
+committed write alone does not keep the lock held between statements, so what actually keeps the
+file locked is the exclusive locking mode on a connection that is never closed, and the file is
+`owner.lock.sqlite`. Corrected here rather than silently edited, because the earlier wording would
+have led a reader to trust the write instead of the mode.

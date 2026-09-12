@@ -17,9 +17,9 @@
 
 import { existsSync, mkdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
-import { BridgeError, ERROR_CODES, toBridgeError } from './errors.js';
-import { createDigest, mintId } from './ids.js';
+import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
+import { BridgeError, ERROR_CODES, toBridgeError } from './errors.ts';
+import { createDigest, mintId } from './ids.ts';
 
 /** On-disk state schema version. An unknown *future* version is refused, not guessed. */
 export const STATE_SCHEMA_VERSION = 1;
@@ -33,7 +33,10 @@ export const OP_STATES = Object.freeze([
   'succeeded',
   'failed',
   'refused',      // host answered ok:false (a definite business refusal)
-]);
+] as const);
+
+/** The states an operation row may hold. The DDL check constraint lists the same set. */
+export type OperationState = (typeof OP_STATES)[number];
 
 /** Interaction lifecycle (approvals and questions). */
 export const INTERACTION_STATES = Object.freeze([
@@ -44,7 +47,21 @@ export const INTERACTION_STATES = Object.freeze([
   'revoked',
   'superseded',
   'uncertain',
-]);
+] as const);
+
+/**
+ * The lifecycle above is the intended set of interaction states. The column is NOT typed with
+ * it: `decideInteraction` writes the caller's decision string into `state`, and the daemon
+ * decides with `allowed-once` / `rejected` / `expired`, so a narrower type here would be a
+ * claim the store cannot keep.
+ */
+export type InteractionState = (typeof INTERACTION_STATES)[number];
+
+/** The states an outbox row may hold. The DDL check constraint lists the same set. */
+export type OutboxState = 'pending' | 'dispatching' | 'acknowledged' | 'uncertain';
+
+/** The states a turn row may hold. The DDL check constraint lists the same set. */
+export type TurnState = 'open' | 'completed' | 'failed' | 'cancelled' | 'uncertain';
 
 const DDL = `
 create table if not exists meta (
@@ -185,16 +202,398 @@ create index if not exists ops_by_state on operations(state);
 create index if not exists interactions_by_state on interactions(state);
 `;
 
+// ---- row shapes -------------------------------------------------------------------------
+//
+// node:sqlite types every result as `Record<string, SQLOutputValue>`, which erases the
+// columns entirely. Each distinct query shape is named once here, and the result is cast once
+// where it crosses the driver boundary — so a mistyped column is a compile error instead of an
+// `undefined` at runtime.
+
+/** `select value from meta where key = ?`. */
+export interface MetaValueRow {
+  readonly value: string;
+}
+
+/** One row of `tasks`. */
+export interface TaskRow {
+  readonly task_id: string;
+  readonly label: string | null;
+  readonly host_base: string;
+  readonly host_scope: string;
+  readonly created_at: number;
+  readonly updated_at: number;
+}
+
+/** One row of `sessions`. */
+export interface SessionRow {
+  readonly session_id: string;
+  readonly task_id: string;
+  readonly host_session_id: string;
+  readonly cwd: string | null;
+  readonly created_at: number;
+  readonly updated_at: number;
+}
+
+/** One row of `turns`. */
+export interface TurnRow {
+  readonly turn_id: string;
+  readonly session_id: string;
+  readonly host_turn: number | null;
+  readonly state: TurnState;
+  readonly opened_at: number;
+  readonly ended_at: number | null;
+  readonly reason: string | null;
+}
+
+/** One row of `operations`. */
+export interface OperationRow {
+  readonly operation_id: string;
+  readonly task_id: string;
+  readonly session_id: string | null;
+  readonly turn_id: string | null;
+  readonly kind: string;
+  readonly state: OperationState;
+  readonly idempotency_key: string;
+  readonly payload_digest: string;
+  readonly request_id: string | null;
+  readonly request_json: string | null;
+  readonly response_json: string | null;
+  readonly error_code: string | null;
+  readonly error_message: string | null;
+  readonly uncertain_reason: string | null;
+  readonly evidence: string | null;
+  readonly created_at: number;
+  readonly updated_at: number;
+}
+
+/** One row of `outbox`. */
+export interface OutboxRow {
+  readonly operation_id: string;
+  readonly request_id: string;
+  readonly method: string;
+  readonly endpoint: string;
+  readonly payload_json: string;
+  readonly state: OutboxState;
+  readonly attempts: number;
+  readonly created_at: number;
+}
+
+/** `select payload_json from outbox where operation_id = ?`. */
+export interface OutboxPayloadRow {
+  readonly payload_json: string;
+}
+
+/** One row of `interactions`. */
+export interface InteractionRow {
+  readonly interaction_id: string;
+  readonly task_id: string;
+  readonly session_id: string;
+  readonly turn_id: string | null;
+  readonly kind: 'approval' | 'question';
+  readonly host_rpc_id: string;
+  readonly native_id: string | null;
+  readonly payload_digest: string;
+  readonly payload_json: string;
+  readonly state: string;
+  readonly decision: string | null;
+  readonly reason: string | null;
+  readonly generation: number;
+  readonly store_generation: number;
+  readonly created_at: number;
+  readonly expires_at: number | null;
+  readonly decided_at: number | null;
+}
+
+/** One row of `events`. */
+export interface EventRow {
+  readonly task_id: string;
+  readonly session_id: string;
+  readonly seq: number;
+  readonly kind: string;
+  readonly payload_json: string;
+  readonly stored_at: number;
+}
+
+/** `select 1 as present from events where ...`. */
+export interface EventPresenceRow {
+  readonly present: number;
+}
+
+/** `select seq from events where ... order by seq`. */
+export interface EventSeqRow {
+  readonly seq: number;
+}
+
+/** `select count(*) as n from events where ...`. */
+export interface CountRow {
+  readonly n: number;
+}
+
+/** `select state, count(*) as n from <table> group by state`. */
+export interface StateCountRow {
+  readonly state: string;
+  readonly n: number;
+}
+
+/** One row of `cursors`. */
+export interface CursorRow {
+  readonly task_id: string;
+  readonly session_id: string;
+  readonly store_generation: number;
+  readonly scope: string;
+  readonly last_seq: number;
+  readonly completed_through: number;
+  readonly high_water: number;
+  readonly completeness: string;
+  readonly gap_from: number | null;
+  readonly gap_to: number | null;
+  readonly updated_at: number;
+}
+
+/** One row of `response_dedupe`. */
+export interface ResponseDedupeRow {
+  readonly task_id: string;
+  readonly host_rpc_id: string;
+  readonly answer_digest: string;
+  readonly outcome: string;
+  readonly created_at: number;
+}
+
+/** One row of `audit`. */
+export interface AuditRow {
+  readonly audit_id: string;
+  readonly task_id: string | null;
+  readonly at: number;
+  readonly kind: string;
+  readonly actor: string;
+  readonly detail_json: string | null;
+}
+
+/** Result of `pragma integrity_check`. */
+export interface IntegrityReport {
+  readonly ok: boolean;
+  readonly detail: string;
+}
+
+/** One contiguous hole in the stored sequence set. */
+export interface MissingRange {
+  readonly from: number;
+  readonly to: number;
+}
+
+/** What the store actually holds for one session's event stream. */
+export interface EventCoverage {
+  readonly count: number;
+  readonly first: number | null;
+  readonly highest: number;
+  readonly contiguousThrough: number;
+  readonly missing: readonly MissingRange[];
+}
+
+/** The provable contiguous run of one session's event stream. */
+export interface ContiguousEventRange {
+  readonly from: number | null;
+  readonly through: number;
+  readonly count: number;
+}
+
+/** A cursor read, bound to the store generation it was written under. */
+export type CursorRead =
+  | { readonly status: 'ok'; readonly cursor: CursorRow | null }
+  | { readonly status: 'expired'; readonly cursor: CursorRow };
+
+/** Result of reserving an operation idempotently. */
+export interface ReservedOperation {
+  readonly operation: OperationRow | null;
+  readonly created: boolean;
+}
+
+/** Result of recording an interaction. */
+export interface RecordedInteraction {
+  readonly interaction: InteractionRow | null;
+  readonly created: boolean;
+}
+
+/** Result of one compare-and-set on an interaction. */
+export interface InteractionDecision {
+  readonly applied: boolean;
+  readonly interaction: InteractionRow | null;
+  readonly previous: string | null;
+}
+
+/** Diagnostics snapshot: counts only, no payload text. */
+export interface StoreStats {
+  readonly generation: number;
+  readonly schemaVersion: number;
+  readonly operations: Record<string, number>;
+  readonly interactions: Record<string, number>;
+  readonly stateDirSizeBytes: number;
+}
+
+/** Constructor options: the directory holding the DB, WAL and lock file. */
+export interface StoreOptions {
+  readonly stateDir: string;
+}
+
+/** The host's error envelope, as much of it as the store records. */
+export interface HostErrorLike {
+  readonly code?: string | number | null;
+  readonly message?: string | null;
+}
+
+/** Input of `createTask`. */
+export interface CreateTaskInput {
+  readonly taskId: string;
+  readonly label?: string | null;
+  readonly hostBase: string;
+  readonly hostScope: string;
+}
+
+/** Input of `audit`. */
+export interface AuditInput {
+  readonly taskId?: string | null;
+  readonly kind: string;
+  readonly actor: string;
+  readonly detail?: Record<string, unknown>;
+}
+
+/** Input of `recordSession`. */
+export interface RecordSessionInput {
+  readonly sessionId: string;
+  readonly taskId: string;
+  readonly hostSessionId: string;
+  readonly cwd?: string | null;
+}
+
+/** Input of `reserveOperation`. */
+export interface ReserveOperationInput {
+  readonly taskId: string;
+  readonly kind: string;
+  readonly idempotencyKey: string;
+  readonly payload: unknown;
+  readonly sessionId?: string | null;
+  readonly turnId?: string | null;
+}
+
+/** Input of `markDispatching`. */
+export interface MarkDispatchingInput {
+  readonly operationId: string;
+  readonly method: string;
+  readonly endpoint: string;
+  readonly payload: unknown;
+}
+
+/** Input of `markAcknowledged`. */
+export interface MarkAcknowledgedInput {
+  readonly operationId: string;
+  readonly ok: boolean;
+  readonly value?: unknown;
+  readonly error?: HostErrorLike | null;
+}
+
+/** Input of `markUncertain`. */
+export interface MarkUncertainInput {
+  readonly operationId: string;
+  readonly reason: string;
+  readonly evidence?: Record<string, unknown>;
+}
+
+/** Input of `resolveUncertain`. */
+export interface ResolveUncertainInput {
+  readonly operationId: string;
+  readonly resolution: 'succeeded' | 'failed';
+  readonly evidence: Record<string, unknown>;
+}
+
+/** Input of `appendEvent`. */
+export interface AppendEventInput {
+  readonly taskId: string;
+  readonly sessionId: string;
+  readonly seq: number;
+  readonly kind: string;
+  readonly payload: object;
+}
+
+/** Input of `pageEvents`. */
+export interface PageEventsInput {
+  readonly taskId: string;
+  readonly sessionId: string;
+  readonly beforeSeq?: number | null;
+  readonly limit?: number;
+}
+
+/** Input of `putCursor`. */
+export interface PutCursorInput {
+  readonly taskId: string;
+  readonly sessionId: string;
+  readonly scope?: string;
+  readonly lastSeq: number;
+  readonly highWater: number;
+  readonly completeness: string;
+  readonly gapFrom?: number | null;
+  readonly gapTo?: number | null;
+  readonly completedThrough?: number | null;
+}
+
+/** Input of `readCursor`. */
+export interface ReadCursorInput {
+  readonly taskId: string;
+  readonly sessionId: string;
+  readonly scope?: string;
+}
+
+/** Input of `recordInteraction`. */
+export interface RecordInteractionInput {
+  readonly taskId: string;
+  readonly sessionId: string;
+  readonly turnId?: string | null;
+  readonly kind: 'approval' | 'question';
+  readonly hostRpcId: string;
+  readonly nativeId?: string | null;
+  readonly payload: object;
+  readonly expiresAt?: number | null;
+}
+
+/** Input of `decideInteraction`. */
+export interface DecideInteractionInput {
+  readonly interactionId: string;
+  readonly decision: string;
+  readonly reason?: string | null;
+}
+
+/** Input of `recordResponseDelivery`. */
+export interface RecordResponseDeliveryInput {
+  readonly taskId: string;
+  readonly hostRpcId: string;
+  readonly answerDigest: string;
+  readonly outcome: string;
+}
+
+/** Input of `openTurn`. */
+export interface OpenTurnInput {
+  readonly turnId: string;
+  readonly sessionId: string;
+  readonly hostTurn?: number | null;
+}
+
+/** Input of `closeTurn`. */
+export interface CloseTurnInput {
+  readonly turnId: string;
+  readonly state: 'completed' | 'failed' | 'cancelled' | 'uncertain';
+  readonly reason?: string | null;
+}
+
 /**
  * Map a thrown SQLite error onto the taxonomy, preserving evidence.
- * @param {unknown} error thrown by node:sqlite
- * @param {string} context what was being attempted
- * @returns {BridgeError}
+ * @param error thrown by node:sqlite
+ * @param context what was being attempted
+ * @returns a BridgeError carrying the mapped code
  */
-export function mapSqliteError(error, context) {
+export function mapSqliteError(error: unknown, context: string): BridgeError {
   const raw = error instanceof Error ? error.message : String(error);
   const lower = raw.toLowerCase();
-  let code = ERROR_CODES.STORAGE_UNAVAILABLE;
+  /** one of ERROR_CODES; starts at the least specific storage code */
+  let code: string = ERROR_CODES.STORAGE_UNAVAILABLE;
   if (lower.includes('disk i/o') || lower.includes('full') || lower.includes('enospc')) {
     code = ERROR_CODES.STORAGE_FULL;
   } else if (lower.includes('malformed') || lower.includes('corrupt') || lower.includes('not a database')) {
@@ -212,19 +611,19 @@ const MAX_BUSY_RETRY = 5;
 
 /** Durable store. One instance per daemon process; never shared across processes. */
 export class Store {
-  #db;
-  #stateDir;
-  #generation;
+  #db: DatabaseSync;
+  #stateDir: string;
+  #generation: number;
 
   /**
-   * @param {object} options
-   * @param {string} options.stateDir directory holding the DB, WAL and lock file
+   * @param options
+   * @param options.stateDir directory holding the DB, WAL and lock file
    */
-  constructor({ stateDir }) {
+  constructor({ stateDir }: StoreOptions) {
     this.#stateDir = stateDir;
     mkdirSync(stateDir, { recursive: true, mode: 0o700 });
     const dbPath = join(stateDir, 'state.sqlite');
-    let db;
+    let db: DatabaseSync;
     try {
       db = new DatabaseSync(dbPath, { timeout: 0 });
       db.exec('pragma journal_mode=WAL');
@@ -244,12 +643,13 @@ export class Store {
     this.#generation = this.#readGeneration();
   }
 
-  get stateDir() { return this.#stateDir; }
-  get generation() { return this.#generation; }
+  get stateDir(): string { return this.#stateDir; }
+  get generation(): number { return this.#generation; }
 
-  /** @returns {number} durable store generation, used to bind cursors. */
-  #readGeneration() {
-    const row = this.#db.prepare('select value from meta where key = ?').get('generation');
+  /** @returns durable store generation, used to bind cursors. */
+  #readGeneration(): number {
+    // One cast for this `meta` read: node:sqlite hands back a loose column bag.
+    const row = this.#db.prepare('select value from meta where key = ?').get('generation') as MetaValueRow | undefined;
     if (row) return Number(row.value);
     const generation = 1;
     this.#db.prepare('insert into meta(key, value) values (?, ?)').run('generation', String(generation));
@@ -259,10 +659,11 @@ export class Store {
 
   /**
    * Refuse a state file written by a newer bridge.
-   * @param {DatabaseSync} db
+   * @param db
    */
-  #checkSchemaVersion(db) {
-    const row = db.prepare('select value from meta where key = ?').get('schema_version');
+  #checkSchemaVersion(db: DatabaseSync): void {
+    // The same cast for the same query shape, on the connection being opened.
+    const row = db.prepare('select value from meta where key = ?').get('schema_version') as MetaValueRow | undefined;
     if (!row) return;
     const found = Number(row.value);
     if (!Number.isFinite(found)) {
@@ -280,11 +681,10 @@ export class Store {
   /**
    * Run a write inside a transaction with bounded busy retry. Never wraps a network call:
    * callers commit, then send.
-   * @template T
-   * @param {() => T} fn work to perform inside the transaction
-   * @returns {T}
+   * @param fn work to perform inside the transaction
+   * @returns the value the work returned
    */
-  write(fn) {
+  write<T>(fn: () => T): T {
     for (let attempt = 0; ; attempt += 1) {
       try {
         this.#db.exec('begin immediate');
@@ -309,35 +709,42 @@ export class Store {
   }
 
   /**
-   * @template T
-   * @param {string} sql
-   * @returns {T}
+   * Read one row, with the row shape named by the caller.
+   * @param sql statement to run
+   * @param params values bound to its `?` placeholders
+   * @returns the first row, or undefined when the statement matched nothing
    */
-  get(sql, ...params) {
+  get<T>(sql: string, ...params: SQLInputValue[]): T | undefined {
     try {
-      return /** @type {T} */ (this.#db.prepare(sql).get(...params));
+      // The cast every `get` caller relies on: node:sqlite types the row as a loose column
+      // bag, and the caller names the shape it selected for (see the row shapes above).
+      return this.#db.prepare(sql).get(...params) as unknown as T | undefined;
     } catch (error) {
       throw mapSqliteError(error, 'query');
     }
   }
 
   /**
-   * @param {string} sql
-   * @returns {unknown[]}
+   * Read every matching row, with the row shape named by the caller.
+   * @param sql statement to run
+   * @param params values bound to its `?` placeholders
+   * @returns one entry per row
    */
-  all(sql, ...params) {
+  all<T>(sql: string, ...params: SQLInputValue[]): T[] {
     try {
-      return this.#db.prepare(sql).all(...params);
+      // The same cast for `.all`: one named row shape per query; see the row shapes above.
+      return this.#db.prepare(sql).all(...params) as unknown as T[];
     } catch (error) {
       throw mapSqliteError(error, 'query');
     }
   }
 
   /**
-   * @param {string} sql
-   * @returns {void}
+   * @param sql statement to run
+   * @param params values bound to its `?` placeholders
+   * @returns nothing
    */
-  run(sql, ...params) {
+  run(sql: string, ...params: SQLInputValue[]): void {
     try {
       this.#db.prepare(sql).run(...params);
     } catch (error) {
@@ -346,7 +753,7 @@ export class Store {
   }
 
   /** Checkpoint the WAL; bounded and explicit. */
-  checkpoint() {
+  checkpoint(): void {
     try {
       this.#db.exec('pragma wal_checkpoint(TRUNCATE)');
     } catch (error) {
@@ -355,7 +762,7 @@ export class Store {
   }
 
   /** Close the store. Never deletes anything: evidence is preserved for triage. */
-  close() {
+  close(): void {
     try {
       this.#db.close();
     } catch {
@@ -365,9 +772,9 @@ export class Store {
 
   /**
    * Integrity check used at startup: a corrupt DB must fail loudly.
-   * @returns {{ok: boolean, detail: string}}
+   * @returns whether the DB is intact, with the pragma's own detail text
    */
-  integrityCheck() {
+  integrityCheck(): IntegrityReport {
     try {
       const rows = this.#db.prepare('pragma integrity_check').all();
       const detail = rows.map((r) => Object.values(r)[0]).join('; ');
@@ -379,8 +786,8 @@ export class Store {
 
   // ---- tasks ------------------------------------------------------------------------
 
-  /** @param {{taskId: string, label?: string, hostBase: string, hostScope: string}} input */
-  createTask({ taskId, label = null, hostBase, hostScope }) {
+  /** @param input the task to record */
+  createTask({ taskId, label = null, hostBase, hostScope }: CreateTaskInput): TaskRow | null {
     const now = Date.now();
     this.write(() => {
       this.run(
@@ -391,13 +798,13 @@ export class Store {
     return this.getTask(taskId);
   }
 
-  /** @param {string} taskId */
-  getTask(taskId) {
-    return this.get('select * from tasks where task_id = ?', taskId) ?? null;
+  /** @param taskId */
+  getTask(taskId: string): TaskRow | null {
+    return this.get<TaskRow>('select * from tasks where task_id = ?', taskId) ?? null;
   }
 
-  /** @param {{taskId: string, reason: string, actor: string}} input */
-  audit({ taskId = null, kind, actor, detail = {} }) {
+  /** @param input the audited action */
+  audit({ taskId = null, kind, actor, detail = {} }: AuditInput): void {
     this.write(() => {
       this.run(
         'insert into audit(audit_id, task_id, at, kind, actor, detail_json) values (?,?,?,?,?,?)',
@@ -406,9 +813,9 @@ export class Store {
     });
   }
 
-  /** @param {string} taskId @param {number} [limit] */
-  auditTrail(taskId, limit = 100) {
-    return this.all(
+  /** @param taskId @param limit */
+  auditTrail(taskId: string, limit = 100): AuditRow[] {
+    return this.all<AuditRow>(
       'select * from audit where task_id = ? order by at asc, audit_id asc limit ?',
       taskId, limit,
     );
@@ -416,8 +823,8 @@ export class Store {
 
   // ---- sessions ---------------------------------------------------------------------
 
-  /** @param {{sessionId: string, taskId: string, hostSessionId: string, cwd: string|null}} input */
-  recordSession({ sessionId, taskId, hostSessionId, cwd = null }) {
+  /** @param input the session to record */
+  recordSession({ sessionId, taskId, hostSessionId, cwd = null }: RecordSessionInput): SessionRow | null {
     const now = Date.now();
     this.write(() => {
       this.run(
@@ -430,19 +837,19 @@ export class Store {
     return this.getSession(sessionId);
   }
 
-  /** @param {string} sessionId */
-  getSession(sessionId) {
-    return this.get('select * from sessions where session_id = ?', sessionId) ?? null;
+  /** @param sessionId */
+  getSession(sessionId: string): SessionRow | null {
+    return this.get<SessionRow>('select * from sessions where session_id = ?', sessionId) ?? null;
   }
 
-  /** @param {string} taskId */
-  listSessions(taskId) {
-    return this.all('select * from sessions where task_id = ? order by created_at asc', taskId);
+  /** @param taskId */
+  listSessions(taskId: string): SessionRow[] {
+    return this.all<SessionRow>('select * from sessions where task_id = ? order by created_at asc', taskId);
   }
 
-  /** @param {string} hostSessionId */
-  findSessionByHostId(hostSessionId) {
-    return this.get('select * from sessions where host_session_id = ?', hostSessionId) ?? null;
+  /** @param hostSessionId */
+  findSessionByHostId(hostSessionId: string): SessionRow | null {
+    return this.get<SessionRow>('select * from sessions where host_session_id = ?', hostSessionId) ?? null;
   }
 
   // ---- operations -------------------------------------------------------------------
@@ -451,13 +858,12 @@ export class Store {
    * Reserve an operation idempotently: the same key and payload returns the SAME operation,
    * and the same key with a different payload is a conflict. This is the caller-facing
    * idempotency contract and it is enforced by a unique constraint, not by a lookup race.
-   * @param {{taskId: string, kind: string, idempotencyKey: string, payload: unknown,
-   *          sessionId?: string|null, turnId?: string|null}} input
-   * @returns {{operation: object, created: boolean}}
+   * @param input the operation to reserve
+   * @returns the operation row and whether this call created it
    */
-  reserveOperation({ taskId, kind, idempotencyKey, payload, sessionId = null, turnId = null }) {
+  reserveOperation({ taskId, kind, idempotencyKey, payload, sessionId = null, turnId = null }: ReserveOperationInput): ReservedOperation {
     const digest = createDigest(JSON.stringify(payload ?? null));
-    const existing = this.get(
+    const existing = this.get<OperationRow>(
       'select * from operations where task_id = ? and idempotency_key = ?',
       taskId, idempotencyKey,
     );
@@ -486,7 +892,7 @@ export class Store {
       });
     } catch (error) {
       // Unique-constraint race: another process reserved the key between read and write.
-      const raced = this.get(
+      const raced = this.get<OperationRow>(
         'select * from operations where task_id = ? and idempotency_key = ?',
         taskId, idempotencyKey,
       );
@@ -496,14 +902,14 @@ export class Store {
     return { operation: this.getOperation(operationId), created: true };
   }
 
-  /** @param {string} operationId */
-  getOperation(operationId) {
-    return this.get('select * from operations where operation_id = ?', operationId) ?? null;
+  /** @param operationId */
+  getOperation(operationId: string): OperationRow | null {
+    return this.get<OperationRow>('select * from operations where operation_id = ?', operationId) ?? null;
   }
 
-  /** @param {string} taskId @param {number} [limit] */
-  listOperations(taskId, limit = 200) {
-    return this.all(
+  /** @param taskId @param limit */
+  listOperations(taskId: string, limit = 200): OperationRow[] {
+    return this.all<OperationRow>(
       'select * from operations where task_id = ? order by created_at asc limit ?',
       taskId, limit,
     );
@@ -513,33 +919,34 @@ export class Store {
    * Persist the outbox row and move the operation to `dispatching` in ONE transaction,
    * committed before the caller performs the network write. This ordering is the whole
    * point: after this returns, a crash means "possibly sent".
-   * @param {{operationId: string, method: string, endpoint: string, payload: unknown}} input
+   * @param input the operation and the request about to go on the wire
    */
   /**
    * The most recent request body handed to the wire for an operation, if any. This is what a
    * retry must resend verbatim: re-deriving a preallocated sessionId would ask the host to
    * create a DIFFERENT session while claiming to be the same operation.
-   * @param {string} operationId
-   * @returns {object|null}
+   * @param operationId
+   * @returns the stored request body, or null when none is recorded or it is not an object
    */
-  latestOutboxPayload(operationId) {
-    const row = this.get(
+  latestOutboxPayload(operationId: string): Record<string, unknown> | null {
+    const row = this.get<OutboxPayloadRow>(
       'select payload_json from outbox where operation_id = ? order by created_at desc limit 1',
       operationId,
     );
     if (!row?.payload_json) return null;
     try {
-      const parsed = JSON.parse(row.payload_json);
-      return parsed && typeof parsed === 'object' ? parsed : null;
+      // JSON.parse is an untyped boundary; the store itself wrote this column as a JSON object.
+      const parsed = JSON.parse(row.payload_json) as unknown;
+      return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : null;
     } catch {
       return null;
     }
   }
 
-  markDispatching({ operationId, method, endpoint, payload }) {
+  markDispatching({ operationId, method, endpoint, payload }: MarkDispatchingInput): OperationRow | null {
     const now = Date.now();
     return this.write(() => {
-      const op = this.get('select * from operations where operation_id = ?', operationId);
+      const op = this.get<OperationRow>('select * from operations where operation_id = ?', operationId);
       if (!op) throw new BridgeError(ERROR_CODES.NOT_FOUND, 'operation not found', { operationId });
       if (op.state !== 'pending') {
         throw new BridgeError(
@@ -568,12 +975,12 @@ export class Store {
 
   /**
    * Record a valid host response. `ok:false` is a definite refusal; `ok:true` a success.
-   * @param {{operationId: string, ok: boolean, value?: unknown, error?: object}} input
+   * @param input the acknowledged operation and the host's answer
    */
-  markAcknowledged({ operationId, ok, value = null, error = null }) {
+  markAcknowledged({ operationId, ok, value = null, error = null }: MarkAcknowledgedInput): OperationRow | null {
     const now = Date.now();
     return this.write(() => {
-      const op = this.get('select * from operations where operation_id = ?', operationId);
+      const op = this.get<OperationRow>('select * from operations where operation_id = ?', operationId);
       if (!op) throw new BridgeError(ERROR_CODES.NOT_FOUND, 'operation not found', { operationId });
       if (op.state !== 'dispatching' && op.state !== 'sent') {
         throw new BridgeError(
@@ -600,9 +1007,9 @@ export class Store {
    * Mark an operation uncertain. Called when the outcome cannot be proven: a lost carrier
    * after a send, or a crash that left the row in `dispatching`. It stays uncertain
    * indefinitely unless strong evidence resolves it — absence of proof is not proof.
-   * @param {{operationId: string, reason: string, evidence?: object}} input
+   * @param input the operation, the reason, and any evidence
    */
-  markUncertain({ operationId, reason, evidence = {} }) {
+  markUncertain({ operationId, reason, evidence = {} }: MarkUncertainInput): OperationRow | null {
     const now = Date.now();
     return this.write(() => {
       this.run(
@@ -618,12 +1025,12 @@ export class Store {
   /**
    * Resolve an uncertain operation from independent evidence (for example authoritative
    * history). Only called with evidence; never called to "tidy up".
-   * @param {{operationId: string, resolution: 'succeeded'|'failed', evidence: object}} input
+   * @param input the operation, the resolution, and the evidence for it
    */
-  resolveUncertain({ operationId, resolution, evidence }) {
+  resolveUncertain({ operationId, resolution, evidence }: ResolveUncertainInput): OperationRow | null {
     const now = Date.now();
     return this.write(() => {
-      const op = this.get('select * from operations where operation_id = ?', operationId);
+      const op = this.get<OperationRow>('select * from operations where operation_id = ?', operationId);
       if (!op) throw new BridgeError(ERROR_CODES.NOT_FOUND, 'operation not found', { operationId });
       if (op.state !== 'uncertain') {
         throw new BridgeError(
@@ -643,11 +1050,11 @@ export class Store {
   /**
    * Operations that were mid-dispatch when the process died: they are "possibly sent" and
    * must be surfaced as uncertain, never silently retried.
-   * @param {string} reason
-   * @returns {object[]} the operations moved to uncertain
+   * @param reason
+   * @returns the operations moved to uncertain
    */
-  sweepInterruptedDispatches(reason) {
-    const rows = this.all("select * from operations where state = 'dispatching'");
+  sweepInterruptedDispatches(reason: string): OperationRow[] {
+    const rows = this.all<OperationRow>("select * from operations where state = 'dispatching'");
     for (const row of rows) {
       this.markUncertain({
         operationId: row.operation_id,
@@ -663,8 +1070,8 @@ export class Store {
   /**
    * Append an event once. Re-delivery of an identical native event is a no-op: dedupe is by
    * native sequence identity, never by hashing repeated identical text.
-   * @param {{taskId: string, sessionId: string, seq: number, kind: string, payload: object}} input
-   * @returns {boolean} true when the row was newly inserted
+   * @param input the event to append
+   * @returns true when the row was newly inserted
    */
   /**
    * Append one native event. Returns false when the sequence is already stored.
@@ -673,11 +1080,11 @@ export class Store {
    * of defence, so a redelivered frame can never produce a second row even if a caller forgets
    * to check. (Callers still check first, to avoid taking a write transaction for a known
    * duplicate.)
-   * @returns {boolean} true when a new row was written
+   * @returns true when a new row was written
    */
-  appendEvent({ taskId, sessionId, seq, kind, payload }) {
+  appendEvent({ taskId, sessionId, seq, kind, payload }: AppendEventInput): boolean {
     return this.write(() => {
-      const before = this.get(
+      const before = this.get<EventPresenceRow>(
         'select 1 as present from events where task_id = ? and session_id = ? and seq = ?',
         taskId, sessionId, seq,
       );
@@ -691,39 +1098,39 @@ export class Store {
   }
 
   /**
-   * @param {{taskId: string, sessionId: string, beforeSeq?: number, maxMessages?: number}} input
+   * @param input the page request
+   * @returns the page in ascending sequence order
    */
-  pageEvents({ taskId, sessionId, beforeSeq = null, limit = 200 }) {
+  pageEvents({ taskId, sessionId, beforeSeq = null, limit = 200 }: PageEventsInput): EventRow[] {
     const rows = beforeSeq === null
-      ? this.all(
+      ? this.all<EventRow>(
         `select * from events where task_id = ? and session_id = ?
          order by seq desc limit ?`, taskId, sessionId, limit)
-      : this.all(
+      : this.all<EventRow>(
         `select * from events where task_id = ? and session_id = ? and seq < ?
          order by seq desc limit ?`, taskId, sessionId, beforeSeq, limit);
     return rows.reverse();
   }
 
   /** Operation counts by state — the observable signal that a request is in flight. */
-  operationCounts() {
-    const rows = this.all('select state, count(*) as n from operations group by state');
-    /** @type {Record<string, number>} */
-    const counts = {};
+  operationCounts(): Record<string, number> {
+    const rows = this.all<StateCountRow>('select state, count(*) as n from operations group by state');
+    const counts: Record<string, number> = {};
     for (const row of rows) counts[row.state] = Number(row.n);
     return counts;
   }
 
-  /** @param {string} taskId @param {string} sessionId */
-  countEvents(taskId, sessionId) {
-    const row = this.get(
+  /** @param taskId @param sessionId */
+  countEvents(taskId: string, sessionId: string): number {
+    const row = this.get<CountRow>(
       'select count(*) as n from events where task_id = ? and session_id = ?', taskId, sessionId,
     );
     return Number(row?.n ?? 0);
   }
 
-  /** @param {string} taskId @param {string} sessionId @param {number} seq */
-  hasEvent(taskId, sessionId, seq) {
-    const row = this.get(
+  /** @param taskId @param sessionId @param seq */
+  hasEvent(taskId: string, sessionId: string, seq: number): boolean {
+    const row = this.get<EventPresenceRow>(
       'select 1 as present from events where task_id = ? and session_id = ? and seq = ?',
       taskId, sessionId, seq,
     );
@@ -737,18 +1144,17 @@ export class Store {
    * are absent. Ranges BELOW the first stored sequence are deliberately not reported: a client
    * that attached to an existing session legitimately receives only a later window, and
    * calling that a hole would report a gap no observation supports.
-   * @param {string} taskId @param {string} sessionId
-   * @returns {{count: number, first: number|null, highest: number, contiguousThrough: number, missing: {from: number, to: number}[]}}
+   * @param taskId @param sessionId
    */
-  eventCoverage(taskId, sessionId) {
-    const rows = this.all(
+  eventCoverage(taskId: string, sessionId: string): EventCoverage {
+    const rows = this.all<EventSeqRow>(
       'select seq from events where task_id = ? and session_id = ? order by seq',
       taskId, sessionId,
     ).map((row) => Number(row.seq));
     if (!rows.length) {
       return { count: 0, first: null, highest: 0, contiguousThrough: 0, missing: [] };
     }
-    const missing = [];
+    const missing: MissingRange[] = [];
     let contiguousThrough = rows[0];
     for (let i = 1; i < rows.length; i += 1) {
       if (rows[i] > rows[i - 1] + 1) missing.push({ from: rows[i - 1] + 1, to: rows[i] - 1 });
@@ -767,10 +1173,9 @@ export class Store {
    * Highest sequence N such that every sequence from the first stored one through N is
    * present. Derived from the stored rows rather than inferred from arrival order: an
    * out-of-order arrival must never let the store claim a contiguous run it does not hold.
-   * @param {string} taskId @param {string} sessionId
-   * @returns {{from: number|null, through: number, count: number}}
+   * @param taskId @param sessionId
    */
-  contiguousEventRange(taskId, sessionId) {
+  contiguousEventRange(taskId: string, sessionId: string): ContiguousEventRange {
     const coverage = this.eventCoverage(taskId, sessionId);
     return { from: coverage.first, through: coverage.contiguousThrough, count: coverage.count };
   }
@@ -778,10 +1183,9 @@ export class Store {
   /**
    * Record a cursor bound to the store generation, scope and page high-water. A cursor whose
    * generation no longer matches is expired, not silently treated as "latest".
-   * @param {{taskId: string, sessionId: string, scope: string, lastSeq: number,
-   *          highWater: number, completeness: string, gapFrom?: number|null, gapTo?: number|null}} input
+   * @param input the cursor to record
    */
-  putCursor({ taskId, sessionId, scope = 'mux', lastSeq, highWater, completeness, gapFrom = null, gapTo = null, completedThrough = null }) {
+  putCursor({ taskId, sessionId, scope = 'mux', lastSeq, highWater, completeness, gapFrom = null, gapTo = null, completedThrough = null }: PutCursorInput): CursorRow | null {
     this.write(() => {
       this.run(
         `insert into cursors(task_id, session_id, store_generation, scope, last_seq, completed_through, high_water,
@@ -803,19 +1207,19 @@ export class Store {
     return this.getCursor(taskId, sessionId, scope);
   }
 
-  /** @param {string} taskId @param {string} sessionId @param {string} scope */
-  getCursor(taskId, sessionId, scope = 'mux') {
-    return this.get(
+  /** @param taskId @param sessionId @param scope */
+  getCursor(taskId: string, sessionId: string, scope = 'mux'): CursorRow | null {
+    return this.get<CursorRow>(
       'select * from cursors where task_id = ? and session_id = ? and scope = ?',
       taskId, sessionId, scope,
     ) ?? null;
   }
 
   /**
-   * @param {{taskId: string, sessionId: string, scope?: string}} input
-   * @returns {{status: 'ok'|'expired', cursor?: object}}
+   * @param input the cursor to read
+   * @returns the cursor, or an expired marker when it was bound to another store generation
    */
-  readCursor({ taskId, sessionId, scope = 'mux' }) {
+  readCursor({ taskId, sessionId, scope = 'mux' }: ReadCursorInput): CursorRead {
     const cursor = this.getCursor(taskId, sessionId, scope);
     if (!cursor) return { status: 'ok', cursor: null };
     if (Number(cursor.store_generation) !== this.#generation) {
@@ -829,12 +1233,11 @@ export class Store {
   /**
    * Record an approval/question exactly once per host rpc id. Replay of the same pending
    * request restores display state only and never re-arms a decision.
-   * @param {{taskId: string, sessionId: string, turnId?: string|null, kind: 'approval'|'question',
-   *          hostRpcId: string, nativeId?: string|null, payload: object, expiresAt?: number|null}} input
-   * @returns {{interaction: object, created: boolean}}
+   * @param input the interaction to record
+   * @returns the interaction row and whether this call created it
    */
-  recordInteraction({ taskId, sessionId, turnId = null, kind, hostRpcId, nativeId = null, payload, expiresAt = null }) {
-    const existing = this.get('select * from interactions where host_rpc_id = ?', hostRpcId);
+  recordInteraction({ taskId, sessionId, turnId = null, kind, hostRpcId, nativeId = null, payload, expiresAt = null }: RecordInteractionInput): RecordedInteraction {
+    const existing = this.get<InteractionRow>('select * from interactions where host_rpc_id = ?', hostRpcId);
     if (existing) return { interaction: existing, created: false };
     const interactionId = mintId('interaction');
     const digest = createDigest(JSON.stringify(payload));
@@ -850,34 +1253,34 @@ export class Store {
     return { interaction: this.getInteraction(interactionId), created: true };
   }
 
-  /** @param {string} interactionId */
-  getInteraction(interactionId) {
-    return this.get('select * from interactions where interaction_id = ?', interactionId) ?? null;
+  /** @param interactionId */
+  getInteraction(interactionId: string): InteractionRow | null {
+    return this.get<InteractionRow>('select * from interactions where interaction_id = ?', interactionId) ?? null;
   }
 
-  /** @param {string} hostRpcId */
-  getInteractionByRpcId(hostRpcId) {
-    return this.get('select * from interactions where host_rpc_id = ?', hostRpcId) ?? null;
+  /** @param hostRpcId */
+  getInteractionByRpcId(hostRpcId: string): InteractionRow | null {
+    return this.get<InteractionRow>('select * from interactions where host_rpc_id = ?', hostRpcId) ?? null;
   }
 
-  /** @param {string} taskId @param {string} [state] */
-  listInteractions(taskId, state = null) {
+  /** @param taskId @param state */
+  listInteractions(taskId: string, state: string | null = null): InteractionRow[] {
     return state
-      ? this.all('select * from interactions where task_id = ? and state = ? order by created_at asc', taskId, state)
-      : this.all('select * from interactions where task_id = ? order by created_at asc', taskId);
+      ? this.all<InteractionRow>('select * from interactions where task_id = ? and state = ? order by created_at asc', taskId, state)
+      : this.all<InteractionRow>('select * from interactions where task_id = ? order by created_at asc', taskId);
   }
 
   /**
    * Compare-and-set one decision. Duplicate identical decisions are idempotent; a different
    * decision on an already-decided interaction is rejected by the caller after this returns
    * the current row, so the CAS is the single point of truth.
-   * @param {{interactionId: string, decision: string, reason?: string}} input
-   * @returns {{applied: boolean, interaction: object, previous: string|null}}
+   * @param input the decision to apply
+   * @returns whether it applied, the current row, and the state it was in before
    */
-  decideInteraction({ interactionId, decision, reason = null }) {
+  decideInteraction({ interactionId, decision, reason = null }: DecideInteractionInput): InteractionDecision {
     const now = Date.now();
     return this.write(() => {
-      const current = this.get('select * from interactions where interaction_id = ?', interactionId);
+      const current = this.get<InteractionRow>('select * from interactions where interaction_id = ?', interactionId);
       if (!current) throw new BridgeError(ERROR_CODES.NOT_FOUND, 'interaction not found', { interactionId });
       if (current.state !== 'pending') {
         return { applied: false, interaction: current, previous: current.state };
@@ -894,9 +1297,10 @@ export class Store {
   /**
    * Record an answer delivery attempt result keyed by host rpc id, so a replayed answer is
    * detectable even after the interaction row moved on.
-   * @param {{taskId: string, hostRpcId: string, answerDigest: string, outcome: string}} input
+   * @param input the delivery attempt
+   * @returns the stored dedupe row
    */
-  recordResponseDelivery({ taskId, hostRpcId, answerDigest, outcome }) {
+  recordResponseDelivery({ taskId, hostRpcId, answerDigest, outcome }: RecordResponseDeliveryInput): ResponseDedupeRow | undefined {
     this.write(() => {
       this.run(
         `insert into response_dedupe(task_id, host_rpc_id, answer_digest, outcome, created_at)
@@ -906,18 +1310,18 @@ export class Store {
         taskId, hostRpcId, answerDigest, outcome, Date.now(),
       );
     });
-    return this.get('select * from response_dedupe where task_id = ? and host_rpc_id = ?', taskId, hostRpcId);
+    return this.get<ResponseDedupeRow>('select * from response_dedupe where task_id = ? and host_rpc_id = ?', taskId, hostRpcId);
   }
 
-  /** @param {string} taskId @param {string} hostRpcId */
-  getResponseDelivery(taskId, hostRpcId) {
-    return this.get('select * from response_dedupe where task_id = ? and host_rpc_id = ?', taskId, hostRpcId) ?? null;
+  /** @param taskId @param hostRpcId */
+  getResponseDelivery(taskId: string, hostRpcId: string): ResponseDedupeRow | null {
+    return this.get<ResponseDedupeRow>('select * from response_dedupe where task_id = ? and host_rpc_id = ?', taskId, hostRpcId) ?? null;
   }
 
   // ---- turns ------------------------------------------------------------------------
 
-  /** @param {{turnId: string, sessionId: string, hostTurn?: number|null}} input */
-  openTurn({ turnId, sessionId, hostTurn = null }) {
+  /** @param input the turn to open */
+  openTurn({ turnId, sessionId, hostTurn = null }: OpenTurnInput): TurnRow | null {
     this.write(() => {
       this.run(
         `insert into turns(turn_id, session_id, host_turn, state, opened_at) values (?,?,?,'open',?)`,
@@ -927,32 +1331,32 @@ export class Store {
     return this.getTurn(turnId);
   }
 
-  /** @param {string} turnId */
-  getTurn(turnId) {
-    return this.get('select * from turns where turn_id = ?', turnId) ?? null;
+  /** @param turnId */
+  getTurn(turnId: string): TurnRow | null {
+    return this.get<TurnRow>('select * from turns where turn_id = ?', turnId) ?? null;
   }
 
-  /** @param {string} sessionId @param {string} [state] */
-  listTurns(sessionId, state = null) {
+  /** @param sessionId @param state */
+  listTurns(sessionId: string, state: string | null = null): TurnRow[] {
     return state
-      ? this.all('select * from turns where session_id = ? and state = ? order by opened_at asc', sessionId, state)
-      : this.all('select * from turns where session_id = ? order by opened_at asc', sessionId);
+      ? this.all<TurnRow>('select * from turns where session_id = ? and state = ? order by opened_at asc', sessionId, state)
+      : this.all<TurnRow>('select * from turns where session_id = ? order by opened_at asc', sessionId);
   }
 
-  /** @param {string} sessionId @returns {object|null} */
-  currentOpenTurn(sessionId) {
-    return this.get(
+  /** @param sessionId @returns the open turn, or null when the session is idle */
+  currentOpenTurn(sessionId: string): TurnRow | null {
+    return this.get<TurnRow>(
       "select * from turns where session_id = ? and state = 'open' order by opened_at desc limit 1", sessionId,
     ) ?? null;
   }
 
   /**
    * Close a turn only on an authoritative terminal event for that exact turn.
-   * @param {{turnId: string, state: 'completed'|'failed'|'cancelled'|'uncertain', reason?: string}} input
+   * @param input the turn to close and the terminal state it reached
    */
-  closeTurn({ turnId, state, reason = null }) {
+  closeTurn({ turnId, state, reason = null }: CloseTurnInput): TurnRow | null {
     this.write(() => {
-      const turn = this.get('select * from turns where turn_id = ?', turnId);
+      const turn = this.get<TurnRow>('select * from turns where turn_id = ?', turnId);
       if (!turn) throw new BridgeError(ERROR_CODES.NOT_FOUND, 'turn not found', { turnId });
       if (turn.state !== 'open') return;
       this.run(
@@ -964,24 +1368,24 @@ export class Store {
   }
 
   /** Diagnostics snapshot, safe to expose: counts only, no payload text. */
-  stats() {
-    const ops = this.all('select state, count(*) as n from operations group by state');
-    const interactions = this.all('select state, count(*) as n from interactions group by state');
+  stats(): StoreStats {
+    const ops = this.all<StateCountRow>('select state, count(*) as n from operations group by state');
+    const interactions = this.all<StateCountRow>('select state, count(*) as n from interactions group by state');
     return {
       generation: this.#generation,
       schemaVersion: STATE_SCHEMA_VERSION,
-      operations: Object.fromEntries(ops.map((r) => [r.state, Number(r.n)])),
-      interactions: Object.fromEntries(interactions.map((r) => [r.state, Number(r.n)])),
+      operations: Object.fromEntries(ops.map((r): [string, number] => [r.state, Number(r.n)])),
+      interactions: Object.fromEntries(interactions.map((r): [string, number] => [r.state, Number(r.n)])),
       stateDirSizeBytes: safeDirSize(this.#stateDir),
     };
   }
 }
 
 /**
- * @param {string} dir
- * @returns {number} total bytes of the state directory, 0 when unreadable
+ * @param dir
+ * @returns total bytes of the state directory, 0 when unreadable
  */
-function safeDirSize(dir) {
+function safeDirSize(dir: string): number {
   try {
     const dbPath = join(dir, 'state.sqlite');
     let total = 0;

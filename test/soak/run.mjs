@@ -33,6 +33,10 @@ import { FakeHost } from '../fixtures/fake-host.mjs';
  * @param {string[]} argv
  */
 function parseArgs(argv) {
+  /**
+   * `null` means "not requested": each field is filled in by its flag below.
+   * @type {{minutes: number|null, hours: number|null, resume: boolean, status: boolean, smoke: boolean, stateDir: string|null, intervalMs: number}}
+   */
   const out = { minutes: null, hours: null, resume: false, status: false, smoke: false, stateDir: null, intervalMs: 30_000 };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -101,7 +105,9 @@ if (!args.minutes && !args.hours) {
   process.stderr.write('refusing to run without a bound: pass --minutes N or --hours N\n');
   process.exit(2);
 }
-const budgetMs = args.hours ? args.hours * 3_600_000 : args.minutes * 60_000;
+// The guard above refuses a run with neither bound, so `null` here can only appear where the
+// product is the same as the unguarded `null * 60_000` (zero); `?? 0` states that for the type.
+const budgetMs = args.hours ? args.hours * 3_600_000 : (args.minutes ?? 0) * 60_000;
 
 // A resumed run keeps its original start; a fresh run records one now.
 const nowUtc = new Date().toISOString();
@@ -188,7 +194,7 @@ for (;;) {
   } catch (error) {
     // A failed checkpoint is recorded as a failure, never silently retried into a green run.
     state.checkpointFailures += 1;
-    process.stdout.write(`soak: checkpoint ${round} FAILED: ${error.message}\n`);
+    process.stdout.write(`soak: checkpoint ${round} FAILED: ${error instanceof Error ? error.message : String(error)}\n`);
   }
 
   const monoNow = performance.now();

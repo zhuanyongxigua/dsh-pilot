@@ -14,21 +14,74 @@
 
 import { connect as netConnect } from 'node:net';
 import { randomBytes, createHash } from 'node:crypto';
-import { BridgeError, ERROR_CODES } from './errors.js';
+import type { IncomingMessage } from 'node:http';
+import type { Duplex } from 'node:stream';
+import { BridgeError, ERROR_CODES } from './errors.ts';
 
-const OPCODE = { continuation: 0x0, text: 0x1, binary: 0x2, close: 0x8, ping: 0x9, pong: 0xa };
+const OPCODE = {
+  continuation: 0x0,
+  text: 0x1,
+  binary: 0x2,
+  close: 0x8,
+  ping: 0x9,
+  pong: 0xa,
+} satisfies Record<string, number>;
 const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+
+/** Connection parameters for `connectWebSocket`. */
+export interface ConnectWebSocketOptions {
+  /** like `ws://127.0.0.1:3080/api/events.mux` */
+  readonly url: string;
+  /** refuse frames beyond this size */
+  readonly maxFrameBytes?: number;
+  readonly connectTimeoutMs?: number;
+  /** close the socket when aborted */
+  readonly signal?: AbortSignal;
+}
+
+/**
+ * What `upgradeState` reports: the close frame's status code once one has been parsed, or null
+ * while the stream is still open.
+ */
+export interface UpgradeState {
+  readonly code: number | null;
+}
+
+/** The client connection `connectWebSocket` resolves to. */
+export interface WebSocketConnection {
+  readonly frames: AsyncIterable<string>;
+  readonly send: (text: string) => void;
+  readonly close: () => void;
+  readonly closed: Promise<void>;
+  readonly handshakeDone: boolean;
+  readonly upgradeState: UpgradeState | null;
+}
+
+/** The server-side peer `acceptWebSocket` returns. */
+export interface AcceptedWebSocket {
+  readonly send: (text: string) => void;
+  readonly close: () => void;
+  readonly onClose: (fn: () => void) => void;
+}
+
+/**
+ * One item handed from the socket to the consumer loop. At most one member is ever set, and the
+ * consumers test them by truthiness — expressed as one shape with optional members rather than a
+ * union the readers would have to narrow with `in`.
+ */
+interface QueueItem {
+  readonly error?: BridgeError;
+  readonly open?: true;
+  readonly done?: true;
+  readonly text?: string;
+}
 
 /**
  * Open a WebSocket to a loopback HTTP URL and yield text frames.
- * @param {object} options
- * @param {string} options.url like `ws://127.0.0.1:3080/api/events.mux`
- * @param {number} [options.maxFrameBytes] refuse frames beyond this size
- * @param {number} [options.connectTimeoutMs]
- * @param {AbortSignal} [options.signal] close the socket when aborted
- * @returns {Promise<{frames: AsyncIterable<string>, send: (text: string) => void, close: () => void, closed: Promise<void>}>}
+ * @param options url, frame bound, handshake timeout and abort signal
+ * @returns the frame stream, the writers, and the handshake result
  */
-export async function connectWebSocket({ url, maxFrameBytes = 1024 * 1024, connectTimeoutMs = 10_000, signal }) {
+export async function connectWebSocket({ url, maxFrameBytes = 1024 * 1024, connectTimeoutMs = 10_000, signal }: ConnectWebSocketOptions): Promise<WebSocketConnection> {
   const parsed = new URL(url);
   if (parsed.protocol !== 'ws:') {
     throw new BridgeError(ERROR_CODES.BAD_REQUEST, `unsupported websocket scheme: ${parsed.protocol}`, {});
@@ -57,23 +110,23 @@ export async function connectWebSocket({ url, maxFrameBytes = 1024 * 1024, conne
   });
 
   /** Frames and errors are delivered through this queue. */
-  const queue = [];
-  let notify = null;
+  const queue: QueueItem[] = [];
+  let notify: (() => void) | null = null;
   let finished = false;
-  let finishReason = null;
+  let finishReason: UpgradeState | null = null;
 
-  const push = (item) => {
+  const push = (item: QueueItem): void => {
     queue.push(item);
     if (notify) { const n = notify; notify = null; n(); }
   };
 
   // ---- frame parser (server->client frames are never masked) -------------------------
   let frameBuffer = Buffer.alloc(0);
-  let fragmentOpcode = null;
-  let fragments = [];
+  let fragmentOpcode: number | null = null;
+  let fragments: Buffer[] = [];
 
-  /** @param {Buffer} chunk */
-  const consumeFrames = (chunk) => {
+  /** @param chunk */
+  const consumeFrames = (chunk: Buffer): void => {
     frameBuffer = Buffer.concat([frameBuffer, chunk]);
     for (;;) {
       if (frameBuffer.length < 2) return;
@@ -104,7 +157,7 @@ export async function connectWebSocket({ url, maxFrameBytes = 1024 * 1024, conne
         socket.destroy();
         return;
       }
-      let maskKey = null;
+      let maskKey: Buffer | null = null;
       if (masked) {
         if (frameBuffer.length < offset + 4) return;
         maskKey = frameBuffer.subarray(offset, offset + 4);
@@ -146,11 +199,11 @@ export async function connectWebSocket({ url, maxFrameBytes = 1024 * 1024, conne
   };
 
   // ---- writers -----------------------------------------------------------------------
-  /** @param {number} opcode @param {Buffer} payload */
-  const writeFrame = (opcode, payload) => {
+  /** @param opcode @param payload */
+  const writeFrame = (opcode: number, payload: Buffer): void => {
     const mask = randomBytes(4);
     const length = payload.length;
-    let header;
+    let header: Buffer;
     if (length < 126) {
       header = Buffer.alloc(2);
       header[1] = 0x80 | length;
@@ -173,7 +226,7 @@ export async function connectWebSocket({ url, maxFrameBytes = 1024 * 1024, conne
     }
   };
 
-  const closedPromise = new Promise((resolve) => {
+  const closedPromise = new Promise<void>((resolve) => {
     socket.on('close', () => {
       finished = true;
       push({ done: true });
@@ -235,7 +288,7 @@ export async function connectWebSocket({ url, maxFrameBytes = 1024 * 1024, conne
   }, connectTimeoutMs);
   timeout.unref?.();
 
-  const close = () => {
+  const close = (): void => {
     clearTimeout(timeout);
     if (!socket.destroyed) {
       try { writeFrame(OPCODE.close, Buffer.alloc(0)); } catch { /* best effort */ }
@@ -250,9 +303,9 @@ export async function connectWebSocket({ url, maxFrameBytes = 1024 * 1024, conne
 
   /**
    * Await the upgrade so callers know the stream is established before iterating.
-   * @returns {Promise<void>}
+   * @returns nothing, once the upgrade has been observed
    */
-  const ready = async () => {
+  const ready = async (): Promise<void> => {
     for (;;) {
       if (queue.length) {
         const item = queue[0];
@@ -262,21 +315,22 @@ export async function connectWebSocket({ url, maxFrameBytes = 1024 * 1024, conne
         queue.shift();
         continue;
       }
-      await new Promise((resolve) => { notify = resolve; });
+      await new Promise<void>((resolve) => { notify = resolve; });
     }
   };
 
   await ready();
 
-  const frames = {
+  const frames: AsyncIterable<string> = {
     async *[Symbol.asyncIterator]() {
       for (;;) {
         if (queue.length === 0) {
           if (finished) return;
-          await new Promise((resolve) => { notify = resolve; });
+          await new Promise<void>((resolve) => { notify = resolve; });
           continue;
         }
-        const item = queue.shift();
+        // The queue length was just checked, so this shift cannot come back empty.
+        const item = queue.shift() as QueueItem;
         if (item.error) throw item.error;
         if (item.done) return;
         if (item.text !== undefined) yield item.text;
@@ -286,7 +340,7 @@ export async function connectWebSocket({ url, maxFrameBytes = 1024 * 1024, conne
 
   return {
     frames,
-    send: (text) => writeFrame(OPCODE.text, Buffer.from(text, 'utf8')),
+    send: (text: string) => writeFrame(OPCODE.text, Buffer.from(text, 'utf8')),
     close,
     closed: closedPromise,
     get handshakeDone() { return headerDone; },
@@ -297,12 +351,12 @@ export async function connectWebSocket({ url, maxFrameBytes = 1024 * 1024, conne
 /**
  * Upgrade an inbound HTTP request on a raw socket — the server side used by the fake host
  * and by tests, so the client above is exercised against a real peer rather than a mock.
- * @param {import('node:http').IncomingMessage} request
- * @param {import('node:stream').Duplex} socket
- * @param {(text: string) => void} [onMessage]
- * @returns {{send: (text: string) => void, close: () => void, onClose: (fn: () => void) => void}}
+ * @param request
+ * @param socket
+ * @param onMessage
+ * @returns the peer's writers and its single close handler slot
  */
-export function acceptWebSocket(request, socket, onMessage) {
+export function acceptWebSocket(request: IncomingMessage, socket: Duplex, onMessage?: (text: string) => void): AcceptedWebSocket {
   const key = request.headers['sec-websocket-key'];
   const accept = createHash('sha1').update(`${key}${GUID}`).digest('base64');
   socket.write([
@@ -315,11 +369,11 @@ export function acceptWebSocket(request, socket, onMessage) {
   ].join('\r\n'));
 
   let buffer = Buffer.alloc(0);
-  let closeHandler = () => {};
+  let closeHandler: () => void = () => {};
 
-  const send = (text) => {
+  const send = (text: string): void => {
     const payload = Buffer.from(text, 'utf8');
-    let header;
+    let header: Buffer;
     if (payload.length < 126) {
       header = Buffer.alloc(2);
       header[1] = payload.length;
@@ -336,7 +390,7 @@ export function acceptWebSocket(request, socket, onMessage) {
     socket.write(Buffer.concat([header, payload]));
   };
 
-  socket.on('data', (chunk) => {
+  socket.on('data', (chunk: Buffer) => {
     buffer = Buffer.concat([buffer, chunk]);
     for (;;) {
       if (buffer.length < 2) return;
@@ -346,7 +400,7 @@ export function acceptWebSocket(request, socket, onMessage) {
       let offset = 2;
       if (length === 126) { if (buffer.length < 4) return; length = buffer.readUInt16BE(2); offset = 4; }
       else if (length === 127) { if (buffer.length < 10) return; length = Number(buffer.readBigUInt64BE(2)); offset = 10; }
-      let maskKey = null;
+      let maskKey: Buffer | null = null;
       if (masked) { if (buffer.length < offset + 4) return; maskKey = buffer.subarray(offset, offset + 4); offset += 4; }
       if (buffer.length < offset + length) return;
       const payload = Buffer.from(buffer.subarray(offset, offset + length));

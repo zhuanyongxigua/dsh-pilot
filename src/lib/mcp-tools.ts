@@ -17,10 +17,46 @@
  * than a silently ignored field.
  */
 
-/** @typedef {{name: string, description: string, inputSchema: object, op: (args: object) => object}} McpTool */
+/**
+ * One node of the JSON-Schema subset this validator implements.
+ *
+ * `type` is deliberately left as an open `string` rather than a closed literal union of the
+ * keywords handled below: `validateAgainst` has a `default` branch whose whole job is to REPORT a
+ * `type` keyword it does not implement (`unsupported schema type …`), so a union would have made
+ * the one branch that exists for unknown input unreachable. Every keyword the validator reads is
+ * typed; the tag itself stays as open as the wire.
+ */
+export interface ToolSchema {
+  readonly type?: string;
+  readonly properties?: Record<string, ToolSchema>;
+  readonly required?: readonly string[];
+  readonly additionalProperties?: boolean;
+  readonly enum?: readonly string[];
+  readonly minLength?: number;
+  readonly maxLength?: number;
+  readonly minimum?: number;
+  readonly maximum?: number;
+}
 
-/** @type {McpTool[]} */
-export const MCP_TOOLS = [
+/** One advertised tool: its schema, and the single daemon request it maps onto. */
+export interface McpTool {
+  readonly name: string;
+  readonly description: string;
+  readonly inputSchema: ToolSchema;
+  /**
+   * Build the daemon request for already-validated arguments. The argument bag is a
+   * string-keyed record because that is what came off the wire and what `validateToolInput`
+   * has just checked against the schema; the request it returns is sent verbatim as JSON.
+   */
+  readonly op: (args: Record<string, unknown>) => Record<string, unknown>;
+}
+
+/** Outcome of checking one call's arguments: the built request, or the schema violations. */
+export type ToolValidation =
+  | { readonly ok: true; readonly request: Record<string, unknown> }
+  | { readonly ok: false; readonly errors: string[] };
+
+export const MCP_TOOLS: readonly McpTool[] = [
   {
     name: 'dsh_daemon_status',
     description: 'Report the bridge daemon state: connection state, store generation, event counters, negotiated host capabilities and effective limits. Read-only.',
@@ -154,42 +190,53 @@ export const MCP_TOOLS = [
   },
 ];
 
-/** @param {string} name */
-export function toolByName(name) {
+/**
+ * @param name tool name from the call
+ * @returns the tool, or null when no advertised tool has that name
+ */
+export function toolByName(name: string): McpTool | null {
   return MCP_TOOLS.find((tool) => tool.name === name) ?? null;
 }
 
 /**
  * Validate tool arguments against the declared schema, then build the IPC request.
- * @param {McpTool} tool
- * @param {unknown} args
- * @returns {{ok: true, request: object} | {ok: false, errors: string[]}}
+ * @param tool the advertised tool
+ * @param args the raw `arguments` member of the MCP call, unvalidated
+ * @returns the built request, or the schema violations
  */
-export function validateToolInput(tool, args) {
-  const errors = [];
+export function validateToolInput(tool: McpTool, args: unknown): ToolValidation {
+  const errors: string[] = [];
   const value = args === undefined || args === null ? {} : args;
   validateAgainst(tool.inputSchema, value, '', errors);
   if (errors.length) return { ok: false, errors: errors.slice(0, 12) };
-  return { ok: true, request: tool.op(value) };
+  // The check above is a runtime one against a runtime schema, so TypeScript cannot relate it to
+  // the argument type `op` declares. `value` is `unknown` here, and the assertion introduces no
+  // use the validator did not already authorise: every tool schema is an object schema with
+  // `additionalProperties: false`, and the check just enforced it.
+  return { ok: true, request: tool.op(value as Record<string, unknown>) };
 }
 
 /**
- * @param {object} schema
- * @param {unknown} value
- * @param {string} path
- * @param {string[]} errors
+ * @param schema the schema node to check against
+ * @param value the candidate, already unwrapped from the call
+ * @param path dotted path of this node, for the message
+ * @param errors collector, shared across the whole walk
  */
-function validateAgainst(schema, value, path, errors) {
+function validateAgainst(schema: ToolSchema, value: unknown, path: string, errors: string[]): void {
   const where = path || '(root)';
   if (schema.type === 'object') {
     if (typeof value !== 'object' || value === null || Array.isArray(value)) {
       errors.push(`${where}: expected object`);
       return;
     }
+    // The guard above proved this is a string-keyed bag; TypeScript's `object` is not indexable,
+    // so the same value is read through a record view. No conversion happens, and the original
+    // read the properties off the value directly.
+    const record = value as Record<string, unknown>;
     for (const key of schema.required ?? []) {
-      if (value[key] === undefined) errors.push(`${where}.${key}: required`);
+      if (record[key] === undefined) errors.push(`${where}.${key}: required`);
     }
-    for (const [key, child] of Object.entries(value)) {
+    for (const [key, child] of Object.entries(record)) {
       const childSchema = schema.properties?.[key];
       if (!childSchema) {
         if (schema.additionalProperties === false) errors.push(`${where}.${key}: unexpected property`);
@@ -208,7 +255,9 @@ function validateAgainst(schema, value, path, errors) {
       if (schema.minLength !== undefined && value.length < schema.minLength) errors.push(`${where}: below minLength ${schema.minLength}`);
       break;
     case 'integer':
-      if (!Number.isInteger(value)) { errors.push(`${where}: expected integer`); return; }
+      // `Number.isInteger` is not a type guard, so the value is narrowed to a number explicitly;
+      // the message and the accepted set are unchanged (any non-number fails both checks).
+      if (typeof value !== 'number' || !Number.isInteger(value)) { errors.push(`${where}: expected integer`); return; }
       if (schema.minimum !== undefined && value < schema.minimum) errors.push(`${where}: below minimum ${schema.minimum}`);
       if (schema.maximum !== undefined && value > schema.maximum) errors.push(`${where}: above maximum ${schema.maximum}`);
       break;
@@ -220,32 +269,49 @@ function validateAgainst(schema, value, path, errors) {
       break;
     default:
       if (schema.enum) {
-        if (!schema.enum.includes(value)) errors.push(`${where}: expected one of ${schema.enum.join(', ')}`);
+        if (!schema.enum.includes(value as string)) errors.push(`${where}: expected one of ${schema.enum.join(', ')}`);
         return;
       }
       errors.push(`${where}: unsupported schema type ${String(schema.type)}`);
   }
-  if (schema.enum && !schema.enum.includes(value)) {
+  if (schema.enum && !schema.enum.includes(value as string)) {
     errors.push(`${where}: expected one of ${schema.enum.join(', ')}`);
   }
 }
 
-/** @param {object} properties @param {string[]} required */
-function objectSchema(properties, required) {
+/** Optional keywords `stringSchema` merges in, spread verbatim into the emitted schema. */
+interface StringSchemaExtras {
+  readonly description?: string;
+  readonly maxLength?: number;
+}
+
+/** Optional keywords `integerSchema` merges in, spread verbatim into the emitted schema. */
+interface IntegerSchemaExtras {
+  readonly description?: string;
+  readonly minimum?: number;
+  readonly maximum?: number;
+}
+
+/**
+ * @param properties the named members of the object
+ * @param required the member names that must be present
+ * @returns an object schema that refuses unknown members
+ */
+function objectSchema(properties: Record<string, ToolSchema>, required: readonly string[]): ToolSchema {
   return { type: 'object', properties, required, additionalProperties: false };
 }
 
-/** @param {object} [extra] */
-function stringSchema(extra = {}) {
+/** @param extra optional keywords merged over the defaults */
+function stringSchema(extra: StringSchemaExtras = {}): ToolSchema {
   return { type: 'string', minLength: 1, ...extra };
 }
 
-/** @param {object} [extra] */
-function integerSchema(extra = {}) {
+/** @param extra optional keywords merged over the defaults */
+function integerSchema(extra: IntegerSchemaExtras = {}): ToolSchema {
   return { type: 'integer', ...extra };
 }
 
-/** @param {string[]} values */
-function enumSchema(values) {
+/** @param values the accepted strings */
+function enumSchema(values: readonly string[]): ToolSchema {
   return { type: 'string', enum: values };
 }

@@ -55,6 +55,33 @@ jobs:
           console.log('runtime dependencies: none');
           "
 
+      # The design adopts real typechecking, so a type error fails CI. Three configs, three different
+      # jobs: the build compiles the sources, the contract one compiles the protocol surface with the
+      # Node type surface REMOVED — which is what makes "contract code stays free of Node-only APIs" a
+      # build failure instead of a convention a reviewer has to notice — and the test config checks the
+      # test layer against the declarations the build emitted, which is the only way an oracle written
+      # against a drifted API can be caught.
+      - name: install dev tooling (types only; the runtime keeps zero dependencies)
+        run: npm ci
+
+      # The implementation is TypeScript SOURCE; `dist/` is the built artifact the tests and the
+      # `bin` entry points run. So the build happens first, and the three typecheck configs then
+      # verify the sources. The mutation runner uses `npm run typecheck` as its own eligibility gate,
+      # so a mutation that does not compile is reported as INVALID rather than as a survivor.
+      - name: build (TypeScript sources -> dist)
+        run: npm run build
+
+      - name: typecheck (all modules)
+        run: npm run typecheck
+
+      - name: typecheck (contract surface is Node-free)
+        run: npm run typecheck:contract
+
+      # Runs AFTER the build on purpose: this config consumes `dist/**/*.d.ts`, so a missing or
+      # stale build would make it check the test layer against nothing.
+      - name: typecheck (test layer against the emitted declarations)
+        run: npm run typecheck:tests
+
       - name: storage engine reachable
         run: |
           node -e "
@@ -91,13 +118,21 @@ jobs:
           DSH_PILOT_PROPERTY_ROUNDS=8 node test/mutation/run.mjs --json test-results/mutations.json || status=$?
           node -e "
           const r = require('./test-results/mutations.json');
-          console.log('mutations=' + r.mutations + ' caught=' + r.caught + ' survived=' + r.survived);
+          console.log('mutations=' + r.mutations + ' caught=' + r.caught + ' survived=' + r.survived + ' invalid=' + r.invalid);
           const lines = ['## negative controls (' + process.env.RUNNER_OS + ')', '',
-            '- mutations: ' + r.mutations, '- caught: ' + r.caught, '- survived: ' + r.survived, '',
-            '| mutation | caught | detail |', '| --- | --- | --- |'];
-          for (const m of r.results) lines.push('| ' + m.name + ' | ' + (m.caught ? 'yes' : 'NO') + ' | ' + m.detail.replace(/\\|/g, '\\\\|') + ' |');
+            '- mutations: ' + r.mutations, '- caught: ' + r.caught, '- survived: ' + r.survived,
+            '- invalid runs (mutation broke the build, or the run produced no tests): ' + r.invalid, '',
+            'Counts are split by KIND because the two prove different things: a production control shows',
+            'this bridge notices its own defect, while a fixture control only shows the fake Host is a',
+            'faithful stand-in and must never be reported as evidence about the bridge.', '',
+            '| mutation | kind | caught | protects | detail |', '| --- | --- | --- | --- | --- |'];
+          for (const m of r.results) lines.push('| ' + m.name + ' | ' + (m.kind ?? 'production') + ' | ' + (m.caught ? 'yes' : m.invalid ? 'INVALID' : 'NO') + ' | ' + (m.protects ?? '-') + ' | ' + String(m.detail).replace(/\\|/g, '\\\\|') + ' |');
+          const obligations = r.obligations ?? [];
+          const uncovered = obligations.filter((o) => !o.covered).map((o) => o.id);
+          lines.push('', 'Required obligations with a caught negative control: ' + (obligations.length - uncovered.length) + '/' + obligations.length);
+          if (uncovered.length) lines.push('NOT covered: ' + uncovered.join(', '));
           require('fs').appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join('\n') + '\n');
-          process.exit(r.survived > 0 ? 1 : 0);
+          process.exit(r.survived > 0 || r.invalid > 0 || uncovered.length > 0 ? 1 : 0);
           "
           exit ${status:-0}
 
@@ -149,4 +184,5 @@ jobs:
 
       - name: npm pack contents are the declared files only
         run: |
+          npm run build
           npm pack --dry-run 2>&1 | tail -30

@@ -4,7 +4,7 @@
  * Why these tests exist: the whole point of the project is that a REAL MCP client can spawn the
  * bridge binary and drive it. Calling the gateway functions in-process would prove nothing
  * about the protocol face — framing, handshake, error codes, and stdio hygiene — so this layer
- * spawns `bin/dsh-pilot-mcp.mjs` as a child process and speaks newline-delimited JSON-RPC 2.0
+ * spawns `dist/bin/dsh-pilot-mcp.js` as a child process and speaks newline-delimited JSON-RPC 2.0
  * to it over real pipes, exactly as an MCP client does.
  *
  * The daemon and the Host are separate real processes too: the MCP process here is only the
@@ -12,7 +12,7 @@
  */
 
 import { join } from 'node:path';
-import { assert, collect, jsonLines, scratchDir, spawnNode, startDaemon, waitFor } from '../helpers.mjs';
+import { assert, collect, ipcClient, jsonLines, scratchDir, spawnNode, startDaemon, waitFor } from '../helpers.mjs';
 import { FakeHost } from '../fixtures/fake-host.mjs';
 
 const PROTOCOL_VERSION = '2024-11-05';
@@ -22,19 +22,27 @@ const PROTOCOL_VERSION = '2024-11-05';
  * @param {{socketPath: string, stateDir: string}} options
  */
 async function startMcpClient({ socketPath, stateDir }) {
-  const child = spawnNode(['bin/dsh-pilot-mcp.mjs', '--state-dir', stateDir, '--socket', socketPath]);
-  const lines = jsonLines(child.stdout);
+  const child = spawnNode(['dist/bin/dsh-pilot-mcp.js', '--state-dir', stateDir, '--socket', socketPath]);
+  // `spawnNode` pipes stdio (`['pipe', 'pipe', 'pipe']` by default, see helpers.mjs), so stdout is a
+  // readable stream here; the declared `Readable|null` covers a caller that spawned without pipes.
+  const lines = jsonLines(/** @type {import('node:stream').Readable} */ (child.stdout));
   const stderrChunks = [];
-  child.stderr.setEncoding('utf8');
-  child.stderr.on('data', (chunk) => stderrChunks.push(chunk));
+  child.stderr?.setEncoding('utf8');
+  child.stderr?.on('data', (chunk) => stderrChunks.push(chunk));
   let nextId = 0;
   /** @type {Map<number, string>} */
   const methods = new Map();
 
   const send = (message) => {
-    child.stdin.write(`${JSON.stringify(message)}\n`);
+    child.stdin?.write(`${JSON.stringify(message)}\n`);
   };
 
+  /**
+   * Send one JSON-RPC request and await the response carrying its id.
+   * @param {string} method
+   * @param {unknown} [params]
+   * @param {number} [timeoutMs]
+   */
   const request = async (method, params = undefined, timeoutMs = 20000) => {
     nextId += 1;
     const id = nextId;
@@ -54,7 +62,7 @@ async function startMcpClient({ socketPath, stateDir }) {
     const response = await request('tools/call', { name, arguments: args ?? {} });
     return response;
   };
-  const rawWrite = (text) => child.stdin.write(text);
+  const rawWrite = (text) => child.stdin?.write(text);
 
   return {
     child,
@@ -66,7 +74,7 @@ async function startMcpClient({ socketPath, stateDir }) {
     nextMessage: (timeoutMs = 10000) => lines.next(timeoutMs),
     stderr: () => stderrChunks.join(''),
     stop: async () => {
-      try { child.stdin.end(); } catch { /* already closed */ }
+      try { child.stdin?.end(); } catch { /* already closed */ }
       const outcome = await Promise.race([
         collect(child),
         new Promise((resolve) => setTimeout(() => resolve({ code: null, signal: 'timeout' }), 5000)),
@@ -291,9 +299,9 @@ export default {
         taskId: task.task.taskId, clientKey: 'cancel-wait-session',
       }));
       await waitFor(async () => {
-        const { IpcClient } = await import('../../lib/ipc.js');
-        const probe = new IpcClient({ socketPath: daemon.socketPath });
-        await probe.ready();
+        // The readiness probe goes through the shared fixture instead of constructing an
+        // `IpcClient` here: the one admitted untyped reply view lives in `test/helpers.mjs`.
+        const probe = await ipcClient(daemon.socketPath);
         try { return (await probe.request({ op: 'health' })).connection === 'ready'; } finally { probe.close(); }
       }, { timeoutMs: 5000, what: 'mux ready' });
       host.emitTurnStart(session.session.hostSessionId);
@@ -364,13 +372,16 @@ export default {
     const socketPath = join(scratch.dir, 'state', 'no-such.sock');
     const client = await startMcpClient({ socketPath, stateDir });
     try {
+      // Both failure modes this can take are Errors: the request helper's own protocol error, and
+      // the timeout `jsonLines.next` rejects with. The null start keeps "answered" distinguishable.
+      /** @type {Error|null} */
       let caught = null;
       try {
         await client.request('initialize', {
           protocolVersion: PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'c', version: '0' },
         }, 6000);
       } catch (error) {
-        caught = error;
+        caught = /** @type {Error} */ (error);
       }
       await client.stop();
       // Either the process exited with a diagnostic on stderr, or it answered with an error;

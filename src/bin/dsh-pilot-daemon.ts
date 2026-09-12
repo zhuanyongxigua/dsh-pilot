@@ -6,20 +6,29 @@
  * state directory and the Host connection; MCP gateways only talk to it over IPC. Starting it
  * is explicit — nothing here starts, stops or mutates any Host.
  *
- * Usage: node bin/dsh-pilot-daemon.mjs [--state-dir DIR] [--host URL] [--ready-file FILE]
+ * Usage: node dist/bin/dsh-pilot-daemon.js [--state-dir DIR] [--host URL] [--ready-file FILE]
  */
 
 import { writeFileSync } from 'node:fs';
-import { resolveConfig, assertScratchStateDir } from '../lib/config.js';
-import { Daemon } from '../lib/daemon.js';
-import { BridgeError, toBridgeError } from '../lib/errors.js';
+import { resolveConfig, assertScratchStateDir } from '../lib/config.ts';
+import { Daemon } from '../lib/daemon.ts';
+import { BridgeError, toBridgeError } from '../lib/errors.ts';
+
+/** The flags this entry point accepts. */
+interface DaemonArgs {
+  stateDir?: string;
+  hostBase?: string;
+  hostScope?: string;
+  readyFile?: string;
+  json: boolean;
+}
 
 /**
- * @param {string[]} argv
- * @returns {{stateDir?: string, hostBase?: string, readyFile?: string, json: boolean}}
+ * @param argv
+ * @returns parsed flags, with `json` always present
  */
-function parseArgs(argv) {
-  const out = { json: false };
+function parseArgs(argv: string[]): DaemonArgs {
+  const out: DaemonArgs = { json: false };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--state-dir') out.stateDir = argv[++i];
@@ -56,7 +65,9 @@ const daemon = new Daemon({
   limits: config.limits,
 });
 
-let started;
+// The startup report, as `Daemon.start` returns it. Declared rather than inferred because the value
+// is produced inside the `try` below, and the catch arm exits the process.
+let started: Awaited<ReturnType<Daemon['start']>>;
 try {
   started = await daemon.start();
 } catch (error) {
@@ -85,7 +96,7 @@ if (args.readyFile) {
 process.stdout.write(`${JSON.stringify(ready)}\n`);
 
 let shuttingDown = false;
-const shutdown = async (signal) => {
+const shutdown = async (signal: string): Promise<void> => {
   if (shuttingDown) return;
   shuttingDown = true;
   process.stderr.write(`daemon: ${signal}, stopping\n`);
@@ -100,9 +111,9 @@ process.on('uncaughtException', (error) => {
 });
 
 /**
- * @param {string} path
- * @returns {string}
+ * @param path
+ * @returns the path, resolved against the process working directory when relative
  */
-function resolvePath(path) {
+function resolvePath(path: string): string {
   return path.startsWith('/') ? path : `${process.cwd()}/${path}`;
 }

@@ -16,17 +16,27 @@
  */
 
 import { readFileSync } from 'node:fs';
-import { resolveConfig } from '../lib/config.js';
-import { IpcClient, socketPathFor, readAuthorityToken } from '../lib/ipc.js';
-import { toBridgeError } from '../lib/errors.js';
+import { resolveConfig } from '../lib/config.ts';
+import { IpcClient, socketPathFor, readAuthorityToken } from '../lib/ipc.ts';
+import { toBridgeError } from '../lib/errors.ts';
+
+/** The command and its flags, as parsed from the command line. */
+interface OpsArgs {
+  command: string;
+  flags: Record<string, string>;
+}
 
 /**
- * @param {string[]} argv
- * @returns {{command: string, flags: Record<string, string>}}
+ * @param argv
+ * @returns the command and every flag it was given
  */
-function parseArgs(argv) {
+function parseArgs(argv: string[]): OpsArgs {
   const command = argv[0] ?? 'help';
-  const flags = {};
+  /**
+   * Every flag value is stored as the raw string (or `'true'` for a valueless flag), which is
+   * what the declared `Record<string, string>` return type promises.
+   */
+  const flags: Record<string, string> = {};
   for (let i = 1; i < argv.length; i += 1) {
     const arg = argv[i];
     if (!arg.startsWith('--')) continue;
@@ -48,10 +58,10 @@ const stateDir = flags['state-dir'] ?? config.stateDir;
 const socketPath = flags.socket ?? config.socketPath ?? socketPathFor(stateDir);
 
 /**
- * @param {object} request
- * @returns {Promise<unknown>}
+ * @param request
+ * @returns the daemon's reply value
  */
-async function call(request) {
+async function call(request: object): Promise<unknown> {
   const ipc = new IpcClient({ socketPath });
   await ipc.ready();
   try {
@@ -61,8 +71,8 @@ async function call(request) {
   }
 }
 
-/** @param {unknown} value */
-function emit(value) {
+/** @param value */
+function emit(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
 
@@ -121,10 +131,10 @@ try {
 }
 
 /**
- * @param {string} name
- * @returns {string}
+ * @param name
+ * @returns the flag's value
  */
-function requireFlag(name) {
+function requireFlag(name: string): string {
   const value = flags[name];
   if (!value || value === 'true') {
     process.stderr.write(`missing required flag --${name}\n`);

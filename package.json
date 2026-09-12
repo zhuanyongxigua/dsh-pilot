@@ -9,22 +9,22 @@
     "node": ">=24.0.0"
   },
   "bin": {
-    "dsh-pilot-daemon": "./bin/dsh-pilot-daemon.mjs",
-    "dsh-pilot-mcp": "./bin/dsh-pilot-mcp.mjs",
-    "dsh-pilot-ops": "./bin/dsh-pilot-ops.mjs"
+    "dsh-pilot-daemon": "./dist/bin/dsh-pilot-daemon.js",
+    "dsh-pilot-mcp": "./dist/bin/dsh-pilot-mcp.js",
+    "dsh-pilot-ops": "./dist/bin/dsh-pilot-ops.js"
   },
   "exports": {
-    ".": "./lib/daemon.js",
-    "./gateway": "./lib/gateway.js",
-    "./adapter": "./lib/adapter.js",
-    "./store": "./lib/store.js"
+    ".": "./dist/lib/daemon.js",
+    "./gateway": "./dist/lib/gateway.js",
+    "./adapter": "./dist/lib/adapter.js",
+    "./store": "./dist/lib/store.js"
   },
   "files": [
-    "bin",
-    "lib",
+    "dist",
     "docs",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "AGENTS.md"
   ],
   "scripts": {
     "test": "node test/run.mjs",
@@ -37,9 +37,19 @@
     "test:live": "node test/run.mjs test/live --live",
     "test:mutations": "node test/mutation/run.mjs",
     "test:soak": "node test/soak/run.mjs",
-    "daemon": "node bin/dsh-pilot-daemon.mjs",
-    "ops": "node bin/dsh-pilot-ops.mjs"
+    "daemon": "node dist/bin/dsh-pilot-daemon.js",
+    "ops": "node dist/bin/dsh-pilot-ops.js",
+    "typecheck": "tsc -p tsconfig.json",
+    "typecheck:contract": "tsc -p tsconfig.contract.json",
+    "typecheck:all": "npm run typecheck && npm run typecheck:contract && npm run typecheck:tests",
+    "build": "tsc -p tsconfig.json",
+    "build:check": "tsc -p tsconfig.json --noEmit",
+    "typecheck:tests": "tsc -p tsconfig.test.json",
+    "clean": "rm -rf dist"
   },
   "dependencies": {},
-  "devDependencies": {}
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "typescript": "^5.9.3"
+  }
 }

@@ -158,7 +158,7 @@ export default {
     const stateDir = join(scratch.dir, 'state');
     const daemon = await bootDaemon(host.baseUrl, stateDir);
     try {
-      const contender = spawnNode(['bin/dsh-pilot-daemon.mjs', '--state-dir', stateDir, '--host', host.baseUrl]);
+      const contender = spawnNode(['dist/bin/dsh-pilot-daemon.js', '--state-dir', stateDir, '--host', host.baseUrl]);
       const refused = await collect(contender);
       assert.equal(refused.code, 4, `a second owner must be refused: ${JSON.stringify(refused)}`);
       // Stop the owner cleanly, then a new daemon must be able to take over.
@@ -190,7 +190,7 @@ export default {
       // failure mode this test exists to prevent.
       daemon.child.kill('SIGSTOP');
       await new Promise((resolve) => setTimeout(resolve, 300));
-      const contender = spawnNode(['bin/dsh-pilot-daemon.mjs', '--state-dir', stateDir, '--host', host.baseUrl]);
+      const contender = spawnNode(['dist/bin/dsh-pilot-daemon.js', '--state-dir', stateDir, '--host', host.baseUrl]);
       const refused = await collect(contender);
       assert.equal(refused.code, 4,
         `a suspended owner must still hold the state directory (got exit ${refused.code}: ${refused.stderr.trim()})`);
@@ -224,7 +224,7 @@ export default {
   },
 
   'locking primitive is real: the probe refuses a second handle on this platform': async () => {
-    const { probeLocking } = await import('../../lib/owner-lock.js');
+    const { probeLocking } = await import('../../dist/lib/owner-lock.js');
     const scratch = scratchDir('crash-lockprobe');
     const lockPath = join(scratch.dir, 'owner.lock.sqlite');
     const probe = probeLocking(lockPath);

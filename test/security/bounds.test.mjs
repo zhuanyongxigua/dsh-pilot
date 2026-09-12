@@ -16,6 +16,11 @@ import { readFileSync, statSync } from 'node:fs';
 import { assert, ipcClient, scratchDir, startDaemon, waitFor } from '../helpers.mjs';
 import { FakeHost } from '../fixtures/fake-host.mjs';
 
+/**
+ * A refusal from the daemon is a coded BridgeError; the assertions below read that code.
+ * @typedef {import('../../dist/lib/errors.js').BridgeError} BridgeError
+ */
+
 async function rig(label) {
   const host = await new FakeHost().start();
   const scratch = scratchDir(label);
@@ -89,6 +94,7 @@ export default {
           { label: 'token from another state dir', payload: { authorityToken: 'y'.repeat(64) } },
         ];
         for (const attempt of attempts) {
+          /** @type {BridgeError|null} */
           let caught = null;
           try {
             await client.request({
@@ -96,7 +102,7 @@ export default {
               decision: 'allowed-once', ...attempt.payload,
             });
           } catch (error) {
-            caught = error;
+            caught = /** @type {BridgeError} */ (error);
           }
           assert.ok(caught, `${attempt.label} must be refused`);
           assert.equal(caught.code, 'APPROVAL_UNAUTHORIZED', `${attempt.label}: unexpected code ${caught.code}`);
@@ -253,7 +259,7 @@ export default {
         listing = execFileSync('lsof', ['-nP', '-a', '-iTCP', '-sTCP:LISTEN', '-p', String(pid)], { encoding: 'utf8' });
       } catch (error) {
         // lsof exits non-zero when there is nothing to report; that is the expected outcome.
-        listing = error.stdout ?? '';
+        listing = /** @type {{stdout?: string}} */ (error).stdout ?? '';
       }
       // Without -a, lsof ORs its filters and would list every process on the machine; the
       // assertion below is only meaningful because -a makes the pid filter binding.

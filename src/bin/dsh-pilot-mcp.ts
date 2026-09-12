@@ -7,19 +7,25 @@
  * anything to stdout that is not a JSON-RPC message — a stray log line would corrupt the
  * protocol stream and silently break the caller.
  *
- * Usage: node bin/dsh-pilot-mcp.mjs [--state-dir DIR] [--socket PATH]
+ * Usage: node dist/bin/dsh-pilot-mcp.js [--state-dir DIR] [--socket PATH]
  */
 
-import { resolveConfig } from '../lib/config.js';
-import { socketPathFor } from '../lib/ipc.js';
-import { runMcpGateway } from '../lib/gateway.js';
-import { toBridgeError } from '../lib/errors.js';
+import { resolveConfig } from '../lib/config.ts';
+import { socketPathFor } from '../lib/ipc.ts';
+import { runMcpGateway, type GatewayIo } from '../lib/gateway.ts';
+import { toBridgeError } from '../lib/errors.ts';
+
+/** The flags this entry point accepts. A flag with no value leaves its field undefined here. */
+interface McpArgs {
+  stateDir?: string;
+  socketPath?: string;
+}
 
 /**
- * @param {string[]} argv
+ * @param argv
  */
-function parseArgs(argv) {
-  const out = {};
+function parseArgs(argv: string[]): McpArgs {
+  const out: McpArgs = {};
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--state-dir') out.stateDir = argv[++i];
@@ -40,8 +46,24 @@ const config = resolveConfig();
 const stateDir = args.stateDir ?? config.stateDir;
 const socketPath = args.socketPath ?? config.socketPath ?? socketPathFor(stateDir);
 
+/**
+ * Every Node process facility the protocol face needs, supplied here rather than read inside
+ * `src/lib/gateway.ts` — that module must stay free of Node-only APIs (AGENTS.md section 4), and
+ * `npm run typecheck:contract` fails the build if it is not.
+ */
+const io: GatewayIo = {
+  input: process.stdin,
+  output: process.stdout,
+  pid: process.pid,
+  /**
+   * @param name
+   * @param handler
+   */
+  onSignal: (name, handler): void => { process.on(name, handler); },
+};
+
 try {
-  const outcome = await runMcpGateway({ socketPath });
+  const outcome = await runMcpGateway({ socketPath, io });
   process.stderr.write(`dsh-pilot-mcp: exiting (${outcome.reason}) after ${outcome.requests} requests\n`);
   process.exit(0);
 } catch (error) {

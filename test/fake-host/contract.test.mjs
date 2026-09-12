@@ -392,7 +392,7 @@ export default {
       assert.equal(interaction.kind, 'approval');
       assert.equal(interaction.state, 'pending');
       // MCP-reachable listing exists, but there is no tool that can decide: enforced by schema.
-      const { MCP_TOOLS } = await import('../../lib/mcp-tools.js');
+      const { MCP_TOOLS } = await import('../../dist/lib/mcp-tools.js');
       assert.equal(MCP_TOOLS.some((tool) => /decide|approve/.test(tool.name)), false,
         'no model-reachable tool may decide an approval');
     } finally {
@@ -437,18 +437,22 @@ export default {
       }, { timeoutMs: 5000, what: 'approval recorded' });
       const interaction = (await ipc.request({ op: 'interaction.list', taskId })).interactions[0];
       // A wrong token is refused with a typed error, and nothing is delivered.
+      // `ipc.request` rejects with a `BridgeError`, whose code is the thing asserted on below; the
+      // structural type says exactly that without importing the class into a test that must not
+      // depend on it, and `null` keeps "refused" distinguishable from "answered".
+      /** @type {{code?: string}|null} */
       let unauthorised = null;
       try {
         await ipc.request({
           op: 'interaction.decide', taskId, interactionId: interaction.interactionId,
           decision: 'allowed-once', authorityToken: 'not-the-token',
         });
-      } catch (error) { unauthorised = error; }
+      } catch (error) { unauthorised = /** @type {{code?: string}} */ (error); }
       assert.equal(unauthorised?.code, 'APPROVAL_UNAUTHORIZED');
       assert.equal(host.respondReceipts.length, 0);
 
       // The real token is read from the daemon's private state directory.
-      const { readAuthorityToken } = await import('../../lib/ipc.js');
+      const { readAuthorityToken } = await import('../../dist/lib/ipc.js');
       const token = readAuthorityToken(daemon.stateDir);
       assert.ok(token && token.length >= 32, 'the daemon must mint an authority token');
       const applied = await ipc.request({
@@ -457,13 +461,14 @@ export default {
       });
       assert.equal(applied.interaction.state, 'allowed-once');
       // A conflicting second decision is stale, not silently overwritten.
+      /** @type {{code?: string}|null} */
       let conflicting = null;
       try {
         await ipc.request({
           op: 'interaction.decide', taskId, interactionId: interaction.interactionId,
           decision: 'rejected', authorityToken: token,
         });
-      } catch (error) { conflicting = error; }
+      } catch (error) { conflicting = /** @type {{code?: string}} */ (error); }
       assert.equal(conflicting?.code, 'APPROVAL_STALE');
       // The identical decision is idempotent.
       const duplicate = await ipc.request({
@@ -509,8 +514,9 @@ export default {
       const status = await ipc.request({ op: 'health' });
       assert.equal(status.capabilities.probed.includes('session.updateQueue'), false);
       // An unknown IPC op is refused rather than answered with a default.
+      /** @type {{code?: string}|null} */
       let caught = null;
-      try { await ipc.request({ op: 'session.teleport' }); } catch (error) { caught = error; }
+      try { await ipc.request({ op: 'session.teleport' }); } catch (error) { caught = /** @type {{code?: string}} */ (error); }
       assert.equal(caught?.code, 'UNSUPPORTED');
     } finally {
       await teardown();

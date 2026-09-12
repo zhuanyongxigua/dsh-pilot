@@ -1,0 +1,30 @@
+{
+  // CONTRACT GATE: compiles the protocol surface with the Node type surface switched off, which turns
+  // AGENTS.md section 4 ("contract and protocol code stays free of Node-only APIs") from a review
+  // convention into a build failure.
+  //
+  // Why these three files and not more — this boundary was measured, not assumed:
+  //
+  //   - `src/lib/errors.ts` and `src/lib/mcp-tools.ts` are pure protocol: error codes and shapes, and the tool
+  //     schemas. They must never need a process, a socket or a buffer.
+  //   - `src/lib/mcp-protocol.ts` holds the JSON-RPC error mapping and the protocol/server identity
+  //     constants. It was EXTRACTED from `src/lib/gateway.ts` for exactly this reason: that file is the
+  //     stdio TRANSPORT and genuinely needs stdin/stdout, a pid and signal handlers, so nothing defined
+  //     in it could be gated. Leaving the constants and the mapping in the transport would have made
+  //     this gate either vacuous or a lie.
+  //
+  // `src/lib/gateway.ts` is deliberately NOT included: needing streams is legitimate for a transport, and
+  // claiming otherwise would force a false abstraction. The checked property is that every wire shape,
+  // error code and protocol constant is Node-free. `src/lib/ipc.ts` is excluded for the same reason — it is
+  // the local socket transport — and the transport modules are checked by `tsconfig.json`.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2023"],
+    "types": []
+  },
+  "include": [
+    "src/lib/errors.ts",
+    "src/lib/mcp-tools.ts",
+    "src/lib/mcp-protocol.ts"
+  ]
+}

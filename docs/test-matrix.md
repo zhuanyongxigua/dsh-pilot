@@ -1,277 +1,395 @@
-# Test matrix — requirement → layer → oracle
+# Test matrix — requirement → layer → evidence
 
-Task: `DSH-PILOT-20260912`. Status: **Phase 0 plan**. Every test id below is a **planned**
-item, not an executed one. The only things measured so far are the two Phase-0 fixture
-observations in [`docs/host-compatibility.md`](host-compatibility.md) §6.
+Task: `DSH-PILOT-20260912`. This file maps every requirement in
+[`requirements.md`](requirements.md) to the layer that proves it and to the test that exists
+**today**. There is no `planned` status: a row either names a test that ran, or says plainly what is
+missing and why.
 
-Rule for reading this document: a row's status is one of `planned`, `blocked` (needs a
-decision or capability we do not have yet), or `measured` (evidence exists today). **No row
-is `passing`.** A plan is not a result.
+| Status | Meaning |
+| --- | --- |
+| `measured` | A named test exists, runs on the environment in §7, and passes. It is the oracle the requirement asked for. |
+| `partial` | The code exists and part of the oracle is asserted. The unproven part is named in the row, and the row is never reported as `measured`. |
+| `unverified` | The behaviour is implemented — or holds by construction — but **no test asserts it**. Nothing here is a result. |
+| `not-implemented` | The capability itself is absent from this build. |
+| `blocked` | Proving it needs something not available here: real elapsed time, or an observable the upstream contract does not have. |
 
-Conventions: requirement ids come from [`docs/requirements.md`](requirements.md); test ids
-are `CT-` (contract/unit), `PT-` (seeded property/model), `PX-` (real multi-process
-persistence + crash), `FH-` (fake Host over real HTTP/WebSocket), `ME-` (real stdio MCP
-client against the built binary), `IH-` (isolated official DSH Host, opt-in), `LIVE-`
-(opt-in paid live suite), `OR-` (process oracle), `SEC-` (security/bounds), `MT-`
-(mutation/negative control), `CI-`, `SOAK-`.
+Where a requirement is only partly blocked, the row is `partial` and names the blocked half rather
+than carrying a whole-row `blocked` status: that applies to `FR-EV2-7` (the runner and its bounded
+smoke exist; the 48-hour observation needs real elapsed time) and to `FR-CANCEL-2` (the prohibition
+is measured; claiming a subprocess *did* stop would need a Host receipt that does not exist).
 
----
-
-## 1. Layers at a glance
-
-| Layer | Directory (planned) | Real transport / real process | Default CI | Proves |
-|---|---|---|---|---|
-| L1 contract & unit | `test/contract`, `test/unit` | no | yes | schemas, envelopes, error mapping, state machines, invalid input |
-| L2 seeded property/model | `test/property` | no | yes | invariants over generated event orders and crash interleavings, replayable seeds |
-| L3 real persistence + crash | `test/persistence` | real files, real processes, `SIGKILL` | yes | durability, no duplicate dispatch/cursor, single-owner, stale-lock recovery |
-| L4 fake Host (real HTTP + real WS) | `test/fake-host` | real sockets, in-process Host | yes | disconnect/delay/dropped ack/dup/old/reorder/malformed/oversize/replay-gap/pagination/backpressure/cancel races |
-| L5 MCP E2E over stdio | `test/mcp-e2e` | built binary spawned by a real MCP client | yes | the actual MCP face, tool schemas, error mapping, cancellation |
-| L6 isolated official Host | `test/isolated-host` | official `dsh web` on an ephemeral port under a throwaway `DSH_HOME` | planned yes, **gated** on mock-provider feasibility | our assumptions vs the real product |
-| L7 live paid (deepseek-flash) | `test/live` | isolated Host + real company route | **never** | integration against a real provider, opt-in, ≤20 min, concurrency ≤8 |
-| L8 process oracle | `test/oracle` | real child processes | yes | subprocess stop/kill claims carry evidence |
-| L9 security & bounds | `test/security` | real FS, real sockets | yes | isolation, redaction, adversarial text, memory/log bounds |
-| L10 mutation/negative controls | tooling | re-runs targeted suites against mutated code | yes (shard) | the suite actually fails when the property is broken |
-| L11 CI wiring | `.github/workflows` | Linux + macOS, no secrets | n/a | deterministic, lockfile install, distinct counts |
-| L12 soak runner | `tools/soak` | real wall time | manual | continuity, gaps, restart checkpoints |
-
-**Fixture separation is mandatory.** L4's fake Host and L6's official Host live in separate
-directories, print distinct labels, and are never described as proving each other's claims.
+Rule for reading this document: **a skipped or unrun test is never a pass.** The default run skips
+the whole isolated-Host layer and never selects the live layer; §7 reports those counts separately
+and §2 shows them per layer.
 
 ---
 
-## 2. L1 — contract & unit (`CT-*`)
+## 1. How to run the tests
 
-| Test id | Requirement | What it does | Observable oracle | Status |
-|---|---|---|---|---|
-| CT-ENV-1 | FR-MCP-1, FR-EXEC-3 | Parses and re-serializes every `client-request` / `server-response` / `client-response` envelope shape | Round-trip equality; an envelope missing `rpcId` or with a wrong `type` tag is rejected | planned |
-| CT-ENV-2 | FR-STATE-2 | Asserts the bridge never mints an `rpcId` for a response and always echoes the request's | Field-level assertion on the built envelope | planned |
-| CT-ENV-3 | FR-EXEC-4 | Maps every one of the 49 `error.code` values from the pinned map to a bridge outcome | Table-driven: each code produces its declared outcome; an unknown code is a failing test, not a default | planned |
-| CT-ENV-4 | FR-MCP-3 | Capability negotiation table: every `RpcMethodMap` key is declared supported / unsupported / unknown | Table equality against the checked-in inventory; a new upstream key fails until classified | planned |
-| CT-STATE-1 | FR-ID-1 | State-machine tests for task/session/turn/operation/interaction transitions | Every legal transition reachable; every illegal transition refused with a typed error | planned |
-| CT-STATE-2 | FR-STATE-7 | Serialization versioning: writes carry a version; unknown future version refused | Hand-crafted version+1 fixture → typed error, file untouched | planned |
-| CT-IN-1 | FR-MCP-2 | Invalid-input table for every MCP tool payload (missing/extra/wrong-typed/boundary) | Each rejected by schema with a machine-readable error; dispatch counter stays 0 | planned |
-| CT-IN-2 | FR-MCP-2 | Oversize and adversarial input (deeply nested JSON, huge strings, non-UTF8, control chars) | Rejected or bounded, never a crash or unbounded allocation | planned |
-| CT-CANCEL-1 | FR-CANCEL-1 | The two cancellation scopes are separate API paths with separate effects | Turn-cancel does not remove queue items; queue-remove does not stop the turn | planned |
-| CT-WAIT-1 | FR-EXEC-1, FR-EXEC-3 | Wait-result contract: closed set of terminal reasons, each reachable from a scripted state | Table equality over the reason enum | planned |
-| CT-PIN-1 | FR-MCP-4 | Compatibility test against the checked-in pin | Diff of resolved-tree inventory + method keys + frame unions; any add/remove/rename fails | planned |
+Requirements: Node ≥ 24 (the bridge uses the built-in `node:sqlite`), macOS or Linux. There are no
+runtime dependencies; `npm ci` installs `typescript` and `@types/node` for the build and the type
+gates only.
 
----
+The implementation is **TypeScript source** under `src/`, and every layer listed here runs the
+compiled output under `dist/` — a suite that spawns the MCP server spawns `dist/bin/dsh-pilot-mcp.js`,
+and the suites import the compiled modules. So `npm run build` comes first; `test/run.mjs` refuses to
+start with exit `2` and names the missing build when `dist/lib/ids.js` is absent.
 
-## 3. L2 — seeded property / model (`PT-*`)
+| Command | What it runs | Needs |
+| --- | --- | --- |
+| `npm test` (or `node test/run.mjs`) | the default deterministic layers: unit, property, fake-host, persistence, mcp-e2e, isolated-host, security — the isolated-Host cases are listed but skip themselves without `--isolated` | nothing else; no network, no credentials |
+| `node test/run.mjs test/unit test/property` | one or more named layer directories | — |
+| `node test/run.mjs --filter=owner-lock` | every case whose id contains a string | — |
+| `node test/run.mjs test/isolated-host --isolated` | the isolated **official** DSH Host layer | an installed `@deepseek-ai/dsh` (or `DSH_PILOT_DSH_BIN`), and an ephemeral port |
+| `node test/run.mjs test/live --live` | the opt-in live layer against the operator's real provider route | the operator's own DSH settings + credential, and the willingness to spend real quota |
+| `node test/mutation/run.mjs [--only NAME] [--json FILE]` | the negative controls (§4) | — |
+| `node test/soak/run.mjs --minutes N` (or `--hours N [--resume]`, `--status`) | the resumable soak runner | — |
+| `npm run build` | `tsc -p tsconfig.json`: `src/**/*.ts` → `dist/`, `strict` **and** `noImplicitAny` | `npm ci` |
+| `npm run typecheck:contract` | `tsc -p tsconfig.contract.json`: `src/lib/{errors,mcp-tools,mcp-protocol}.ts` with the Node type surface removed | `npm ci` |
+| `npm run typecheck:tests` | `tsc -p tsconfig.test.json`: `test/**/*.mjs` (`allowJs` + `checkJs`, `noEmit`, `noImplicitAny: false`) checked against the declarations emitted into `dist/` | `npm ci`, and a build |
 
-All `PT-*` print their seed on start and accept it back via env var. A failure without a
-reproducing seed is a test bug.
+Environment knobs a reader may need: `DSH_PILOT_JSON=<path>` (machine-readable report),
+`DSH_PILOT_SEED` (replay a property run), `DSH_PILOT_PROPERTY_ROUNDS` (property rounds),
+`DSH_PILOT_STATE_DIR`, `DSH_PILOT_HOST_URL`, `DSH_PILOT_ALLOW_REAL_STATE=1` (only if a state
+directory at or under `~/.dsh` or `~/.local/state` is genuinely intended), `DSH_PILOT_SETTINGS_FILE`
+(live layer), `DSH_PILOT_DSH_BIN` (isolated layer).
 
-| Test id | Requirement | What it does | Observable oracle | Status |
-|---|---|---|---|---|
-| PT-EV-1 | FR-EV-2, FR-EV-6 | Generates randomized event orders (dup / old / out-of-order / interleaved sessions) and folds them | Final canonical state equals the in-order control run for the same event set | planned |
-| PT-EV-2 | FR-EV-1, FR-EV-3 | Model test over cursor arithmetic: persist, restart, resume at random points | Cursor monotonic; no duplicate id persisted; no id skipped | planned |
-| PT-EV-3 | FR-EV-8 | Bounds model: random long sequences against retention caps | Memory and record counts stay within declared bounds; truncation counters agree with the model | planned |
-| PT-CR-1 | FR-STATE-1, FR-STATE-2 | Crash-interleaving model: kills injected at random points around each dispatch step | For every interleaving, the logical operation appears exactly once in the Host request log or is reported `uncertain`; never twice | planned |
-| PT-CR-2 | FR-STATE-3 | Crash/restore model over the journal | Replay from any prefix yields a state that matches the expected snapshot; no double-apply | planned |
-| PT-OWN-1 | FR-OWN-1 | Randomized multi-process claim/expire/reclaim schedules | At most one owner at any instant; every refused claimant performed zero dispatches | planned |
-| PT-CAN-1 | FR-CANCEL-5 | Randomized cancel-vs-completion race interleavings | Exactly one declared terminal reason per run, consistent with the observed event sequence | planned |
-| PT-AP-1 | FR-APPR-2 | Randomized approval correlation: correct/stale/replayed/wrong-turn answers | Only the exactly-matching answer is delivered; all others refused | planned |
-
----
-
-## 4. L3 — real persistence, multiprocess and crash (`PX-*`)
-
-Real files, real processes, real signals. No mocked filesystem.
-
-| Test id | Requirement | What it does | Observable oracle | Status |
-|---|---|---|---|---|
-| PX-1 | FR-STATE-3 | Two-process: writer process commits, `SIGKILL`, new process reads | Committed state present; state hash matches the post-commit expectation | planned |
-| PX-2 | FR-STATE-1 | Kill during dispatch, then inspect the journal on disk | Intent + `requestId` present before any dispatch could have happened | planned |
-| PX-3 | FR-STATE-2, FR-STATE-4 | Fake Host drops the ack; restart; reconcile | Exactly one upstream request observed; bridge reports `uncertain` then resolves by reconciliation | planned |
-| PX-4 | FR-OWN-2 | Two live processes against one state dir; second attempts to send | Second refused with a typed error; Host request log shows only owner traffic | planned |
-| PX-5 | FR-OWN-3 | `SIGKILL` the owner; start a new process with **no manual lock cleanup** | New process becomes owner automatically and reconciles before dispatching | planned |
-| PX-6 | FR-OWN-4 | `SIGSTOP` the owner past the lease; second process reclaims; `SIGCONT` | Reclaim succeeds; resumed old owner detects loss and issues no further calls | planned |
-| PX-7 | FR-STATE-5 | Injected corruption (truncated/bit-flipped journal), `ENOSPC` on a small loopback device (where permitted) or a quota-limited dir, and `EACCES` | Typed error per case; last-good state readable; no partial mutation visible | planned |
-| PX-8 | FR-ID-4 | Real state dir produced by tests is scanned for absolute paths and secret-looking strings | Zero findings; scan fails the suite otherwise | planned |
-| PX-9 | FR-EV-1 | Caller process A ingests, process B resumes from the same durable cursor | No re-delivery, no gap; both agree on the cursor | planned |
+Safety properties of the suite itself: no test binds port `3080`; the isolated and live rigs boot
+their own Host on an OS-assigned port inside their own temporary `DSH_HOME`; the live rig refuses a
+URL ending in `:3080`; every state directory is a per-test scratch dir; the live layer refers to a
+credential by environment-variable **name** only (`SX_API_KEY` in the operator's own settings is
+read as a name, and its value goes straight into the child's environment and is never read back).
 
 ---
 
-## 5. L4 — fake Host over real HTTP and WebSocket (`FH-*`)
+## 2. Layers and their measured counts
 
-A locally started fake Host implementing the pinned carrier shape: `POST /api/<method>`,
-`POST /api/respond` with the real receipt semantics, `426` for plain `GET` on the downlinks,
-WebSocket mux + host streams, and a recorded request log that tests assert against.
+Default run, this machine (macOS `darwin/arm64`, Node `v24.15.0`), `node test/run.mjs`:
 
-| Test id | Requirement | What it does | Observable oracle | Status |
-|---|---|---|---|---|
-| FH-1 | FR-EV-1, FR-EV-4 | Disconnect mid-stream, reconnect, refetch history | Client state equals a control run with no disconnect | planned |
-| FH-2 | FR-EV-3 | Injected replay gap (frames silently absent, no `stream/error`) | Bridge detects the gap and reconciles by refetch; final set complete and duplicate-free | planned |
-| FH-3 | FR-EV-6 | Duplicate / old / out-of-order / malformed frames | Malformed frame is skipped without killing the stream; gap reported; state converges | planned |
-| FH-4 | FR-EV-6, FR-SEC-5 | Oversized frame and oversize response body | Typed oversize outcome; bounded memory; stream survives | planned |
-| FH-5 | FR-EV-2, FR-SEC-5 | Pagination and backpressure: slow reader, producer flood | Bounded in-flight memory; pages bounded in size; no unbounded queue | planned |
-| FH-6 | FR-CANCEL-4 | Cancel racing a dropped carrier | Typed `uncertain`/refused outcome; never a false `cancelled` | planned |
-| FH-7 | FR-APPR-3 | `/api/respond` returns `not-pending` (stale/replayed) | Interaction marked already-resolved-by-host; never "answered by us" | planned |
-| FH-8 | FR-MCP-3 | Fake Host answers an unsupported method with an unknown code | Bridge reports unsupported, does not fabricate a value | planned |
-| FH-9 | FR-EXEC-2, FR-EXEC-6 | Fake Host reports healthy connection + misleading `attachedSessions` while a session is not running | Bridge's per-session execution state is unaffected; connection stays `up` | planned |
-| FH-10 | FR-SESS-6 | Dispatch with a cwd the fake Host rejects (`workspace-invalid-path`) | Typed error surfaced; no retry loop; no partial state | planned |
-| FH-11 | FR-EXEC-1 | Bounded program wait under a silent Host (no frames) | Returns `timeout` at the bound; no busy loop (CPU-time observed) | planned |
+| Layer | Directory | Transport / process | Default | passed | failed | skipped | timed out |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Unit / contract | `test/unit` | in-process plus real child processes for ownership | yes | 21 | 0 | 0 | 0 |
+| Seeded property / model | `test/property` | in-process, seeded, reference model independent of `src/` | yes | 3 | 0 | 0 | 0 |
+| Fake-Host contract | `test/fake-host` | real HTTP + real WebSocket against our own fixture Host | yes | 17 | 0 | 0 | 0 |
+| Persistence and crash | `test/persistence` | real processes, real `SIGKILL`/`SIGSTOP`, real restarts | yes | 6 | 0 | 0 | 0 |
+| MCP E2E (stdio) | `test/mcp-e2e` | the built `dist/bin/dsh-pilot-mcp.js` spawned and driven over real pipes | yes | 8 | 0 | 0 | 0 |
+| Isolated official Host | `test/isolated-host` | a real DSH Host, own home, ephemeral port, loopback mock provider | **opt-in (`--isolated`)** | 0 | 0 | 10 | 0 |
+| Security and bounds | `test/security` | real sockets, real files, real `lsof` | yes | 9 | 0 | 0 | 0 |
+| Live provider | `test/live` | real DSH Host + the operator's real route | **opt-in (`--live`)**, never in CI | *(not selected)* | — | — | — |
 
----
+`passed=64 failed=0 skipped=10 timedOut=0` for the default run. The live layer is **not** in the
+default layer list at all: when it is not selected the runner prints
+`live suite: SKIPPED (opt-in; not selected on this run)`.
 
-## 6. L5 — MCP E2E over real stdio (`ME-*`)
-
-Every `ME-*` spawns the **built** entry point as a child process and speaks MCP to it with a
-real MCP client. Calling internal handlers directly is not an E2E test and does not satisfy
-these rows.
-
-| Test id | Requirement | What it does | Observable oracle | Status |
-|---|---|---|---|---|
-| ME-1 | FR-MCP-1 | Spawn built binary; MCP `initialize`; `tools/list` | Handshake completes with the declared protocol version; tool list matches the schema snapshot | planned |
-| ME-2 | FR-MCP-1, FR-MCP-2 | Call each tool with valid and invalid input over the wire | Valid calls succeed; invalid calls return MCP-level errors; fake-Host request log matches exactly the valid calls | planned |
-| ME-3 | FR-MCP-3 | Request an operation the negotiated capability set lacks | Explicit unsupported error to the MCP client; no fabricated success | planned |
-| ME-4 | FR-EV-2 | Watch/pagination tools stream incremental events to the client | Client receives bounded pages, strictly increasing cursors, no duplicates across pages | planned |
-| ME-5 | FR-MCP-6 | Caller cancels a long wait via MCP cancellation | Bridge stops waiting promptly; no further mutating Host requests | planned |
-| ME-6 | FR-ID-1 | Kill the server child, respawn against the same state dir, resume the task over MCP | Same ids; no duplicate dispatch of the pre-kill operation | planned |
-| ME-7 | FR-SEC-1 | Two MCP clients/tasks against one bridge instance | No cross-task data or events in either client's results | planned |
-| ME-8 | FR-MCP-5 | Missing/unwritable state dir; unreachable Host | Fail-closed startup error surfaced through the MCP client, with an actionable message | planned |
+**Fixture separation is not negotiable.** The fake Host (`test/fixtures/fake-host.mjs`) is our own
+code and a passing run against it is evidence about our client only. The isolated Host is the real
+product booted by the test. They live in different directories, print different labels, and neither
+is presented as evidence for the other. The live layer is a third thing again: a real Host against a
+real model route.
 
 ---
 
-## 7. L6 — isolated official DSH Host (`IH-*`)
+## 3. Requirement → test → evidence
 
-Fixture (verified feasible, §6 of the compatibility report):
-`DSH_HOME=<tmp>/home dsh web --port 0 --host 127.0.0.1 --no-open`.
+Requirement ids and priorities come from [`requirements.md`](requirements.md) §3 and keep its
+numbering. Test ids are `<layer>/<file>::<case name>` — exactly what the runner prints, and what
+`--filter=` matches on.
 
-| Test id | Requirement | What it does | Observable oracle | Status |
-|---|---|---|---|---|
-| IH-0 | — (fixture) | Boot the isolated Host, probe `host.describe`, `session.list` | Boots on an ephemeral port with a fresh home; **measured today**: describe ok, 0 sessions, clean kill, port 3080 untouched | **measured** |
-| IH-1 | FR-SESS-1 | Create N sessions through the bridge against a real Host | All created, distinct ids, each reachable in `session.list` with the recorded cwd | blocked: needs a deterministic provider fixture (no paid model) |
-| IH-2 | FR-EV-1, FR-EV-4 | Real mux frames, real reconnect | Cursor/state consistent across a forced reconnect | blocked: needs a running turn |
-| IH-3 | FR-SESS-3, FR-SESS-4 | Kill the bridge, re-attach from a new process | Same `sessionId`, no new session created by the re-attach path | blocked: needs a running turn |
-| IH-4 | FR-APPR-1, FR-APPR-2 | Trigger a real approval-requiring tool call against a policy that asks | Interaction pending until answered; wrong-turn/stale answers refused; the Host's own state confirms the outcome | blocked: needs the provider fixture **and** an approval-triggering policy |
-| IH-5 | FR-CANCEL-1, FR-CANCEL-2 | Real `session.cancel` with queued work **and** a real child process | Turn stops; queued items survive per Host semantics; subprocess claim carries process evidence (L8 oracle) | blocked: needs the provider fixture |
-| IH-6 | FR-MCP-4 | Capability negotiation against the real pinned Host | Declared cap set matches the Host's actual answers; a missing method is reported unsupported | planned (can run without a turn) |
+### 3.1 Identity and sessions (`FR-ID`, `FR-SESS`)
 
-**Gate for L6 in default CI:** the mock-provider question (compatibility report §7) must be
-resolved first, so that no automated test can reach a paid endpoint. Until then, every
-turn-level `IH-*` row stays `blocked`, and that word — not "passing" — is what gets reported.
+| Req | Pri | Status | Test id(s) | Evidence, and what is not covered |
+| --- | --- | --- | --- | --- |
+| FR-ID-1 | P0 | partial | `persistence/crash::a restart preserves task, session and event identity, and never invents a new session`; `unit/core::durable-before-send: the dispatching row is committed before any network write`; `live/live::a SIGKILL during a live turn leaves durable history and an honest, unresolved outcome` | `taskId`, `sessionId` and `operationId` come back byte-identical in a new process after `SIGKILL`, and the intent row is durable before the send. **Not covered:** there is no `task.get`-shaped call (the snapshot is `session.state`), and `turnId`/`interactionId` stability across a restart is not asserted. |
+| FR-ID-2 | P0 | measured | `fake-host/contract::session.create retries idempotently with the preallocated id and reports a cwd conflict`; `fake-host/contract::a host business refusal is recorded as refused with the host code preserved`; mutation `session-create-id-not-reused-on-retry` (production) | A stored retry reuses the stored host session id rather than minting a new one, and a business refusal keeps the Host's own code. |
+| FR-ID-3 | P1 | partial | `fake-host/contract::concurrent sessions: 8 sessions run 3 rounds each with per-session isolation` | Eight sessions created in one process are all distinct. **Not covered:** no test spawns ≥ 8 concurrent *creator processes* against one state directory; cross-process creation is bounded by single ownership (only one daemon may own the directory) but that bound is not itself the oracle the requirement asked for. |
+| FR-ID-4 | P2 | partial | `unit/core::id namespaces are separate and validated per kind`; `security/bounds::state directory contents contain no credential values, only references` | Every id carries a kind prefix, is validated per kind, and cross-kind use is refused; durable state holds references rather than credential material. **Not covered:** no test asserts that no absolute path fragment can appear inside an id. |
+| FR-SESS-1 | P0 | measured | `fake-host/contract::concurrent sessions: 8 sessions run 3 rounds each with per-session isolation`; `live/live::three real sessions recall only their own planted fact`; `live/live::sessions run in parallel at widths 2, 4 and 8 without cross-contamination`; `isolated-host/turns::two sessions on one real Host stay isolated, and each ends on its own turn` | Parallel sessions on the fixture and on a real Host, with per-session markers that must not appear in a sibling's log. |
+| FR-SESS-2 | P0 | measured | `live/live::three real sessions recall only their own planted fact` (each round is a plant turn and a recall turn in the *same* session); `mcp-e2e/stdio::a full session lifecycle driven only through MCP tools` | Follow-up turns are attributed to the same session and both turns appear in its log. |
+| FR-SESS-3 | P0 | measured | `persistence/crash::a restart preserves task, session and event identity, and never invents a new session` (asserts exactly one `session.create` reached the Host across the restart); `live/live::a SIGKILL during a live turn leaves durable history and an honest, unresolved outcome` | Re-attach does not create a second session. |
+| FR-SESS-4 | P0 | unverified | — | No test drives two independent caller processes against one durable task. The transport allows it (≤ 32 gateway connections on one socket) and a second process cannot own state, but "both read identical snapshots and identical cursor semantics" has no oracle. |
+| FR-SESS-5 | P1 | unverified | — | The bridge has no discovery path that could adopt a session it did not create, so the property holds by construction. No test asserts it: the isolated Host always starts with zero sessions and the live rig always creates its own single-use home. |
+| FR-SESS-6 | P1 | partial | `fake-host/contract::session.create retries idempotently with the preallocated id and reports a cwd conflict` | The cwd-conflict path is measured. **Not covered:** `cwd` is not re-verified before every dispatch, the fixture never answers `workspace-invalid-path`, and the "refused, and no prompt was sent" oracle does not exist. |
+| FR-SESS-7 | P2 | not-implemented | — | No rename operation or tool exists. `session.rename` is in the pinned method inventory in `src/lib/adapter.ts`; nothing calls it. |
 
----
+### 3.2 Durable state, crash behaviour and ownership (`FR-STATE`, `FR-OWN`)
 
-## 8. L7 — opt-in live deepseek-flash (`LIVE-*`)
+| Req | Pri | Status | Test id(s) | Evidence, and what is not covered |
+| --- | --- | --- | --- | --- |
+| FR-STATE-1 | P0 | measured | `unit/core::durable-before-send: the dispatching row is committed before any network write` (reads the row back from a **second** SQLite connection); `persistence/crash::SIGKILL during dispatch: the next process reports the operation as uncertain, never as sent` (the Host saw exactly one `session.prompt`); `property/model::idempotency keys under repeated submission produce exactly one durable operation`; mutation `durable-intent-after-send` (production, caught by two persistence cases) | The intent and its outbox row are committed before the send, and a crash out of `dispatching` leaves it visible for the next process. |
+| FR-STATE-2 | P0 | measured | `fake-host/contract::dropped ack after send becomes uncertain, is never retried, and never duplicates the send`; `persistence/crash::SIGKILL during dispatch…`; `mcp-e2e/stdio::uncertain outcomes are reported as errors so a caller cannot mistake them for success`; `live/live::a SIGKILL during a live turn…`; mutations `durable-intent-after-send` and `ack-loss-reported-as-success` (production, both caught) | Repeating the same logical call returns `previously-sent-outcome-unknown` and never reaches the wire again. Scope: the evidence is example-based across four layers; the seeded crash-interleaving model from the original plan was **not** built, so "exactly once under every interleaving" is not claimed. |
+| FR-STATE-3 | P0 | measured | `persistence/crash::a restart preserves task, session and event identity…` (event count and cursor `highWater` unchanged); `live/live::a SIGKILL during a live turn…` (stored sequences are contiguous across the crash); mutation `duplicate-rows-written` (production, caught) | No duplicate dispatch, no cursor regression, no duplicate event after a real `SIGKILL`. |
+| FR-STATE-4 | P0 | measured | `fake-host/contract::dropped ack after send becomes uncertain…` (`uncertainReason` names `after-send`/`timeout`); `persistence/crash::SIGKILL during dispatch…` (reason `crash-during-dispatch` is preserved); `mcp-e2e/stdio::uncertain outcomes are reported as errors…` | `uncertain` is a persisted state carrying the evidence that produced it, and it is surfaced to the caller with `isError: true`. |
+| FR-STATE-5 | P0 | partial | `unit/core::corrupt storage is reported with evidence preserved` | Corruption is measured: a typed `STORAGE_CORRUPT`, and the database and WAL are left in place rather than deleted. **Not covered:** neither `ENOSPC` nor `EACCES` is exercised by any test; `STORAGE_FULL` exists in the taxonomy and is reachable in `src/lib/store.ts`, not by an oracle. |
+| FR-STATE-6 | P1 | not-implemented | — | There is no rotation and no compaction. `logMaxBytes` is a configured number with nothing enforcing or testing it beyond a WAL checkpoint on clean shutdown, so "growth is bounded and a compacted state can be replayed" is not a property of this build. |
+| FR-STATE-7 | P1 | measured | `unit/core::a state file from a newer bridge is refused, not misread` (`STATE_VERSION_UNSUPPORTED`, with the found version in the details) | An unknown future schema version is refused rather than misinterpreted. |
+| FR-STATE-8 | P2 | partial | [`architecture.md`](architecture.md) §10 documents the layout; `security/bounds::IPC is a local socket with 0600 permissions, not a network listener`; `persistence/crash::state directory permissions: the authority token is private to the operator account`; `unit/owner-lock::the lock file keeps its inode, so releasing and re-taking cannot split ownership` | The layout is documented and its pieces are asserted individually. **Not covered:** no docs-to-reality check compares the documented layout to a real state directory field by field. |
+| FR-OWN-1 | P0 | measured | `unit/owner-lock::the lock database is held in exclusive locking mode, not merely remembered`; `unit/owner-lock::a second holder is refused, and an uncooperative connection cannot take the file`; `unit/core::exclusive ownership: a second handle is refused, and the holder keeps it while stopped`; `unit/core::the daemon refuses to start when the state directory is already owned`; `persistence/crash::two daemons cannot own one state directory, and a clean release lets the next one in`; mutation `second-owner-not-refused` (production) | Kernel-enforced exclusion: the second holder is refused, an *independent* process that knows nothing about `OwnerLock` cannot take a write lock, and a second daemon exits `4` with `OWNER_HELD`. |
+| FR-OWN-2 | P0 | measured | `unit/core::the daemon refuses to start when the state directory is already owned`; `persistence/crash::two daemons cannot own one state directory…` | A refused daemon exits before it opens the store, binds IPC or contacts the Host, so it sends nothing. Scope: "the Host request log shows only owner traffic" is satisfied by that ordering rather than by an assertion on the loser's request log — it never opens a connection to assert against. |
+| FR-OWN-3 | P0 | measured | `persistence/crash::SIGKILL during dispatch…` (a new process starts against the same directory with no manual cleanup); `unit/owner-lock::a stale marker left by a dead holder does not block a new owner`; `unit/owner-lock::the marker file is informational only: deleting it does not release anything` | Ownership is decided by the kernel lock, never by a file's presence, and a dead owner's directory is reclaimable automatically. |
+| FR-OWN-4 | P1 | not-implemented | Measured **inverse**: `persistence/crash::SIGSTOP on the living owner: ownership is retained, and it comes back with its state`; `unit/core::exclusive ownership… the holder keeps it while stopped` | The requirement asks for a lease that a hung owner loses. This build deliberately refuses that ([`adr/0002-owner-exclusion-primitive.md`](adr/0002-owner-exclusion-primitive.md)): a paused owner may hold unflushed durable state, and handing the directory to a second process while the first lives is the failure mode the design exists to prevent. What is measured is the opposite property — a `SIGSTOP`ped owner keeps ownership, a `SIGCONT`ed owner resumes as the owner with its state intact, and a `SIGKILL`ed owner is released by the kernel. A hung owner therefore holds the directory until it is killed; the remedy is process-level, not a lock file. |
+| FR-OWN-5 | P1 | partial | `store.audit` writes `daemon-started`, `session-created` and `approval-unauthorized` rows; `security/bounds::the authority token is never readable through the IPC surface` | Some transitions are journalled. **Not covered:** claim / release / reclaim are not recorded as ownership transitions (only daemon start is), and no test inspects an ownership history. |
+| FR-OWN-6 | P2 | partial | Stated plainly in [`architecture.md`](architecture.md) §7 ("a coordination device, not a security boundary") and in ADR 0002; `unit/owner-lock::the marker file is informational only…` shows the marker is not authority | The non-claim is documented. **Not covered:** no test detects and reports a foreign process that writes the state directory without following the protocol. |
 
-Separately created test DSH home, Host and session set. Route: the company
-`sx-anthropic/deepseek-flash` route **as configured by the operator**, by env reference
-only. **No automatic provider fallback**: if the configured route is not routable, the suite
-fails and says so; it never silently picks another model.
+### 3.3 Events, cursors, execution and waiting (`FR-EV`, `FR-EXEC`)
 
-Hard caps: wall time ≤ 20 min for the whole suite, concurrency ≤ 8, no retries until green,
-first failures reported verbatim, usage reported. Port 3080 and existing tasks are never
-touched. Raw provider evidence stays in the ignored `.local/`.
+| Req | Pri | Status | Test id(s) | Evidence, and what is not covered |
+| --- | --- | --- | --- | --- |
+| FR-EV-1 | P0 | measured | `property/model::cursor conclusions are stable no matter how many times the same stream is replayed`; `persistence/crash::a restart preserves task, session and event identity…` (cursor `highWater` preserved across a restart); `fake-host/contract::disconnect then reconnect refetches history and converges to the control state` | Durable per-session cursors, and a restart that neither re-delivers nor loses. |
+| FR-EV-2 | P0 | measured | `security/bounds::an event page is bounded by the configured maximum regardless of what is asked for` (`limit: 5` returns 5 with `hasMore: true`; `limit: 10_000_000` is clamped to ≤ 200); `property/model::generated event streams: stored sequences and gap conclusions match an independent model`; `mcp-e2e/stdio::a full session lifecycle driven only through MCP tools` | Pages are bounded and carry `completeness`, `completedThrough`, `highWater` and any gap. Shape note: continuation is a **backwards** cursor (`beforeSeq`, "strictly below"), not a forward token; the schema bounds `limit` to 1..200. |
+| FR-EV-3 | P0 | measured | `fake-host/contract::a silent frame gap is reported as incomplete and cannot be smoothed over`; `fake-host/contract::malformed and duplicate frames do not corrupt state, and duplicates are counted not re-stored`; `property/model::generated event streams…` (the completeness verdict must equal the independent model's); mutation `gap-smoothed-over` (production) | A hole is reported with its range and never presented as a complete log. |
+| FR-EV-4 | P0 | partial | `fake-host/contract::disconnect then reconnect refetches history and converges to the control state` (reopen the downlink **and** refetch, because mux `since` is unimplemented upstream; `eventStats.reconnects` is counted) | Measured against the fixture. **Not covered:** no layer forces a disconnect from a real Host, so the real-Host reconnect path is unproven. |
+| FR-EV-5 | P1 | unverified | — | Interactions are keyed durably by correlation id, so a replayed request resolves to the row that already exists rather than arming a second one — but **no test replays a frame** and asserts that. The case named `fake-host/contract::approvals: a replayed request is not re-armed, and the receipt decides the reported meaning` records one approval and asserts it stays `pending`; its name promises more than its body checks. |
+| FR-EV-6 | P1 | measured | `fake-host/contract::malformed and duplicate frames do not corrupt state…` (raw non-JSON and truncated frames on the real socket; duplicates counted, not re-stored); `property/model::cursor conclusions are stable…` (shuffled duplicates collapse to one row each); `security/bounds::an oversized event frame is refused as oversize rather than buffered` | Duplicate, old, out-of-order and oversize input leave the canonical state unchanged. |
+| FR-EV-7 | P1 | not-implemented | — | There is no retention window and no age-based expiry. `CURSOR_EXPIRED` means exactly one thing today: a cursor bound to a different store generation (`src/lib/daemon.ts`). No test asserts a typed "cursor expired" with a documented refetch path. |
+| FR-EV-8 | P2 | not-implemented | — | Counters exist (`health.eventStats`: frames, stored, duplicates, gaps, malformed, oversize, reconnects, historyTruncations) and caps are configured, but no long-running test asserts that memory or on-disk event records stay under a cap, or that truncation counters agree with observed growth. |
+| FR-EXEC-1 | P0 | measured | `fake-host/contract::wait returns a closed-set reason and a deadline is a timeout, not a hang` (`no-turn-observed`; `timeout` inside the deadline; `turn-ended` when the terminal event arrives); `mcp-e2e/stdio::a full session lifecycle driven only through MCP tools`; `mcp-e2e/stdio::cancelling a wait does not cancel the turn, and the server keeps serving` | A bounded wait always returns a reason from a closed set; a deadline is reported as a timeout. |
+| FR-EXEC-2 | P0 | measured | `fake-host/contract::execution state is not derived from connection state` (the carrier is killed while a turn is open: execution stays `running`, connection is not `ready`); `persistence/crash::SIGSTOP on the living owner…` (the resumed owner rebinds its downlink and returns to `ready`) | Connection state and execution state are separate facts in both directions. |
+| FR-EXEC-3 | P0 | partial | `isolated-host/turns::a real turn runs to an authoritative end, and the model reply arrives in the event log` (reason `turn-ended`, terminal reason names the authoritative `turn/end`); `fake-host/contract::wait returns a closed-set reason…`; `fake-host/contract::a stale or foreign terminal event does not end the current turn` (`lastTerminalReason` names the authoritative event); `isolated-host/turns::cancel is reported as a turn-level ack with no subprocess evidence, never as proof` | Some termination paths are distinguishable from real and fixture Hosts. **Not covered:** no table-driven test walks the whole reason set, and `failed` / `cancelled` / `host-rejected` are not asserted as *turn* terminal reasons — the provider-failure case asserts what the Host actually did (no tool call, no model text) rather than a bridge-side reason. |
+| FR-EXEC-4 | P1 | measured | `mcp-e2e/stdio::uncertain outcomes are reported as errors so a caller cannot mistake them for success`; `fake-host/contract::dropped ack after send becomes uncertain…`; mutation `ack-loss-reported-as-success` (production, caught) | The negative control is the proof: mapping an unprovable outcome to success turns the suite red. |
+| FR-EXEC-5 | P1 | partial | `test/live/live-route.mjs` derives the route from the operator's own settings and names the credential only by environment variable; `live/live::a real model turn completes through the bridge and its reply is in the durable log` (prints provider id, model id and credential variable **name**; no endpoint or value is committed anywhere); `live/live::three real sessions recall only their own planted fact` | A real, operator-configured route is exercised, and a missing route is reported as a SKIP with the precise cause (`resolveLiveRoute` returns `{ok:false, reason}`). **Not covered:** an *unroutable* route is not asserted to produce a typed error — the layer skips instead — and `HOST_UNREACHABLE` is not asserted by any test. |
+| FR-EXEC-6 | P2 | partial | `fake-host/contract::execution state is not derived from connection state`; `fake-host/contract::a stale or foreign terminal event does not end the current turn` | Execution state is computed per session from that session's own `turn/start`/`turn/end`, and nothing derives it from a host-level aggregate. **Not covered:** the planned negative control (a fixture reporting a misleading `attachedSessions` while our session is idle) does not exist — the fixture reports its real count. |
 
-| Test id | Requirement | What it does | Observable oracle | Status |
-|---|---|---|---|---|
-| LIVE-1 | FR-SESS-1 | 2 / 4 / 8 parallel sessions, each with a unique memory marker | Every session recalls its own marker; no sibling's marker appears in its history | blocked (opt-in; requires operator-provided route + budget) |
-| LIVE-2 | FR-SESS-1, FR-SEC-1 | ≥3 rounds of unique-memory isolation | Round N's markers never surface in a later round of another session | blocked (opt-in) |
-| LIVE-3 | FR-SESS-3, FR-STATE-3 | New caller process / new bridge process recovery | Same task and session ids; no duplicate dispatch; no lost turn | blocked (opt-in) |
-| LIVE-4 | FR-SESS-3 | Isolated Host restart (own home) then re-attach | Session survives, work resumes, no manual lock deletion | blocked (opt-in) |
-| LIVE-5 | FR-EXEC-5 | Route configuration by env reference; unroutable route handling | Configured route performs a real turn; an unroutable route fails with a typed error | blocked (opt-in) |
+### 3.4 Approvals and cancellation (`FR-APPR`, `FR-CANCEL`)
 
-A green `LIVE-*` run is the only thing that may be called "verified against a real model".
-When it is skipped, every document says skipped.
+| Req | Pri | Status | Test id(s) | Evidence, and what is not covered |
+| --- | --- | --- | --- | --- |
+| FR-APPR-1 | P0 | partial | `fake-host/contract::prompt text that demands approval authorizes nothing`; `fake-host/contract::an approval decision requires the operator token and cannot be replayed`; `security/bounds::an unauthenticated caller cannot decide an approval, even with a well-formed request`; `mcp-e2e/stdio::handshake, tools/list and a real initialize round trip over stdio` (no tool name matches the pattern `approve`, `decide` or `allow`); mutation `approval-authority-not-checked` (production, caught) | Nothing answers an approval without the operator token, and no tool can. **Not covered:** the timeout and reconnect paths specifically — "not on timeout, not on reconnect" is structural (no code path decides without the token) rather than separately asserted. |
+| FR-APPR-2 | P0 | partial | `fake-host/contract::an approval decision requires the operator token and cannot be replayed` (a conflicting second decision is `APPROVAL_STALE`; an identical repeat returns receipt `duplicate`; `respondReceipts` is empty for the unauthenticated attempt); `security/bounds::an unauthenticated caller cannot decide an approval…` (four unauthenticated shapes, all `APPROVAL_UNAUTHORIZED`, nothing delivered) | Stale and replayed decisions are refused, and an unauthorised attempt never reaches the Host. **Not covered:** binding to an exact **turn** and to `approvalId`; the tests bind to task + interaction, and no wrong-turn answer is attempted. |
+| FR-APPR-3 | P0 | unverified | The path exists but no test drives it: `src/lib/adapter.ts` maps the receipt `{accepted:false, reason:'not-pending'}` to a receipt instead of an outcome, and `src/lib/daemon.ts` records `previousDelivery.outcome === 'not-pending'` so such an interaction is never counted as answered by us; the fixture returns `not-pending` for an unknown `rpcId` | **No test drives a `not-pending` receipt and asserts the reported meaning**, so the oracle the requirement asked for is missing. |
+| FR-APPR-4 | P0 | measured | `fake-host/contract::prompt text that demands approval authorizes nothing` (a prompt instructing the bridge to approve; the interaction stays `pending` and `respondReceipts` stays 0) | Text in the conversation is not human intent. Scope: the adversarial text is injected as prompt text; document-content and event-payload text are not separately injected. |
+| FR-APPR-5 | P1 | partial | `fake-host/contract::an approval decision requires the operator token and cannot be replayed` | `allowed-once` plus the stale/duplicate refusals are measured. **Not covered:** no test drives an interaction to `rejected` or `expired`, so those are not shown to be distinguishable from accepted-by-human. |
+| FR-APPR-6 | P2 | unverified | Durable rows exist (an `interactions` table with `decision`, `reason`, `decided_at` and the correlation id, plus an `audit` table; an unauthorised decision writes `approval-unauthorized`). | **Not covered:** no test inspects an interaction history for who answered, when, on which correlation id, with what outcome. |
+| FR-CANCEL-1 | P0 | partial | `fake-host/contract::cancel is turn-scoped, reports subprocess evidence honestly, and holds local dispatch while checking` (`target.scope` is `local-open-turn`; `queue.clear` reports `localScope: 'daemon'` and `remoteScope.cleared: false`); `isolated-host/turns::cancel is reported as a turn-level ack with no subprocess evidence, never as proof` | Turn cancellation is measured on both the fixture and a real Host, and the two scopes are reported separately. **Not covered:** the Host-side queue half is not implemented — `queue.clear` clears only the daemon's own queue and says why (`remote queue clearing requires a queue item id observed from the Host queue snapshot`), because nothing reads a `session/queue` snapshot. "Remove the queue item and observe it disappear from the Host queue snapshot" has no code and no test. |
+| FR-CANCEL-2 | P0 | measured | `fake-host/contract::cancel is turn-scoped…` (`processEvidence.observed === false`); `isolated-host/turns::cancel is reported as a turn-level ack…` (observed false, with the reason naming the missing Host receipt); mutation `cancel-ack-claims-subprocess-stop` (production, caught) | The requirement is a prohibition and it holds: no path reports a subprocess as stopped on the strength of a turn-level ack. The positive half — observing a real child-process stop with pid/exit evidence — is not implemented and is blocked on an observable the contract does not have (§8). |
+| FR-CANCEL-3 | P1 | unverified | `src/lib/daemon.ts` returns `{operation, reused: true}` for a repeated cancel idempotency key, which is the mechanism the requirement asks for. | **No test calls cancel twice** and asserts one effect, a stable journal and a typed outcome. |
+| FR-CANCEL-4 | P1 | partial | The daemon builds the `uncertain` note ("cancel outcome unproven: the turn may or may not have stopped") when the dispatch result is unproven; the dropped-ack path itself is measured for `session.prompt` in `fake-host/contract::dropped ack after send becomes uncertain…` | The code path exists. **Not covered:** no test drops the carrier around a cancel, so "cancel during a disconnect is never a false success" is not asserted for cancel specifically. |
+| FR-CANCEL-5 | P2 | unverified | Cancels are serialized per session and hold the next local dispatch while the turn is checked (`src/lib/daemon.ts`), which is the mechanism a race would be resolved by. | **No seeded cancel-versus-completion race test exists**, so the resolution is not shown to be deterministic. |
 
----
+### 3.5 MCP face, compatibility and security (`FR-MCP`, `FR-SEC`)
 
-## 9. L8 — process oracle (`OR-*`)
+| Req | Pri | Status | Test id(s) | Evidence, and what is not covered |
+| --- | --- | --- | --- | --- |
+| FR-MCP-1 | P0 | measured | `mcp-e2e/stdio::handshake, tools/list and a real initialize round trip over stdio` (spawns `dist/bin/dsh-pilot-mcp.js` and speaks JSON-RPC 2.0 over real pipes; all 11 tools are checked for an object schema with `additionalProperties: false`); `mcp-e2e/stdio::a full session lifecycle driven only through MCP tools` | A real client process spawns the real entry point; no in-process shortcut anywhere in the layer. |
+| FR-MCP-2 | P0 | measured | `mcp-e2e/stdio::invalid arguments are a JSON-RPC invalid-params error, and nothing is sent upstream` (missing field, unknown property, wrong type, out-of-range value → `-32602`; unknown tool → `-32601`; the fake Host's mutation counter is unchanged); mutation `mcp-unknown-arguments-accepted` (production) | Strict schemas, machine-readable errors, and a refused call demonstrably not reaching the Host. |
+| FR-MCP-3 | P0 | measured | `unit/core::capability negotiation reports unverified methods instead of assuming them`; `fake-host/contract::unsupported methods are reported as unsupported, never faked`; `isolated-host/host::the unverified method set is reported, and a method outside it is refused not faked` (a method absent from this Host never answers `ok:true`); `mcp-e2e/stdio::invalid arguments…` (`-32601` for an unknown tool) | An unsupported capability is reported, never simulated. |
+| FR-MCP-4 | P1 | partial | `unit/core::capability negotiation reports unverified methods instead of assuming them` (the pinned inventory is unique and complete, which is the drift tripwire's basis); `isolated-host/host::the bridge attaches to a real Host and reaches ready without a protocol error` (`protocolErrors === 0`, declared and unverified counts printed) | The pin exists in code and is probed against the real Host. **Not covered:** there is no checked-in generated inventory of the resolved dependency tree, no artifact-hash assertion, and no test that fails on an add/remove/rename of the method map — the compatibility gate described in [`host-compatibility.md`](host-compatibility.md) §2.2 is a procedure, not yet an oracle. |
+| FR-MCP-5 | P1 | partial | `mcp-e2e/stdio::the gateway fails closed and stays silent on stdout when the daemon is absent` (diagnostic on stderr, no stdout noise); `unit/core::the daemon refuses to start when the state directory is already owned` (exit 4, `OWNER_HELD`); `src/bin/dsh-pilot-daemon.ts` guards a real-state-dir target and exits 3 | Two startup failures fail closed. **Not covered:** an unwritable state directory (`EACCES`) is not exercised, and an unreachable Host is deliberately **not** a startup failure — the daemon runs with `connection != ready`, so "host reachability fails closed" is not a property of this build. |
+| FR-MCP-6 | P2 | partial | `mcp-e2e/stdio::cancelling a wait does not cancel the turn, and the server keeps serving` (a `notifications/cancelled` is sent for a wait request; the turn is still `running` afterwards; the gateway keeps serving with `rejectedToolCalls === 0`) | Cancelling a caller's wait is not cancelling work, and the server stays healthy. **Not covered:** an in-flight wait is not interrupted early — the gateway records the cancelled id and answers `-32800` only when a request carrying that id arrives — and no progress notifications are emitted. |
+| FR-SEC-1 | P0 | measured | `fake-host/contract::concurrent sessions: 8 sessions run 3 rounds each with per-session isolation`; `property/model::generated event streams: stored sequences and gap conclusions match an independent model` (every stored event's `sessionId` must be the session asked for); `isolated-host/turns::two sessions on one real Host stay isolated…`; `live/live::three real sessions recall only their own planted fact`; `live/live::sessions run in parallel at widths 2, 4 and 8 without cross-contamination` | No marker or event crosses a session boundary, on the fixture, on a real Host, and against a real model. |
+| FR-SEC-2 | P0 | partial | `security/bounds::IPC is a local socket with 0600 permissions, not a network listener`; `security/bounds::the daemon refuses to bind anything on a TCP port` (`lsof -a -iTCP -sTCP:LISTEN` for the daemon's pid finds no listener); `isolated-host/host::an isolated Host boots on an OS-assigned port, in its own home` (the home is inside the test's scratch dir; never `:3080`) | The daemon exposes exactly one endpoint, the socket file, and the real Host is never the operator's. **Not covered:** there is no audit of the write paths recorded by the whole suite against the allowed roots, and the `~/.dsh` / `~/.local/state` refusal (`src/lib/config.ts`) is a startup guard with no test asserting a refused attempt. |
+| FR-SEC-3 | P0 | partial | `security/bounds::state directory contents contain no credential values, only references` (scans the durable database and the raw file for credential-shaped markers and key-shaped literals); `security/bounds::the authority token is never readable through the IPC surface`; `persistence/crash::state directory permissions: the authority token is private to the operator account` (mode `0600`, directory not group/world accessible); CI's `package-shape` job (credential-shaped literals and internal endpoints in tracked files); the live layer resolves a credential by environment-variable **name** and never reads the value back (`test/live/live-route.mjs`) | Durable state and the token are measured clean, and no value is ever committed. **Not covered:** no synthetic sentinel is planted in config/env/host responses and traced through logs, error messages and tool results, so "never in logs or errors" rests on those scans plus code inspection rather than on a test of that path. |
+| FR-SEC-4 | P1 | not-implemented | — | No symlink or workspace-escape handling exists, and no test attempts one. `cwd` is recorded and replayed; it is not resolved or bounded. |
+| FR-SEC-5 | P1 | partial | `security/bounds::an event page is bounded by the configured maximum…`; `security/bounds::an oversized event frame is refused as oversize rather than buffered`; `security/bounds::host error details are bounded before they reach a caller`; `security/bounds::a hostile IPC line is refused without taking the daemon down` (a > 4 MiB line closes the connection and the daemon keeps serving); mutation `host-error-text-unbounded` (production) | Each declared bound is enforced at a real boundary. **Not covered:** no long randomized run asserts memory or per-session retention growth, or counters agreeing with observed growth. |
+| FR-SEC-6 | P2 | partial | The prohibition is written down ([`architecture.md`](architecture.md) §7 and §12, ADR 0002), and the security layer's own header states it exercises no network reachability because the Host's trust fence is not an auth layer. | The non-claim is explicit. **Not covered:** the planned test asserting that an untrusted-directory case is *reported* rather than blocked does not exist. |
 
-| Test id | Requirement | What it does | Observable oracle | Status |
-|---|---|---|---|---|
-| OR-1 | FR-CANCEL-2 | Start a real long-running child process through an agent turn; attempt cancellation | Claim about the subprocess is backed by an observed pid + exit/reap; otherwise reported as unobserved | blocked: needs a resolvable tool surface for the process and an isolated Host |
-| OR-2 | FR-CANCEL-2 | Negative control: cancel a turn whose process has already exited | No claim of "stopped by us"; report distinguishes already-exited from stopped | blocked (same dependency) |
-| OR-3 | FR-SEC-4 | Symlink escape attempt during an agent filesystem operation | Refused or safely resolved; no write outside the owned workspace, verified by scanning the escape target | planned |
-| OR-4 | FR-EXEC-2 | Carrier death while a child is demonstrably alive | Execution reported as unknown/running with evidence, never as stopped | blocked (needs the fixture) |
+### 3.6 Evidence, CI and reproducibility (`FR-EV2`)
 
----
-
-## 10. L9 — security, adversarial input and bounds (`SEC-*`)
-
-| Test id | Requirement | What it does | Observable oracle | Status |
-|---|---|---|---|---|
-| SEC-1 | FR-SEC-3 | Synthetic sentinel secrets planted in config/env and in Host responses | Zero occurrences in state files, logs, error messages, MCP results, or evidence artifacts | planned |
-| SEC-2 | FR-APPR-4 | Adversarial document/event text instructing the bridge to approve, or impersonating a human | No approval ever emitted; fake-Host log shows zero `respond` calls for those interactions | planned |
-| SEC-3 | FR-APPR-4 | Approval request whose text claims "already approved" / "urgent" | Still pending until a real caller intent arrives | planned |
-| SEC-4 | FR-SEC-1 | Cross-session/cross-task isolation under interleaved traffic | No data or event crosses tasks (fake Host and live both) | planned |
-| SEC-5 | FR-SEC-2 | Filesystem scope audit of the whole suite | Recorded write paths all inside allowed roots; no write to a real DSH home, other repos, or port 3080 | planned |
-| SEC-6 | FR-SEC-5 | Memory/log growth bounds under a long randomized run | Configured caps respected; counters agree with observed growth | planned |
-| SEC-7 | FR-EV-7 | Cursor retention gap (`FR-EV-7`) | Typed "cursor expired" outcome with the documented refetch path; never a silent gap | planned |
-
----
-
-## 11. L10 — mutation / negative controls (`MT-*`)
-
-Negative controls exist to prove the suite can fail. Each mutates the implementation, runs a
-targeted suite, and **requires red**.
-
-| Test id | Requirement | Mutation | Required outcome | Status |
-|---|---|---|---|---|
-| MT-1 | FR-STATE-2 | Remove the durable-intent write before dispatch | `PX-2`/`PT-CR-1` fail | planned |
-| MT-2 | FR-STATE-2 | Allow one blind re-send after an unknown outcome | `PX-3`/`PT-CR-1` fail (duplicate dispatch observed) | planned |
-| MT-3 | FR-STATE-4 | Map `uncertain` to success | `PX-3`, `FH-6`, `OR-4` fail | planned |
-| MT-4 | FR-OWN-1 | Replace the atomic claim with check-then-delete | `PT-OWN-1`/`PX-5` fail (two owners or manual cleanup needed) | planned |
-| MT-5 | FR-APPR-1 | Auto-approve on timeout / on reconnect | `SEC-2`/`SEC-3`/`IH-4` fail | planned |
-| MT-6 | FR-EV-3 | Ignore gaps instead of reporting/reconciling | `FH-2`/`PT-EV-1` fail | planned |
-| MT-7 | FR-CANCEL-2 | Claim subprocess stopped without evidence | `OR-1`/`OR-2` fail | planned |
-| MT-8 | FR-MCP-3 | Fabricate success for an unsupported method | `FH-8`/`ME-3` fail | planned |
-
-Mutation runs are a shard in CI (targeted, time-bounded), not a full-suite pass.
-
----
-
-## 12. L11 — CI (`CI-*`)
-
-| Test id | Requirement | What it does | Observable oracle | Status |
-|---|---|---|---|---|
-| CI-1 | FR-EV2-3 | Linux + macOS matrix, frozen lockfile install | Both jobs green from `--frozen-lockfile`; no network install drift | planned |
-| CI-2 | FR-EV2-3 | Counts reported distinctly | Report shows failed / skipped / timed-out as three separate numbers; a skipped live suite is visibly skipped | planned |
-| CI-3 | FR-EV2-4 | Untrusted PR context (fork-like) | No secret is available to the job; live suite cannot run even if requested | planned |
-| CI-4 | FR-EV2-5 | Machine-readable per-layer JSON artifacts | Artifact contains per-layer results with test ids, statuses, durations, seeds | planned |
-| CI-5 | FR-EV2-6 | Coverage for critical modules | Report names the critical modules (state store, ownership, event cursor, approval binding, host client) with the oracle for each | planned |
-| CI-6 | FR-EV2-3 | Timeout policy per suite, reported as timeout (not failure) | A deliberately hung test is reported as timed out, distinctly | planned |
-| CI-7 | FR-SEC-3 | Secret scanner over the working tree and artifacts | Fails the build on any hit | planned |
-
----
-
-## 13. L12 — soak (`SOAK-*`)
-
-| Test id | Requirement | What it does | Observable oracle | Status |
-|---|---|---|---|---|
-| SOAK-1 | FR-EV2-7 | Resumable runner: real wall-clock duration, restart checkpoints, continuity counters, gap counts | JSON + human report per checkpoint; resuming continues rather than restarting | planned (short smoke only) |
-| SOAK-2 | FR-EV2-7 | Multi-day observation | Real elapsed time ≥ the claimed window, with continuity evidence | **blocked**: explicitly a later measured milestone. A short smoke run is not multi-day proof, and no document may claim it. |
-| SOAK-3 | FR-EV2-7 | No automatic multi-day paid loops | The runner refuses to start a multi-day paid configuration without explicit operator intent | planned |
+| Req | Pri | Status | Test id(s) | Evidence, and what is not covered |
+| --- | --- | --- | --- | --- |
+| FR-EV2-1 | P0 | partial | This document is the audit: every row above carries a status, and §7 carries the commands and counts. | **Not covered:** nothing fails the build when a requirement loses its test; the mapping is maintained by hand, so a missing row is a documentation bug rather than a red test. |
+| FR-EV2-2 | P0 | measured | All three property cases print `[seeded property] seed=<n> rounds=<n> (replay with DSH_PILOT_SEED=<n>)` at the **start** of every run, not only on failure, and read the seed back from `DSH_PILOT_SEED` (`test/property/model.test.mjs`); the PRNG is `mulberry32`, so one seed replays identically on any platform, and each failure message repeats the seed and round | A failure that cannot be replayed is impossible by construction. |
+| FR-EV2-3 | P0 | partial | `.github/workflows/ci.yml` runs the deterministic layers plus the negative controls on `ubuntu-latest` and `macos-latest`, installs dev tooling with `npm ci`, asserts zero runtime dependencies, builds the sources and runs the `typecheck` / `typecheck:contract` / `typecheck:tests` configs, prints `passed/failed/skipped/timedOut` as separate numbers, and appends a per-layer table to the job summary. | The workflow exists and is written to do this. **Not covered:** no run of that workflow has been observed or recorded, so nothing here claims a two-platform result. What *is* measured is one macOS run of the same command (§7). |
+| FR-EV2-4 | P0 | partial | The workflow declares `permissions: contents: read`, references no secret, and has no job that can reach the live layer; the live suite is local and opt-in only. | **Not covered:** no fork-context run is recorded; this is workflow inspection. |
+| FR-EV2-5 | P1 | partial | `DSH_PILOT_JSON=<path> node test/run.mjs` writes a report containing `counts`, per-layer counts, `layerNotes`, `liveSuite` and every test id with its status and duration (this run's report: `.local/evidence-default-run.json`); CI consumes and uploads it. | Per-test ids and statuses are machine-readable. **Not covered:** no artifact is committed, and the JSON has no per-test seed field. |
+| FR-EV2-6 | P1 | partial | §6 of this document names the critical modules and the measured test id for each behaviour. No percentage is reported anywhere. | **Not covered:** no coverage tool is wired in, and no artifact carries the module→test mapping. |
+| FR-EV2-7 | P2 | partial | `test/soak/run.mjs` is resumable, records wall clock *and* monotonic segments *and* the gaps between them, records checkpoint failures rather than retrying them, refuses to start without a bound, and reports `meetsMultiDayMilestone` only when 48 h of monotonic coverage has no unexplained gap; CI runs a bounded smoke (`--smoke --minutes 1`). | The runner exists and its short mode is exercised. **Blocked part:** the 48-hour milestone needs real elapsed time that has not been spent, so no multi-day figure is claimed anywhere in this repository — 48 h of monotonic coverage is a later milestone, not a result. |
 
 ---
 
-## 14. Coverage targets (behavioural, not a percentage)
+## 4. Negative controls
 
-Coverage must be *meaningful for critical modules*, so the matrix tracks these modules
-explicitly rather than one global number:
+A green suite proves nothing on its own; it may simply be unable to fail. `test/mutation/run.mjs`
+copies the tree to a scratch root, applies exactly **one** defect, and requires the target suite to
+go RED. It never mutates the working tree, and it verifies that each mutation applied (a stale
+anchor is an error, not a silent no-op).
 
-| Critical module | Behaviour that must be covered | Primary layers |
-|---|---|---|
-| Durable state store (journal, intent records, replay, versioning) | write-before-dispatch, crash replay, corruption/ENOSPC/EACCES, version refusal | L1, L2, L3 |
-| Ownership / lease | atomic claim, refusal, expiry reclaim, no manual cleanup, resume-after-loss | L2, L3 |
-| Event ingest & cursor | paging, dedupe, gap detection + refetch, retention floor, bounds | L2, L4, L5 |
-| Approval / interaction binding | pending-until-intent, exact correlation, stale/replay refusal, receipt semantics | L1, L2, L4, L9 |
-| Cancellation scopes | turn vs queue separation, uncertain outcomes, subprocess evidence | L1, L4, L8 |
-| Host client carrier | envelopes, echo verification, error-code mapping, WS lifecycle, oversize, trust fence authority | L1, L4, L6 |
-| MCP face | real stdio handshake, strict schemas, unsupported reporting, cancellation | L5 |
+| Control | Kind | Mutates | Must break |
+| --- | --- | --- | --- |
+| `durable-intent-after-send` | production | `src/lib/daemon.ts` | `test/persistence` (the `dispatching` row no longer precedes the send) |
+| `ack-loss-reported-as-success` | production | `src/lib/daemon.ts` | `test/fake-host` (an unprovable outcome recorded as success) |
+| `duplicate-rows-written` | production | `src/lib/store.ts` | `test/unit` (`store dedupe`) |
+| `stale-terminal-event-closes-turn` | production | `src/lib/daemon.ts` | `test/fake-host` (any terminal event closes the turn) |
+| `approval-authority-not-checked` | production | `src/lib/daemon.ts` | `test/security` (a decision without the operator token) |
+| `gap-smoothed-over` | production | `src/lib/daemon.ts` | `test/property` (a holed stream reported as complete) |
+| `session-create-id-not-reused-on-retry` | production | `src/lib/daemon.ts` | `test/fake-host` (one logical session becomes two Host sessions) |
+| `second-owner-not-refused` | production | `src/lib/owner-lock.ts` | `test/unit` (a refused handle treated as acquired) |
+| `host-error-text-unbounded` | production | `src/lib/adapter.ts` | `test/security` (a peer's size becomes our size) |
+| `cancel-ack-claims-subprocess-stop` | production | `src/lib/daemon.ts` | `test/fake-host` (ack reported as process evidence) |
+| `mcp-unknown-arguments-accepted` | production | `src/lib/mcp-tools.ts` | `test/mcp-e2e` (a typo silently ignored) |
+| `fake-host-ignores-preallocated-session-id` | **fixture** | `test/fixtures/fake-host.mjs` | `test/fake-host` |
 
-A row here is satisfied by a named test id above, never by "line coverage of this file".
+Measured on this machine (`node test/mutation/run.mjs`, re-run during this documentation pass;
+machine-readable report at `.local/evidence-mutations.json`):
+
+```
+mutations=12 caught=12 survived=0 invalid=0
+  production: 11/11 caught — production code in lib/ (evidences this bridge)
+  fixture:    1/1  caught — fixture fidelity (evidences the FAKE HOST, not this bridge)
+  required obligations: 11/11 have a caught negative control
+```
+
+Two of those catches are the reason the hang and timeout rules exist rather than being theory:
+
+- `second-owner-not-refused` was caught **by a HANG** — `test/unit` never finished inside the
+  runner's 300 s ceiling, because a refusal path that no longer refuses blocks its caller instead
+  of failing it. Counting non-termination as detection is what stopped a real defect from being
+  reported as a surviving control.
+- `stale-terminal-event-closes-turn` was caught by three **timeouts** in `test/fake-host` (all
+  sessions idle; turn closed by an authoritative event; wait returns a closed-set reason), which is
+  the same class of observation.
+
+Rules this runner follows and reports:
+
+- **`kind` decides what a caught control proves.** A `production` control mutates `src/`, so it
+  evidences *this bridge*. A `fixture` control mutates our own fake Host, so it evidences *fixture
+  fidelity* only — the summary splits the two counts on purpose, because collapsing them would
+  overstate what has been demonstrated.
+- **`survived`** — the target suite stayed green with the defect applied — is a failure of the
+  runner, and the exit code is non-zero.
+- **`invalid`** — the mutation left the file unparseable (`node --check` fails), or the target run
+  produced no tests at all — is reported separately from `survived`, because a build broken before
+  the first assertion is not evidence about a missing control.
+- **A mutation that makes the suite HANG is counted as caught.** Non-termination is an observable
+  defect: a refusal path that no longer refuses blocks its caller instead of failing it.
+- The summary ends with an **obligation table** — `owner-exclusion`, `output-bounds`,
+  `cancel-local-only`, `uncertainty-not-success`, `durable-intent-before-send`,
+  `turn-boundary-authority`, `approval-authority`, `event-identity`, `stream-completeness`,
+  `session-identity`, `tool-schema-strictness` — and names any obligation with no caught control,
+  rather than letting "N of M caught" be read as "every required control exists". An obligation is
+  marked covered only by a **caught** control whose declared `protects` text names it, never by a
+  test's name.
 
 ---
 
-## 15. What this matrix does NOT claim
+## 5. Supported and unsupported capabilities
 
-- No row is executed. `measured` appears exactly once (`IH-0`, the Phase-0 fixture probe).
-- `blocked` rows are dependencies, not failures and not passes.
-- The live suite has never been run; nothing in this repository may be described as
-  "verified against deepseek-flash" until `LIVE-1`…`LIVE-5` actually run and link evidence.
-- Default CI can never produce a full-pass claim while any row is skipped or blocked; the
-  reports must carry the three distinct counts and the blocked list.
+### 5.1 Supported, with the evidence that says so
+
+| Capability | Evidence |
+| --- | --- |
+| Real MCP server over stdio, 11 tools, strict schemas | `mcp-e2e/stdio::handshake…`, `mcp-e2e/stdio::invalid arguments…` |
+| Durable single-owner daemon behind N thin gateways over a local socket | `security/bounds::IPC is a local socket with 0600 permissions…`, `unit/core::IPC framing…` |
+| Kernel-enforced single ownership; dead-owner reclaim with no manual cleanup | `test/unit/owner-lock.test.mjs` (7 cases), `test/persistence/crash.test.mjs` (`SIGSTOP`, `SIGKILL`) |
+| Durable-before-send intents; `uncertain` as a first-class, inspectable state; no auto-retry | `unit/core::durable-before-send…`, `fake-host/contract::dropped ack…`, `persistence/crash::SIGKILL during dispatch…` |
+| Restart recovery with a reported sweep (`health.recovery`) and per-operation inspection (`ops.get`) | `persistence/crash::SIGKILL during dispatch…`, `live/live::a SIGKILL during a live turn…` |
+| Event ingest with native-sequence dedupe, explicit completeness and gap ranges; bounded pages | `property/model::*` (3 cases), `fake-host/contract::a silent frame gap…`, `security/bounds::an event page is bounded…` |
+| Bounded waits with a closed-set reason; waiting is not cancelling | `fake-host/contract::wait returns a closed-set reason…`, `mcp-e2e/stdio::cancelling a wait…` |
+| Turn cancellation with an honest "no subprocess evidence" report | `fake-host/contract::cancel is turn-scoped…`, `isolated-host/turns::cancel is reported as a turn-level ack…` |
+| Approval listing, operator-only decision with stale/duplicate refusal, and no model-reachable approval tool | `fake-host/contract::an approval decision requires the operator token…`, `security/bounds::an unauthenticated caller cannot decide an approval…` |
+| Capability negotiation against a real Host without protocol errors | `isolated-host/host::the bridge attaches to a real Host and reaches ready without a protocol error` |
+| Real turns end-to-end against a real Host with a deterministic loopback mock provider | `isolated-host/turns::*` (6 cases), `test/fixtures/mock-provider.mjs` |
+| Real turns against the operator's real route, with a budget the layer cannot exceed | `live/live::*` (5 cases), `LIVE_BUDGET` + `sharedBudget` |
+| TypeScript sources under `src/` compiled by `tsc` to `dist/`, which is what every layer runs; protocol surface checked with the Node type surface removed | `npm run build`, `npm run typecheck:contract`, `npm run typecheck:tests` — 0 errors |
+
+### 5.2 Not implemented (do not ask the bridge for these)
+
+| Not implemented | What happens today |
+| --- | --- |
+| `session.export` (session-log ZIP) | Never called. The Host route exists; the bridge does not use it, because a session log is sensitive by definition and is never produced, committed or published. |
+| MCP **resources** | The face is tools only: `initialize` advertises `capabilities: {tools: {listChanged: false}}` and `tools/list` returns the 11 tools. |
+| A `streamable-http` MCP transport | stdio only. A listener would need its own ADR and a different trust story. |
+| Host-side queue removal (`session.updateQueue` remove) | `queue.clear` clears the daemon's own queue and reports `remoteScope.cleared: false` with the reason. |
+| Positive process-level evidence that a subprocess stopped | `processEvidence.observed` is always `false`, with the reason. |
+| Symlink / workspace-escape handling | `cwd` is recorded and replayed, not resolved or bounded. |
+| Cursor retention floor / typed "cursor expired" by age | `CURSOR_EXPIRED` means a store-generation mismatch only. |
+| Journal rotation or compaction | No rotation; a size cap is configured but not enforced by a tested mechanism. |
+| 48-hour soak | A resumable runner and a bounded smoke run exist; the multi-day figure is a later milestone. |
+| MCP progress notifications | Not emitted. |
+
+### 5.3 Unsupported upstream at the measured pin
+
+These are the Host's limits, not ours, and the bridge must report them rather than work around them.
+Full detail and sources: [`host-compatibility.md`](host-compatibility.md) §5.4 (unsupported at this
+pin) and §2.3 (measured drift between published versions).
+
+| Unsupported upstream | Evidence |
+| --- | --- |
+| Cursor pagination on `session.list` | contract: "cursor is a reserved seat, unimplemented" |
+| Mux `since` resume | contract: "unimplemented in v1 (ignored if passed)" — hence reconnect = reopen **and** refetch |
+| Any client→host traffic on the WebSocket | contract: a protocol violation |
+| Any authentication/authorization layer for `/api` | contract: the trust fence "is not an auth layer" |
+| `command.execute` / `command.list` | absent from the method map at this pin (present in an older published tree); asserted not to answer `ok:true` in `isolated-host/host::the unverified method set is reported…` |
+| A Host-observable stop receipt for tool subprocesses | no such method or frame in the contract |
+
+---
+
+## 6. Coverage statement
+
+Coverage here means "a named test decides this behaviour", not a percentage of lines. A row is
+satisfied by the test id in it, never by "line coverage of this file".
+
+| Critical module | Behaviour that must be covered | Covered by | Gaps |
+| --- | --- | --- | --- |
+| Durable state (`src/lib/store.ts`) | write-before-send ordering, idempotency-key conflict, illegal transition refusal, version refusal, corruption, dedupe by native sequence | `unit/core::durable-before-send…`, `unit/core::idempotency key returns the same operation…`, `unit/core::illegal operation transitions are refused, not coerced`, `unit/core::a state file from a newer bridge is refused, not misread`, `unit/core::corrupt storage is reported with evidence preserved`, `property/model::idempotency keys under repeated submission…` | no `ENOSPC`/`EACCES`; no growth bound; no crash-interleaving model |
+| Ownership (`src/lib/owner-lock.ts`) | exclusive mode read back from the holder, refusal of a cooperating and an uncooperative second writer, process-level refusal, inode stability, stale marker, `SIGSTOP`/`SIGKILL` | `test/unit/owner-lock.test.mjs` (7 cases), `test/persistence/crash.test.mjs` (`SIGSTOP`, two-daemon, lock probe) | no foreign-writer detection; no ownership-transition journal |
+| Event ingest and cursors (`src/lib/daemon.ts`, `src/lib/store.ts`) | dedupe, gap detection and reporting, reconnect + refetch convergence, completeness verdict, bounded pages, oversize refusal | `property/model::*` (3 cases), `fake-host/contract::a silent frame gap…`, `fake-host/contract::disconnect then reconnect…`, `security/bounds::an event page is bounded…`, `security/bounds::an oversized event frame is refused as oversize…` | no retention floor; no real-Host reconnect |
+| Approval / interaction binding (`src/lib/daemon.ts`, `src/lib/ipc.ts`) | authority token required, unauthenticated refusal, stale and duplicate refusal, no model-reachable decide path, adversarial text answers nothing | `fake-host/contract::an approval decision requires the operator token…`, `security/bounds::an unauthenticated caller cannot decide an approval…`, `fake-host/contract::prompt text that demands approval authorizes nothing` | no `not-pending` receipt assertion; no wrong-turn binding; no rejected/expired history |
+| Cancellation scopes (`src/lib/daemon.ts`) | turn-scoped cancel, separate local queue scope, no fabricated subprocess evidence | `fake-host/contract::cancel is turn-scoped…`, `isolated-host/turns::cancel is reported as a turn-level ack…` | Host queue removal absent; no double-cancel test; no disconnect-during-cancel test |
+| Host client carrier (`src/lib/adapter.ts`, `src/lib/ws-client.ts`) | envelope and rpcId echo, error-code mapping (including an unknown code), capability probe, detail bounds, `426` on plain GET, real WebSocket frames | `unit/core::capability negotiation…`, `unit/core::host error details are sanitised…`, `fake-host/contract::a plain GET on the event downlink is refused with 426…`, `fake-host/contract::an unknown host error code is surfaced as unknown…`, `security/bounds::host error details are bounded…` | no resolved-tree pin test; no `HOST_UNREACHABLE` assertion |
+| MCP face (`src/lib/gateway.ts`, `src/lib/mcp-tools.ts`, `src/lib/mcp-protocol.ts`) | real stdio handshake, strict schemas, JSON-RPC error mapping, framing resilience, fail-closed startup, no approval tool | `test/mcp-e2e/stdio.test.mjs` (8 cases) | in-flight cancellation not honoured early; no progress notifications |
+| Isolation of official-Host behaviour | real boot, `426` on both downlinks, a real turn to an authoritative end, a real tool effect on disk, a refused sandbox write carried through, a provider failure that is not a completion, two isolated sessions, an honest cancel | `test/isolated-host/*.test.mjs` (10 cases, opt-in) | turn-level cases are opt-in and therefore skipped in the default run |
+| Live behaviour against a real route (`test/live/`) | one real turn; three sessions recalling only their own fact; parallel widths 2/4/8; `SIGKILL` in flight; budget adherence | `test/live/live.test.mjs` (5 cases, opt-in) | never in CI; only one recorded run |
+
+---
+
+## 7. Exact evidence
+
+Versions on this machine: Node `v24.15.0`, `darwin/arm64`, SQLite `3.51.3` through `node:sqlite`,
+`process.binding('fs').flock === undefined`, zero runtime dependencies.
+
+| Command | Observed result | Provenance |
+| --- | --- | --- |
+| `node test/run.mjs` | `passed=64 failed=0 skipped=10 timedOut=0`, 57 s wall clock; per layer: unit 21/0/0/0, property 3/0/0/0, fake-host 17/0/0/0, persistence 6/0/0/0, mcp-e2e 8/0/0/0, isolated-host 0/0/**10**/0, security 9/0/0/0; `live suite: SKIPPED (opt-in; not selected on this run)` | re-run during this documentation pass; report at `.local/evidence-default-run.json` |
+| `node test/run.mjs test/isolated-host --isolated` | `10 passed, 0 failed, 0 skipped` — a real DSH Host booted in its own `DSH_HOME` on an OS-assigned port, routed exclusively at a loopback mock provider | recorded opt-in run on this machine; **not** re-run during this pass |
+| `node test/run.mjs test/live --live` | `5 passed, 0 failed`, 93 s of a 20-minute ceiling; nowhere near the 8-session concurrency ceiling | recorded opt-in run on this machine; **not** re-run during this pass, because it spends real provider quota |
+| `npm run build` | 0 errors during the `src/` migration (`src/**/*.ts` → `dist/`, `strict` + `noImplicitAny` on — the artifact every layer above runs) | the migration's own measurement, recorded in ADR 0001 §2; **not** re-run during this pass |
+| `npm run typecheck:contract` | 0 errors (`src/lib/errors.ts`, `src/lib/mcp-tools.ts`, `src/lib/mcp-protocol.ts`, Node type surface removed) | re-run during this pass |
+| `npm run typecheck:tests` | 0 errors (`test/**/*.mjs` checked against the declarations emitted into `dist/`) | re-run after the daemon migration |
+| `node test/mutation/run.mjs` | `mutations=12 caught=12 survived=0 invalid=0`; `production: 11/11`, `fixture: 1/1`, `required obligations: 11/11 have a caught negative control`; one control was caught by a hang, none survived and none was invalid | re-run during this documentation pass; report at `.local/evidence-mutations.json` |
+| `node test/soak/run.mjs --minutes N` | bounded smoke only; the multi-day figure is not produced | — |
+
+Two things this table deliberately does **not** contain: no CI run from a hosted runner (no such run
+has been observed), and no multi-day soak.
+
+The seeded property layer prints its seed on every run, e.g.
+`[seeded property] seed=20260912 rounds=40 (replay with DSH_PILOT_SEED=20260912)`; replay with
+`DSH_PILOT_SEED=<seed> node test/run.mjs test/property`.
+
+---
+
+## 8. What is not implemented
+
+Stated plainly, because a capability that is only *named* in an architecture section is not a
+capability:
+
+| Not implemented | Reason | Where it stands |
+| --- | --- | --- |
+| **Session export** (`session.export`) | A produced ZIP is a real session log by definition, and this project never produces, commits, attaches or quotes one | The Host route exists and is documented in [`host-compatibility.md`](host-compatibility.md) §3; the bridge never calls it |
+| **MCP resources** | The face is deliberately tool-only; every capability maps 1:1 onto one daemon op | `initialize` advertises tools only; `tools/list` returns 11 tools |
+| **`streamable-http` MCP transport** | It would open a listener, which is a different trust story and needs its own ADR | stdio only |
+| **Host-side queue removal** | Needs a queue item id observed from the Host's `session/queue` snapshot | `queue.clear` clears the local queue and reports `remoteScope.cleared: false` |
+| **Positive subprocess-stop evidence** | The Host contract has no receipt for child-process termination | `processEvidence.observed` is always `false`, with the reason |
+| **48-hour soak** | Real elapsed time has not been spent | `test/soak/run.mjs` exists and has only been run as a bounded smoke (CI uses `--minutes 1`); the 48-hour figure is a later milestone and is claimed nowhere |
+| **A 48-hour or multi-day reliability claim of any kind** | Same as above | No document in this repository claims one |
+
+---
+
+## 9. What this matrix does not claim
+
+- No row above says `measured` without naming the test that measured it.
+- `partial` means exactly that: implemented, partly proven, with the gap written in the row. It is
+  never to be quoted as passing.
+- `unverified` means implemented-but-unasserted; `not-implemented` means the capability is absent,
+  and the reason says which of the two a reader is looking at. Neither is a pass.
+- `blocked` items are dependencies on something outside this repository (real elapsed time, or an
+  upstream observable that does not exist), not failures and not passes.
+- The default run skips the entire isolated-Host layer (10 skips) and never selects the live layer.
+  A default green run is therefore **not** evidence about the official Host or about a real model.
+- The fake Host is our own code. A green fake-Host run is evidence about our client only, and this
+  document never presents it as evidence about the official Host.
+- The live layer ran once and is opt-in; nothing here is a standing claim about provider behaviour,
+  and no endpoint or credential value appears in this repository — the credential is referred to by
+  environment-variable name only.
+- Requirement `FR-OWN-4` is recorded as `not-implemented` on purpose: the delivered design rejects
+  the lease the requirement describes, and the measured behaviour is the opposite one.
+- No test audits coverage percentages, and no percentage is reported.

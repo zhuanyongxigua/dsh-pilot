@@ -18,7 +18,7 @@
 
 import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
-import { acceptWebSocket } from '../../lib/ws-client.js';
+import { acceptWebSocket } from '../../dist/lib/ws-client.js';
 
 /** One fake host instance, listening on an ephemeral port. */
 export class FakeHost {
@@ -226,7 +226,8 @@ export class FakeHost {
    * @param {import('node:http').ServerResponse} res
    */
   #handleHttp(req, res) {
-    const url = new URL(req.url, 'http://localhost');
+    // `req.url` is always set on a real HTTP request; the fallback only satisfies its declared type.
+    const url = new URL(req.url ?? '', 'http://localhost');
     const chunks = [];
     req.on('data', (chunk) => chunks.push(chunk));
     req.on('end', async () => {
@@ -421,7 +422,8 @@ export class FakeHost {
     // A socket destroyed mid-read raises ECONNRESET; on a fixture downlink that is an
     // expected end of life, so it must not take the test process down.
     socket.on('error', () => { try { socket.destroy(); } catch { /* already gone */ } });
-    const url = new URL(req.url, 'http://localhost');
+    // As in `#handleHttp`: an upgrade request always carries a url; this is only its declared type.
+    const url = new URL(req.url ?? '', 'http://localhost');
     if (url.pathname === '/api/events.mux') {
       const ws = acceptWebSocket(req, socket, () => {
         // Client messages on the downlink are a protocol violation in the real host.

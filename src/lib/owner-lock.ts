@@ -10,12 +10,19 @@
  *
  * The primitive used here is a kernel-enforced lock: a dedicated SQLite file opened in
  * `locking_mode=EXCLUSIVE`, with one committed write so the database file locks are actually
- * taken and held for the lifetime of the connection. The OS releases those locks when the
+ * taken and held for the lifetime of the connection.
+ *
+ * Measured detail worth knowing about that pragma: `locking_mode` is PER-CONNECTION state. A second
+ * connection to the same file reports `normal` however the holder opened it, so "is exclusion
+ * configured?" is not observable from outside the holder. That is why `describe()` reads the mode back
+ * from the holder's own handle, and why a test that probed a fresh connection measured nothing. The OS releases those locks when the
  * process dies, for any reason, including SIGKILL — so ownership is never stale, needs no
  * cleanup, and cannot be handed over while the holder lives.
  *
  * Measured on this machine (macOS, Node 24.15.0, SQLite 3.51.3), reproduced by
- * test/unit/owner-lock.test.mjs and test/persistence/owner-process.test.mjs:
+ * test/unit/owner-lock.test.mjs (the primitive: exclusive locking mode read back from the holder's own
+ * connection, an uncooperative second writer refused, inode stability, a process-level contender that
+ * must exit) and test/persistence/crash.test.mjs (the daemon-level SIGSTOP/SIGKILL behaviour):
  *   holder alive            -> contender refused
  *   holder SIGSTOPped       -> contender still refused   (a live-but-stopped owner keeps it)
  *   holder SIGCONTed        -> unchanged, exactly one owner
@@ -28,32 +35,76 @@
  */
 
 import { openSync, closeSync, statSync } from 'node:fs';
-import { BridgeError, ERROR_CODES } from './errors.js';
+import type { DatabaseSync } from 'node:sqlite';
+import { BridgeError, ERROR_CODES } from './errors.ts';
+
+/** What one acquisition attempt reports: a refusal always says why. */
+export type AcquireOutcome =
+  | { readonly acquired: true }
+  | { readonly acquired: false; readonly reason: string };
+
+/** What the HELD connection reports about itself, read back from its own handle. */
+export interface LockDescription {
+  readonly held: boolean;
+  readonly lockingMode: string | null;
+  readonly journalMode: string | null;
+}
+
+/** Platform self-check: whether exclusion behaves as the design requires on this platform. */
+export interface LockProbe {
+  readonly supported: boolean;
+  readonly secondRefused: boolean;
+  readonly inodeStable: boolean;
+  /** The holder's inode; present only when the probe acquired the lock. */
+  readonly inode?: number;
+  /** Why locking is unusable here; present only when `supported` is false. */
+  readonly reason?: string;
+}
 
 /** Held lock: one SQLite connection whose file locks live as long as this object. */
 export class OwnerLock {
-  #db = null;
-  #dbPath;
-  #markerPath;
+  #db: DatabaseSync | null = null;
+  #dbPath: string;
+  #markerPath: string;
   #held = false;
 
   /**
-   * @param {object} options
-   * @param {string} options.lockPath path of the exclusive lock database
+   * @param options.lockPath path of the exclusive lock database
    */
-  constructor({ lockPath }) {
+  constructor({ lockPath }: { readonly lockPath: string }) {
     this.#dbPath = lockPath;
     this.#markerPath = `${lockPath}.held`;
   }
 
-  get dbPath() { return this.#dbPath; }
-  get held() { return this.#held; }
+  get dbPath(): string { return this.#dbPath; }
+  get held(): boolean { return this.#held; }
 
   /**
-   * Try to become the owner. Never blocks, never retries, never reclaims.
-   * @returns {{acquired: true} | {acquired: false, reason: string}}
+   * Report what the HELD connection is actually doing, read back from the connection itself.
+   *
+   * Why this exists: `locking_mode` is per-connection state, so a fresh connection to the same file
+   * reports `normal` no matter how the holder opened it. That makes "is exclusion configured?" an
+   * unobservable claim from outside — and an unobservable claim cannot be tested, which is how the
+   * `owner-lock-not-exclusive` mutation survived a daemon-level test that looked thorough.
+   *
+   * The returned values come from `pragma` reads on the holder's own handle, so they describe the real
+   * state rather than a constant this class would otherwise be trusted to report.
    */
-  tryAcquire() {
+  describe(): LockDescription {
+    if (this.#db === null) return { held: false, lockingMode: null, journalMode: null };
+    const db = this.#db;
+    const read = (pragma: string): string | null => {
+      try {
+        const row = db.prepare(`pragma ${pragma}`).get();
+        const value = row ? Object.values(row)[0] : null;
+        return typeof value === 'string' ? value.toLowerCase() : null;
+      } catch { return null; }
+    };
+    return { held: true, lockingMode: read('locking_mode'), journalMode: read('journal_mode') };
+  }
+
+  /** Try to become the owner. Never blocks, never retries, never reclaims. */
+  tryAcquire(): AcquireOutcome {
     if (this.#db !== null) return { acquired: true };
     if (typeof process.getBuiltinModule !== 'function') {
       return { acquired: false, reason: 'runtime-unsupported' };
@@ -61,7 +112,7 @@ export class OwnerLock {
     const sqlite = process.getBuiltinModule('node:sqlite');
     if (!sqlite?.DatabaseSync) return { acquired: false, reason: 'sqlite-unavailable' };
 
-    let db;
+    let db: DatabaseSync | undefined;
     try {
       db = new sqlite.DatabaseSync(this.#dbPath, { timeout: 0 });
       db.exec('pragma locking_mode=EXCLUSIVE');
@@ -84,9 +135,8 @@ export class OwnerLock {
   /**
    * Acquire or throw a typed refusal. The error deliberately carries no PID: a PID would
    * invite exactly the check-then-delete pattern this class exists to remove.
-   * @returns {void}
    */
-  acquire() {
+  acquire(): void {
     const result = this.tryAcquire();
     if (!result.acquired) {
       throw new BridgeError(
@@ -98,7 +148,7 @@ export class OwnerLock {
   }
 
   /** Release explicitly (orderly shutdown). The kernel also releases it on process death. */
-  release() {
+  release(): void {
     if (this.#db === null) return;
     try { this.#db.close(); } catch { /* closing a dead handle must not mask shutdown */ }
     this.#db = null;
@@ -109,9 +159,8 @@ export class OwnerLock {
    * Write a zero-byte private marker so an operator can see which directory is claimed.
    * Purely informational: the marker is never read to decide ownership, and deleting it
    * would not release anything.
-   * @returns {void}
    */
-  writeMarker() {
+  writeMarker(): void {
     try {
       const fd = openSync(this.#markerPath, 'w', 0o600);
       closeSync(fd);
@@ -123,10 +172,8 @@ export class OwnerLock {
  * Report whether this platform's exclusion behaves as the design requires, without leaving
  * anything behind. Used by startup self-check and by a unit test that fails loudly on a
  * platform whose locking is a no-op.
- * @param {string} lockPath
- * @returns {{supported: boolean, secondRefused: boolean, reason?: string}}
  */
-export function probeLocking(lockPath) {
+export function probeLocking(lockPath: string): LockProbe {
   const first = new OwnerLock({ lockPath });
   const second = new OwnerLock({ lockPath });
   try {

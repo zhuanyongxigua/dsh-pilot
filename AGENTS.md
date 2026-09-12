@@ -17,9 +17,12 @@ first change; sections 2, 4, and 7 are the ones newcomers get wrong.
 
 ## 2. Architecture in one paragraph
 
-Three faces, one spine. The **MCP face** is a real MCP server (official SDK) exposing tools and
-resources to whatever client spawns it. The **Host client face** is a locally implemented HTTP +
-WebSocket client for the DSH `/api` surface: control traffic is `POST /api/<method>`, two WebSocket
+Three faces, one spine. The **MCP face** is a real MCP server speaking the official MCP wire
+protocol directly — newline-delimited JSON-RPC 2.0 over stdio, hand-implemented, because this project
+has zero runtime dependencies and no MCP SDK is used — exposing tools to whatever client spawns it.
+(There are no MCP resources or prompts: the surface is tools only.)
+
+The **Host client face** is a locally implemented HTTP + WebSocket client for the DSH `/api` surface: control traffic is `POST /api/<method>`, two WebSocket
 downlinks stream events, and approvals and user-questions are answered with `POST /api/respond`. The
 **durable local state** records every intent before it is sent and reconciles after a restart, since
 most host methods have no idempotency key. The **domain layer** between the faces is the only place
@@ -27,7 +30,7 @@ MCP tool semantics and Host wire semantics meet, and owns lifecycle, queue, and 
 
 | Face / layer | Owns | Must not |
 | --- | --- | --- |
-| MCP face | MCP protocol wiring, tool/resource schemas, JSON-RPC framing, client-facing errors | Contain HTTP, WebSocket, or session semantics |
+| MCP face | MCP protocol wiring, tool schemas, JSON-RPC framing, client-facing errors | Contain HTTP, WebSocket, or session semantics |
 | Domain layer | Session lifecycle, intent records, reconciliation, cancellation scopes, capability negotiation | Speak raw HTTP/WS; know MCP tool names |
 | Host client face | `/api` envelopes, rpcId minting, WS downlinks, `/api/respond`, `session.export` | Decide business meaning; retry non-idempotent calls on its own initiative |
 | Durable state | Journal, intent records, replay, durable-before-accepted ordering | Hold credentials or secrets; be treated as an optional cache |
@@ -54,19 +57,63 @@ Allowed dependency direction is one way: `mcp face -> domain -> host client -> d
 Anything pointing backwards is a review blocker.
 
 - **Contract and protocol code stays free of Node-only APIs.** No `node:*`, `Buffer`, `process`, or
-  filesystem/socket access where wire shapes, schemas, or capability tables are defined. DSH takes the
-  same posture in its contract layer; enforce it with lint or a dedicated tsconfig.
+  filesystem/socket access where wire shapes, schemas, or capability tables are defined. This is no
+  longer a convention: `tsconfig.contract.json` compiles `src/lib/errors.ts`, `src/lib/mcp-tools.ts` and
+  `src/lib/mcp-protocol.ts` with the Node type surface REMOVED (`"types": []`), so such an access is a
+  build failure. `npm run typecheck:contract` is a CI gate. `src/lib/gateway.ts` is the stdio transport and
+  is excluded on purpose — it legitimately needs streams, which is why the Node-free protocol surface
+  lives in `src/lib/mcp-protocol.ts` and the loop receives its process facilities as values instead of
+  reading the Node global object.
 - **The MCP face and the Host client face meet only in the domain layer.** A tool handler never
   builds an HTTP request, mints an `rpcId`, or touches the WebSocket; the Host client never imports a
   tool definition or an MCP type.
 - **No reaching into another layer's internals.** Import through each layer's public entry point
   only: no deep cross-layer relative imports, no poking at another module's private fields.
-- **Types-only dependency.** `@deepseek-ai/dsh-host-apiproxy` is consumed for **types only**, via
-  `import type`, as the source of truth for payload types, error codes, and capability shape. It also
-  ships runtime JS, so the policy is enforced by lint, compiler settings, and review rather than by
-  the package shape. See `docs/adr/0001-language-runtime-and-dependency-posture.md`.
+- **No dependency on `@deepseek-ai/dsh-host-apiproxy`, not even for types.** An earlier revision of
+  this file required it as a types-only source of truth. That was never adopted and is not the
+  delivered posture: the package is not a dependency in any form, and the Host's payload types, error
+  codes and capability shape are modelled in `src/lib/adapter.ts` and `src/lib/errors.ts` and pinned by
+  `PINNED_METHODS` (52 names) and `PINNED_ERROR_CODES` (39 codes). Written out deliberately rather
+  than silently deleted, because a stale rule that contradicts the code is worse than no rule. See
+  `docs/adr/0001-language-runtime-and-dependency-posture.md` and
+  `docs/host-compatibility.md` for the measured contract.
 - **No dependency on any pre-existing "Agentlink" project**, runtime or dev time. Fixtures, helpers,
   and protocol code are ours.
+- **Type checking is part of the design, and it is a gate.** The implementation is **TypeScript**
+  under `src/`, compiled by `tsc` to `dist/`; the suites and the shipped binaries run the compiled
+  output. Three gates, all run in CI and all runnable by hand:
+
+  | Gate | Command | Covers |
+  | --- | --- | --- |
+  | Build | `npm run build` | `src/**/*.ts` → `dist/` with `strict` **and `noImplicitAny`** on |
+  | Contract surface is Node-free | `npm run typecheck:contract` | `src/lib/{errors,mcp-tools,mcp-protocol}.ts` compiled with the Node type surface removed (`types: []`) |
+  | Test layer against the emitted types | `npm run typecheck:tests` | `test/**/*.mjs` (`allowJs`+`checkJs`, `strict`, `noImplicitAny: false` — tests may have unannotated locals; nullability and `unknown` narrowing are still enforced) |
+
+  A green suite with an unchecked type surface is not acceptable, and an environment problem
+  installing a devDependency is never a reason to ship unchecked code: fix the install (a
+  task-owned cache or prefix is usually enough) or report a concrete blocker.
+- **`dist/` is generated, gitignored, and rebuilt — never committed and never edited.** Every gate
+  above and the mutation runner rebuild it, and `test/run.mjs` refuses to start without it. A change
+  that only exists in `dist/` does not exist.
+- **`src/` uses no `any`, and no type-check suppression of any kind.** `@ts-ignore`,
+  `@ts-expect-error` and `@ts-nocheck` appear nowhere in `src/` or `test/` — a suppressed error is a
+  deleted check, and this repository does not delete checks. Where a value is genuinely of unknown
+  type it is `unknown` and the code narrows it; `any` is never the answer, because `any` silently
+  disables checking rather than documenting uncertainty.
+- **A narrowing cast is permitted only at a documented dynamic boundary, and nowhere else.** The
+  honest cases are the ones where data crosses into this process from something that cannot promise a
+  shape: a `JSON.parse` result (the Host's reply envelope and `/api/respond` receipt in
+  `src/lib/adapter.ts`, a peer's parsed payload in `src/lib/mcp-tools.ts` and `src/lib/ids.ts`), and a
+  `node:sqlite` row read through a generic helper that cannot know its caller's row type
+  (`src/lib/store.ts`). Each such site carries a comment naming the boundary, and the runtime
+  validation that guards the value is a real check elsewhere in the same flow rather than the cast.
+  **The rule that matters: a cast must never be used to silence an error the type system just
+  found.** If a cast looks like the cheapest way to make something compile, that is the signal that
+  the code is wrong, not that the cast is needed — prefer a runtime check plus a type predicate,
+  which is what the ban on `any` exists to force.
+- The one permitted untyped view outside `src/` is the documented single cast in
+  `test/helpers.mjs`'s `ipcClient`, which exists because the test layer is the oracle for the
+  daemon's JSON reply frames and an oracle that must first be told the answer is not an oracle.
 
 ## 5. Compatibility and pinning
 
@@ -118,7 +165,9 @@ without a test that could fail.
 | Persistence and crash | real multi-process persistence, SIGKILL crash and restart, replay, reconciliation | yes |
 | Fake-Host contract | real HTTP and real WebSocket against a locally started fake Host, including the `426` upgrade behaviour and receipt shapes | yes |
 | MCP E2E (stdio) | the built binary spawned as a real MCP server over `stdio`, driven by a real MCP client | yes |
-| Live Host | opt-in only, against an isolated DSH Host | never |
+| Isolated official DSH Host | a real Host booted by the test in its own `DSH_HOME` on an ephemeral port, with the model route closed to a loopback fixture | opt-in |
+| Live Host | the operator's real provider route, bounded by constants (a total wall-clock ceiling, a concurrency ceiling, a minimum number of isolation rounds); the credential is referenced by environment-variable NAME only and never read back | never |
+| Negative controls | one deliberate defect at a time, applied to a scratch copy: a `production` control mutates `src/` and evidences this bridge, a `fixture` control mutates our own fake Host and evidences fixture fidelity only. A control that survives, or a run that executes no tests at all, fails the runner | yes |
 
 - **MCP is never replaced by direct internal function calls in E2E.** A test claiming to prove MCP
   behaviour must spawn the built binary and speak MCP over a real transport; calling the handler

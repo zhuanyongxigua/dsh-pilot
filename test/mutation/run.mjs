@@ -26,47 +26,77 @@ import { spawnSync } from 'node:child_process';
 const ROOT = resolve(new URL('../..', import.meta.url).pathname);
 
 /**
+ * Per-mutation wall-clock ceiling. A mutation that hangs the suite is a detection (see below), so this
+ * only needs to be long enough that an honest run finishes; every suite here is bounded and the slowest
+ * is well inside it.
+ */
+const MUTATION_TIMEOUT_MS = 300_000;
+
+/**
+ * One negative control: a deliberate defect in a named file, plus the suite that must go red.
+ * `kind` is what makes the summary honest — a control that mutates `test/fixtures/` evidences the
+ * fixture, not this bridge — and `protects` names the obligation the control is supposed to guard.
+ * @typedef {object} Mutation
+ * @property {string} name
+ * @property {'production'|'fixture'} kind
+ * @property {string} protects
+ * @property {string} why
+ * @property {string} file
+ * @property {string} find
+ * @property {string} replace
+ * @property {boolean} [keepTail] declared by some mutations; the runner reports the anchor verbatim
+ * @property {string} target
+ * @property {string} expectFailure
+ */
+
+/**
  * Each mutation pairs a deliberate defect with the negative control that must notice it.
- * @type {{name: string, why: string, file: string, find: string, replace: string, target: string, expectFailure: string}[]}
+ * @type {Mutation[]}
  */
 const MUTATIONS = [
   {
     name: 'durable-intent-after-send',
+    kind: 'production',
+    protects: 'durable intent: the intent reaches disk before the network write',
     why: 'Persisting the intent AFTER the network write would make a crash mid-send invisible, so "sent, outcome unknown" would silently disappear.',
-    file: 'lib/daemon.js',
-    find: `    if (fresh.state === 'pending') {
+    file: 'src/lib/daemon.ts',
+    find: `    if (freshRow.state === 'pending') {
       this.#store.markDispatching({
-        operationId: fresh.operation_id,
+        operationId: freshRow.operation_id,
         method,
         endpoint: \`/api/\${method}\`,
         payload,
       });
     }`,
     replace: `    // MUTATION: the dispatch intent is never committed before the send.
-    void fresh;`,
+    void freshRow;`,
     target: 'test/persistence',
     expectFailure: 'crash',
   },
   {
     name: 'ack-loss-reported-as-success',
+    kind: 'production',
+    protects: 'uncertainty: an unprovable outcome is never reported as success',
     why: 'Treating a lost acknowledgement as success converts "we do not know" into a false confirmation.',
-    file: 'lib/daemon.js',
+    file: 'src/lib/daemon.ts',
     find: `      this.#store.markUncertain({
-        operationId: fresh.operation_id,
+        operationId: freshRow.operation_id,
         reason: result.reason ?? 'unproven-outcome',
         evidence: { method, at: Date.now() },
       });`,
     keepTail: true,
     replace: `      // MUTATION: an unprovable outcome is recorded as a success.
-      this.#store.markAcknowledged({ operationId: fresh.operation_id, ok: true, value: { assumed: true } });`,
+      this.#store.markAcknowledged({ operationId: freshRow.operation_id, ok: true, value: { assumed: true } });`,
     target: 'test/fake-host',
     expectFailure: 'uncertain',
   },
   {
     name: 'duplicate-rows-written',
+    kind: 'production',
+    protects: 'event identity: one native sequence becomes exactly one durable row',
     why: 'Losing the store-side sequence check lets a redelivered frame become a second row whenever the caller has not already cached that sequence, which corrupts every count and page derived from the log.',
-    file: 'lib/store.js',
-    find: `      const before = this.get(
+    file: 'src/lib/store.ts',
+    find: `      const before = this.get<EventPresenceRow>(
         'select 1 as present from events where task_id = ? and session_id = ? and seq = ?',
         taskId, sessionId, seq,
       );
@@ -80,8 +110,10 @@ const MUTATIONS = [
   },
   {
     name: 'stale-terminal-event-closes-turn',
+    kind: 'production',
+    protects: 'turn boundaries: only the authoritative turn/end may close a turn',
     why: 'Closing a turn on any terminal event reports live work as finished, which is the exact failure the "authoritative turn/end" rule exists to prevent.',
-    file: 'lib/daemon.js',
+    file: 'src/lib/daemon.ts',
     find: `      if (Number.isFinite(endTurn)) {
         if (!Number.isFinite(openHostTurn) || endTurn !== openHostTurn) return;`,
     replace: `      if (false) { // MUTATION: accept any terminal event
@@ -91,8 +123,10 @@ const MUTATIONS = [
   },
   {
     name: 'approval-authority-not-checked',
+    kind: 'production',
+    protects: 'approval authority: a decision needs the separate authority token',
     why: 'Accepting a decision without the operator token would let any local caller — including a model-driven one — authorize its own approvals.',
-    file: 'lib/daemon.js',
+    file: 'src/lib/daemon.ts',
     find: `    if (typeof authorityToken !== 'string' || createDigest(authorityToken) !== createDigest(expected)) {`,
     replace: `    if (false) { // MUTATION: authority token is not verified`,
     target: 'test/security',
@@ -100,16 +134,94 @@ const MUTATIONS = [
   },
   {
     name: 'gap-smoothed-over',
+    kind: 'production',
+    protects: 'stream completeness: a gap is never reported as a complete log',
     why: 'Reporting a stream with a hole as complete destroys the caller’s ability to tell a full log from a partial one.',
-    file: 'lib/daemon.js',
+    file: 'src/lib/daemon.ts',
     find: `      completeness: hasGap ? 'incomplete' : 'complete',`,
     replace: `      completeness: 'complete', // MUTATION: gaps always reported as complete`,
     target: 'test/property',
     expectFailure: 'property',
   },
+  // ---------------------------------------------------------------------------------------------
+  // The five controls below are the ones that guard behaviour an operator would actually notice if
+  // it broke. Each one mutates PRODUCTION code in `src/`, and the fixture-fidelity control is
+  // labelled separately, because mutating our own fake Host proves something about the fixture, not
+  // about the bridge. Reporting "8 of 8 caught" while the only session-identity control mutated the
+  // fake Host was a real gap in how this runner described itself; the classification is now explicit
+  // in every `kind` field and in the summary.
+  // ---------------------------------------------------------------------------------------------
   {
-    name: 'session-create-id-not-reused',
-    why: 'A Host that discards the caller preallocated session id makes a retry ask for a SECOND Host session, so one logical session silently becomes two.',
+    // PRODUCTION control: the bridge's own identity handling, not the fixture's.
+    name: 'session-create-id-not-reused-on-retry',
+    kind: 'production',
+    protects: 'session identity survives a retry: one logical session is one Host session',
+    why: 'Generating a FRESH host session id on every attempt makes a retry ask for a second Host session, so one logical session silently becomes two and the caller loses the original turn history.',
+    file: 'src/lib/daemon.ts',
+    find: `    const hostSessionId = typeof storedSessionId === 'string' ? storedSessionId : \`session-\${randomUUID()}\`;`,
+    replace: `    // MUTATION: the stored preallocated id is ignored, so every attempt mints a new Host session.
+    const hostSessionId = \`session-\${randomUUID()}\`;`,
+    target: 'test/fake-host',
+    expectFailure: 'idempotently',
+  },
+  {
+    // PRODUCTION control for owner exclusion: two owners must never coexist.
+    //
+    // The mutation neuters the SECOND holder's refusal rather than the pragma. Deleting the pragma is
+    // not a valid mutation: `locking_mode=EXCLUSIVE` is per-connection and SQLite still takes a write
+    // lock for a committed transaction, so a second holder is refused either way — and removing the line
+    // leaves a syntax error behind, which the runner now rejects instead of misreporting. The refusal is
+    // the thing this control must actually depend on.
+    name: 'second-owner-not-refused',
+    kind: 'production',
+    protects: 'owner exclusion: a second owner cannot start against a live state directory',
+    why: 'If the second holder is allowed to proceed, two daemons interleave writes into one journal and one of them silently owns state the other is also mutating.',
+    file: 'src/lib/owner-lock.ts',
+    find: `      const busy = /busy|locked/i.test(message);
+      return { acquired: false, reason: busy ? 'busy' : \`error:\${message.slice(0, 120)}\` };`,
+    replace: `      // MUTATION: a refused handle is treated as acquired anyway, so exclusion does not hold.
+      this.#db = db ?? null;
+      this.#held = true;
+      return { acquired: true };`,
+    target: 'test/unit',
+    expectFailure: 'owner',
+  },
+  {
+    // PRODUCTION control for output bounds: a peer's size must not become our size.
+    name: 'host-error-text-unbounded',
+    kind: 'production',
+    protects: 'bounded output: a peer cannot make our error surface arbitrarily large',
+    why: 'Removing the bound lets a Host error message of any size flow into a tool result, an operator log and the durable operation record, which is a memory and log-growth path an untrusted peer controls (a ~200 KB message was observed in practice).',
+    file: 'src/lib/adapter.ts',
+    find: `  return cleaned.length > max ? \`\${cleaned.slice(0, max)}…[truncated \${cleaned.length - max} chars]\` : cleaned;`,
+    replace: `  // MUTATION: no bound is applied, so a peer's size becomes our size.
+  return cleaned;`,
+    target: 'test/security',
+    expectFailure: 'bounded',
+  },
+  {
+    // PRODUCTION control for cancellation meaning: an ack is not process evidence.
+    name: 'cancel-ack-claims-subprocess-stop',
+    kind: 'production',
+    protects: 'cancellation honesty: a turn-level ack is never reported as proof a subprocess stopped',
+    why: 'Reporting `observed: true` from a receipt that only acknowledges the turn converts "we sent a cancel" into a fabricated claim that a child process stopped, which is the single most harmful thing this bridge could tell a caller.',
+    file: 'src/lib/daemon.ts',
+    find: `          processEvidence: {
+            observed: false,`,
+    replace: `          processEvidence: {
+            // MUTATION: the turn-level ack is reported as process-level evidence.
+            observed: true,`,
+    target: 'test/fake-host',
+    expectFailure: 'process evidence',
+  },
+  {
+    // FIXTURE control, classified as such: it guards the fake Host's own fidelity, so a run that goes
+    // green when it is mutated means our NEGATIVE CONTROLS overlap the fixture's bug, not that the
+    // bridge is broken.
+    name: 'fake-host-ignores-preallocated-session-id',
+    kind: 'fixture',
+    protects: 'fixture fidelity: the fake Host honours a caller preallocated session id',
+    why: 'If the fake Host discards the preallocated id, every test that relies on it to observe retry behaviour silently stops testing anything — this control proves the fixture itself would be noticed.',
     file: 'test/fixtures/fake-host.mjs',
     find: `  createSession(sessionId) {
     const id = sessionId ?? \`session-\${randomUUID()}\`;`,
@@ -122,8 +234,10 @@ const MUTATIONS = [
   },
   {
     name: 'mcp-unknown-arguments-accepted',
+    kind: 'production',
+    protects: 'tool schema: an unknown argument is refused, not ignored',
     why: 'Accepting unknown tool arguments turns a caller typo into a silently different operation.',
-    file: 'lib/mcp-tools.js',
+    file: 'src/lib/mcp-tools.ts',
     find: `        if (schema.additionalProperties === false) errors.push(\`\${where}.\${key}: unexpected property\`);`,
     replace: `        void 0; // MUTATION: unknown properties ignored`,
     target: 'test/mcp-e2e',
@@ -154,15 +268,27 @@ if (!selected.length) {
 /** Copy the source tree without VCS metadata into a scratch root. */
 function makeSandbox() {
   const sandbox = mkdtempSync(join(tmpdir(), 'dshpilot-mutation-'));
-  for (const entry of ['bin', 'lib', 'test', 'docs', 'package.json', 'README.md', 'LICENSE']) {
+  // `src` holds the authored sources, which is what a mutation edits. `dist` is NOT copied: it is
+  // rebuilt inside the sandbox from the mutated sources, so what the suites execute is provably the
+  // mutated code and not a stale artifact left over from before the mutation.
+  for (const entry of ['src', 'test', 'docs', 'package.json', 'package-lock.json', 'tsconfig.json', 'tsconfig.contract.json', 'tsconfig.test.json', 'README.md', 'LICENSE']) {
     const from = join(ROOT, entry);
     if (!existsSync(from)) continue;
     cpSync(from, join(sandbox, entry), { recursive: true });
   }
+  // `npm ci` is unnecessary and slow here; the toolchain is symlinked from the real tree so the
+  // sandbox has `tsc` without a network round trip or a second copy of `node_modules`.
+  const modules = join(ROOT, 'node_modules');
+  if (existsSync(modules)) cpSync(modules, join(sandbox, 'node_modules'), { recursive: true, dereference: false });
   return sandbox;
 }
 
-/** @type {{name: string, caught: boolean, failed: number, passed: number, timedOut: number, skipped: number, detail: string}[]} */
+/**
+ * One control's outcome. `kind`, `protects` and `invalid` are genuinely absent on the "the mutation
+ * did not apply" case, which is reported before any suite runs — so the summary reads their absence
+ * as it reads `false` rather than an entry being invented for them.
+ * @type {{name: string, caught: boolean, failed: number, passed: number, timedOut: number, skipped: number, detail: string, kind?: 'production'|'fixture', protects?: string|null, invalid?: boolean}[]}
+ */
 const results = [];
 
 for (const mutation of selected) {
@@ -177,28 +303,73 @@ for (const mutation of selected) {
       });
       continue;
     }
-    writeFileSync(path, original.replace(mutation.find, mutation.replace));
+    const mutated = original.replace(mutation.find, mutation.replace);
+    writeFileSync(path, mutated);
+
+    // A mutation that does not even PARSE cannot be reported as "SURVIVED": a source file with a syntax
+    // error often makes a suite produce nothing at all, which would otherwise read as a missing control.
+    // This check is why the runner no longer confuses "the mutation broke the build" with "the tests
+    // cannot see this defect".
+    // The implementation is TypeScript, so the gate is the compiler, not `node --check`. A mutation
+    // that does not compile is INVALID rather than a survivor: a source file with a type error often
+    // makes a run produce nothing at all, which would otherwise read as a missing control. The same
+    // compile is also what produces `dist/` for the suites to execute, so a passing gate means the
+    // suites really do run the mutated code.
+    const build = spawnSync(process.execPath, [join('node_modules', 'typescript', 'bin', 'tsc'), '-p', 'tsconfig.json'], {
+      cwd: sandbox, encoding: 'utf8', timeout: 180_000,
+    });
+    if (build.status !== 0) {
+      results.push({
+        name: mutation.name, caught: false, invalid: true, failed: 0, passed: 0, timedOut: 0, skipped: 0,
+        kind: mutation.kind ?? 'production',
+        protects: mutation.protects ?? null,
+        detail: `INVALID: the mutation does not compile, so any test result would be meaningless: ${String(build.stdout ?? '').split('\n').filter((l) => l.includes('error TS')).slice(0, 3).join(' | ').slice(0, 300)}`,
+      });
+      continue;
+    }
 
     const run = spawnSync(process.execPath, ['test/run.mjs', mutation.target], {
       cwd: sandbox,
       encoding: 'utf8',
-      timeout: 600_000,
+      timeout: MUTATION_TIMEOUT_MS,
       env: { ...process.env, DSH_PILOT_PROPERTY_ROUNDS: '4' },
     });
     const stdout = `${run.stdout ?? ''}`;
+    // Kept for the diagnostic below: a run that produced nothing must describe WHY, or the report is
+    // as uninformative as the result it is trying to explain.
+    const runDiagnostic = run.error
+      ? `spawn error: ${run.error.message}`
+      : `status=${run.status} signal=${run.signal} stderr=${String(run.stderr ?? '').split('\n').filter((line) => line.trim() !== '').slice(0, 3).join(' | ').slice(0, 300)}`;
     const summary = stdout.match(/passed=(\d+) failed=(\d+) skipped=(\d+) timedOut=(\d+)/);
     const counts = summary
       ? { passed: Number(summary[1]), failed: Number(summary[2]), skipped: Number(summary[3]), timedOut: Number(summary[4]) }
       : { passed: 0, failed: 0, skipped: 0, timedOut: 0 };
     const caughtWith = stdout.split('\n').filter((line) => /^(FAIL|TIME) /.test(line)).map((line) => line.trim()).slice(0, 3);
+    // A mutation that makes the suite HANG has been detected, and must not be reported as a missing
+    // control. `spawnSync` returns ETIMEDOUT with no summary in that case, and the first version of this
+    // runner described that as "ran 0 tests", which is the same wrong conclusion in a different costume.
+    // `code` is set on the error by `spawnSync` itself; it is not part of the `Error` type.
+    const exhausted = run.error !== undefined && 'code' in run.error && run.error.code === 'ETIMEDOUT';
+    if (exhausted) counts.timedOut = 1;
     const detections = counts.failed + counts.timedOut;
+    const ranNothing = detections === 0 && counts.passed === 0;
     results.push({
       name: mutation.name,
       caught: detections > 0,
       ...counts,
-      detail: detections > 0
+      kind: mutation.kind ?? 'production',
+      protects: mutation.protects ?? null,
+      // A run in which NOT ONE test executed cannot be evidence of anything. Reporting that as
+      // "SURVIVED ... stayed green" would describe a build that broke before the first assertion as a
+      // missing control. `owner-lock-not-exclusive` first slipped through exactly this way.
+      invalid: ranNothing,
+      detail: exhausted
+        ? `caught by a HANG: the suite never finished within ${MUTATION_TIMEOUT_MS / 1000}s with the mutation applied, so the defect is observable as non-termination (a refusal path that no longer refuses blocks its caller rather than failing it)`
+        : detections > 0
         ? `caught by ${detections} test(s): ${caughtWith.join(' | ')}`
-        : `SURVIVED: ${mutation.target} stayed green with the mutation applied (${counts.passed} passed) — the control for this behaviour is not real`,
+        : ranNothing
+          ? `INVALID: ${mutation.target} ran 0 tests with the mutation applied — this is evidence about a broken run, not about a missing control. Output: ${stdout.split('\n').filter((line) => line.trim() !== '').slice(0, 4).join(' | ').slice(0, 400)} [${runDiagnostic}]`
+          : `SURVIVED: ${mutation.target} stayed green with the mutation applied (${counts.passed} passed, ${counts.skipped} skipped) — the control for this behaviour is not real`,
     });
   } finally {
     rmSync(sandbox, { recursive: true, force: true });
@@ -207,11 +378,53 @@ for (const mutation of selected) {
 
 process.stdout.write('\nmutation / negative controls\n');
 for (const result of results) {
-  process.stdout.write(`${result.caught ? 'caught  ' : 'SURVIVED'} ${result.name}\n`);
+  process.stdout.write(`${result.caught ? 'caught  ' : result.invalid ? 'INVALID ' : 'SURVIVED'} ${result.name}\n`);
   process.stdout.write(`    ${result.detail}\n`);
 }
-const survived = results.filter((result) => !result.caught).length;
-process.stdout.write(`\nmutations=${results.length} caught=${results.length - survived} survived=${survived}\n`);
+const survived = results.filter((result) => !result.caught && !result.invalid).length;
+const invalid = results.filter((result) => result.invalid).length;
+const byKind = {};
+for (const result of results) {
+  const kind = result.kind ?? 'production';
+  byKind[kind] ??= { total: 0, caught: 0 };
+  byKind[kind].total += 1;
+  if (result.caught) byKind[kind].caught += 1;
+}
+process.stdout.write(`\nmutations=${results.length} caught=${results.length - invalid - survived} survived=${survived} invalid=${invalid}\n`);
+// Reported by kind ON PURPOSE. A fixture control proves the fake Host is a faithful stand-in; only a
+// production control is evidence that this bridge notices its own defect. Collapsing the two into one
+// number would overstate what the suite has demonstrated.
+for (const [kind, counts] of Object.entries(byKind)) {
+  const scope = kind === 'fixture'
+    ? 'fixture fidelity (evidences the FAKE HOST, not this bridge)'
+    : 'production code in src/ (evidences this bridge)';
+  process.stdout.write(`  ${kind}: ${counts.caught}/${counts.total} caught — ${scope}\n`);
+}
+// The coverage obligations the design names separately. Listing them here, and checking each against a
+// CAUGHT control rather than against a test's name, is what stops a summary like "9/11 caught" from being
+// read as "every required negative control exists" — those are different claims, and only the second one
+// matters to a reviewer.
+const OBLIGATIONS = [
+  { id: 'owner-exclusion', phrase: 'owner exclusion' },
+  { id: 'output-bounds', phrase: 'bounded output' },
+  { id: 'cancel-local-only', phrase: 'cancellation honesty' },
+  { id: 'uncertainty-not-success', phrase: 'uncertainty' },
+  { id: 'durable-intent-before-send', phrase: 'durable intent' },
+  { id: 'turn-boundary-authority', phrase: 'turn boundaries' },
+  { id: 'approval-authority', phrase: 'approval authority' },
+  { id: 'event-identity', phrase: 'event identity' },
+  { id: 'stream-completeness', phrase: 'stream completeness' },
+  { id: 'session-identity', phrase: 'session identity' },
+  { id: 'tool-schema-strictness', phrase: 'tool schema' },
+];
+const obligationTable = OBLIGATIONS.map((obligation) => ({
+  id: obligation.id,
+  covered: results.some((result) => result.caught && String(result.protects ?? '').includes(obligation.phrase)),
+}));
+const uncovered = obligationTable.filter((row) => !row.covered).map((row) => row.id);
+// One line, not two: the obligation table is the authoritative coverage statement, and printing the same
+// list twice in different words invites a reader to treat them as two separate facts.
+process.stdout.write(`  required obligations: ${obligationTable.length - uncovered.length}/${obligationTable.length} have a caught negative control${uncovered.length ? `; NOT covered: ${uncovered.join(', ')}` : ''}\n`);
 
 if (jsonPath) {
   writeFileSync(jsonPath, `${JSON.stringify({
@@ -219,10 +432,13 @@ if (jsonPath) {
     root: ROOT,
     results,
     mutations: results.length,
-    caught: results.length - survived,
+    caught: results.length - survived - invalid,
     survived,
+    invalid,
+    byKind,
+    obligations: obligationTable,
   }, null, 2)}\n`);
   process.stdout.write(`machine-readable report: ${jsonPath}\n`);
 }
 
-process.exit(survived > 0 ? 1 : 0);
+process.exit(survived > 0 || invalid > 0 ? 1 : 0);

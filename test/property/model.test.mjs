@@ -15,7 +15,7 @@
  */
 
 import { join } from 'node:path';
-import { assert, scratchDir } from '../helpers.mjs';
+import { assert, must, scratchDir } from '../helpers.mjs';
 
 /** Deterministic PRNG (mulberry32): same seed, same sequence, on every platform. */
 function rng(seed) {
@@ -172,7 +172,7 @@ export default {
               assert.ok(page.gap, `the model says a hole exists but no gap was reported. ${detail}`);
             }
           } catch (error) {
-            failures.push(error.message);
+            failures.push(error instanceof Error ? error.message : String(error));
           }
         }
       } finally {
@@ -188,7 +188,7 @@ export default {
   'idempotency keys under repeated submission produce exactly one durable operation': async () => {
     const seed = Number(process.env.DSH_PILOT_SEED ?? 20260912);
     const random = rng(seed + 7);
-    const { Store } = await import('../../lib/store.js');
+    const { Store } = await import('../../dist/lib/store.js');
     const scratch = scratchDir('prop-idem');
     const store = new Store({ stateDir: join(scratch.dir, 'state') });
     try {
@@ -202,8 +202,11 @@ export default {
         const result = store.reserveOperation({ taskId, kind: 'session.prompt', idempotencyKey: key, payload });
         if (result.created) created.set(key, created.get(key) ?? 0);
         created.set(key, created.get(key) ?? 0);
-        // The same key with the same payload always resolves to the same operation row.
-        assert.equal(result.operation.idempotency_key, key);
+        // The same key with the same payload always resolves to the same operation row. The row
+        // is typed nullable because "no row" is an honest store outcome, but this property is a
+        // statement ABOUT the row, so the row must be present for every one of the 200 rounds.
+        const row = must(result.operation, `the operation row resolved for key ${key} on round ${i}`);
+        assert.equal(row.idempotency_key, key);
       }
       const rows = store.get('select count(*) as c from operations');
       assert.equal(rows.c, keys.length, 'exactly one durable operation per idempotency key');

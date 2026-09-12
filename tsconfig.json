@@ -1,0 +1,39 @@
+{
+  // The implementation is TypeScript SOURCE, compiled by `tsc` to `dist/`.
+  //
+  // Why a build step and not `allowJs`/`checkJs` over `.js` sources: the adopted design (ADR 0001)
+  // is Node 24 + TypeScript, and checking JavaScript is not the same thing as writing typed sources
+  // — it cannot require a type where none was written, and the coordinator's review returned the
+  // earlier checkJs-only arrangement as not satisfying that requirement. So `src/**` is `.ts` and
+  // `noImplicitAny` is ON here.
+  //
+  // Why `rewriteRelativeImportExtensions`: source imports name `./x.ts`, so the same specifier is
+  // valid for `tsc`, for a type-aware editor, and (with the extension rewritten on emit) for Node at
+  // runtime. Without it, `.ts` specifiers survive into `dist/` and Node cannot resolve them.
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": ["node"],
+    "rootDir": "src",
+    "outDir": "dist",
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    "declaration": true,
+    "sourceMap": true,
+    "verbatimModuleSyntax": true,
+
+    "strict": true,
+    "noImplicitAny": true,
+    "noImplicitOverride": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "useUnknownInCatchVariables": true,
+    "forceConsistentCasingInFileNames": true,
+    "exactOptionalPropertyTypes": false,
+    "noUncheckedIndexedAccess": false,
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*.ts"]
+}

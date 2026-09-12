@@ -21,29 +21,38 @@ export const ID_KINDS = Object.freeze({
   event: 'evt',
   host: 'host',
   gateway: 'gw',
-});
+} satisfies Record<string, string>);
 
-const PREFIX = Object.freeze(Object.fromEntries(
-  Object.entries(ID_KINDS).map(([kind, prefix]) => [prefix, kind]),
-));
+/** The id namespaces this bridge mints. */
+export type IdKind = keyof typeof ID_KINDS;
+
+const PREFIX: Readonly<Record<string, IdKind>> = Object.freeze(
+  Object.fromEntries(
+    Object.entries(ID_KINDS).map(([kind, prefix]) => [prefix, kind as IdKind]),
+  ),
+);
 
 /**
  * Mint an id of a given kind.
- * @param {keyof ID_KINDS} kind id namespace
- * @returns {string} `<prefix>_<uuid>`
+ * @param kind id namespace
+ * @returns `<prefix>_<uuid>`
  */
-export function mintId(kind) {
+export function mintId(kind: IdKind): string {
   const prefix = ID_KINDS[kind];
-  if (!prefix) throw new Error(`unknown id kind: ${kind}`);
+  if (!prefix) throw new Error(`unknown id kind: ${String(kind)}`);
   return `${prefix}_${randomUUID()}`;
 }
 
+/** Result of parsing a candidate id. */
+export type ParsedId =
+  | { readonly ok: true; readonly kind: IdKind; readonly id: string }
+  | { readonly ok: false; readonly reason: string };
+
 /**
  * Validate an id string and report the kind it actually is.
- * @param {string} value candidate id
- * @returns {{ok: true, kind: string, id: string} | {ok: false, reason: string}}
+ * @param value candidate id
  */
-export function parseId(value) {
+export function parseId(value: unknown): ParsedId {
   if (typeof value !== 'string') return { ok: false, reason: 'not-a-string' };
   const separator = value.indexOf('_');
   if (separator <= 0) return { ok: false, reason: 'missing-prefix' };
@@ -58,30 +67,33 @@ export function parseId(value) {
 }
 
 /**
- * Assert an id is of an expected kind; throws a typed error otherwise.
- * @param {string} value candidate id
- * @param {keyof ID_KINDS} kind expected kind
- * @returns {string} the id
+ * Assert an id is of an expected kind.
+ * @param value candidate id
+ * @param kind expected kind
+ * @returns the id, unchanged
+ * @throws {Error} when the id is malformed or belongs to another namespace
  */
-export function assertIdKind(value, kind) {
+export function assertIdKind(value: unknown, kind: IdKind): string {
   const parsed = parseId(value);
   if (!parsed.ok) throw new Error(`invalid id (${parsed.reason}): ${String(value).slice(0, 64)}`);
   if (parsed.kind !== kind) throw new Error(`expected ${kind} id, got ${parsed.kind}`);
-  return value;
+  return parsed.id;
 }
 
 /** Is this a usable DSH session id? Host ids are opaque strings of this shape. */
-export function isHostSessionId(value) {
+export function isHostSessionId(value: unknown): value is string {
   return typeof value === 'string' && /^session-[0-9a-zA-Z-]{8,}$/.test(value);
 }
+
+/** Result of validating a caller-supplied idempotency key. */
+export type KeyVerdict = { readonly ok: true } | { readonly ok: false; readonly reason: string };
 
 /**
  * A caller-supplied idempotency key must be a bounded, printable token: it is stored in
  * SQLite and echoed in errors, so control characters and unbounded length are refused.
- * @param {string} key candidate
- * @returns {{ok: true} | {ok: false, reason: string}}
+ * @param key candidate
  */
-export function isIdempotencyKey(key) {
+export function isIdempotencyKey(key: unknown): KeyVerdict {
   if (typeof key !== 'string') return { ok: false, reason: 'not-a-string' };
   if (key.length < 8 || key.length > 200) return { ok: false, reason: 'length' };
   if (!/^[A-Za-z0-9._:/-]+$/.test(key)) return { ok: false, reason: 'charset' };
@@ -91,25 +103,23 @@ export function isIdempotencyKey(key) {
 /**
  * Stable digest of a request payload, used to detect "same key, different payload".
  * Canonicalises key order so an equivalent payload does not look like a conflict.
- * @param {unknown} value payload
- * @returns {string} hex sha256
+ * @param value payload
+ * @returns hex sha256
  */
-export function payloadDigest(value) {
+export function payloadDigest(value: unknown): string {
   return createDigest(canonicalJson(value));
 }
 
 /** Canonical JSON: sorted object keys, no undefined, deterministic number formatting. */
-export function canonicalJson(value) {
+export function canonicalJson(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value ?? null);
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
-  const keys = Object.keys(value).filter((k) => value[k] !== undefined).sort();
-  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(value[k])}`).join(',')}}`;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).filter((k) => record[k] !== undefined).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(record[k])}`).join(',')}}`;
 }
 
-/**
- * @param {string} text input
- * @returns {string} hex sha256 digest
- */
-export function createDigest(text) {
+/** Hex sha256 of a UTF-8 string. */
+export function createDigest(text: string): string {
   return createHash('sha256').update(text, 'utf8').digest('hex');
 }

@@ -13,7 +13,7 @@
  *   DSH_PILOT_JSON=out.json node test/run.mjs
  */
 
-import { readdirSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -49,7 +49,19 @@ function parseArgs(argv) {
 const args = parseArgs(process.argv.slice(2));
 const layers = args.targets.length ? args.targets : DEFAULT_LAYERS;
 
-/** @type {{id: string, layer: string, status: string, ms: number, detail?: string}[]} */
+// Preflight: the implementation is TypeScript SOURCE, and every layer here — including a test that
+// spawns the real MCP binary over stdio — runs the BUILT artifact under `dist/`. Without this check a
+// fresh clone produces a wall of module-resolution failures that read like broken code rather than
+// like a missing build step, which is how a build problem gets mistaken for a product defect.
+if (!existsSync(resolve('dist/lib/ids.js'))) {
+  process.stderr.write(
+    'the built implementation is missing (dist/lib/ids.js not found).\n'
+    + 'The sources are TypeScript; run `npm run build` first, or `npm run build && node test/run.mjs`.\n',
+  );
+  process.exit(2);
+}
+
+/** @type {{id: string, layer: string, status: string, ms: number, detail?: string, stack?: string}[]} */
 const results = [];
 const startedAt = new Date();
 /** @type {string[]} */
@@ -95,9 +107,16 @@ for (const layer of layers) {
       } catch (error) {
         const ms = Date.now() - started;
         const message = error instanceof Error ? `${error.message}` : String(error);
+        // A timeout is reported by a DOMException (`TimeoutError`), not by an Error subclass in
+        // every runtime, so the name is read structurally rather than through `instanceof`.
+        // Objects and functions are the only values that can carry `name`, so this is exactly
+        // the `error?.name` read it replaces.
+        const thrownName = error && (typeof error === 'object' || typeof error === 'function') && 'name' in error
+          ? error.name
+          : undefined;
         if (message.startsWith(SKIP_MARKER)) {
           results.push({ id: caseId, layer, status: 'skipped', ms, detail: message.slice(SKIP_MARKER.length).trim() });
-        } else if (error?.name === 'TimeoutError' || /timed out|timeout/i.test(message)) {
+        } else if (thrownName === 'TimeoutError' || /timed out|timeout/i.test(message)) {
           results.push({ id: caseId, layer, status: 'timed-out', ms, detail: message });
         } else {
           results.push({
