@@ -182,6 +182,14 @@ jobs:
           fi
           echo "no internal endpoints in tracked files"
 
+      # The pack check BUILDS, and the build needs `typescript` and `@types/node`, so the dev
+      # tooling has to be installed here too. Without this the step fails with
+      # `TS2688: Cannot find type definition file for 'node'`, which is what this job did on its
+      # first run after the sources became TypeScript — a failure of the workflow, not of the
+      # package, and worth the comment so it is not re-learned.
+      - name: install dev tooling (types only; the runtime keeps zero dependencies)
+        run: npm ci
+
       - name: npm pack contents are the declared files only
         run: |
           npm run build
