@@ -316,6 +316,39 @@ const MUTATIONS = [
     expectFailure: 'invalid arguments',
   },
   {
+    name: 'workspace-not-reverified-before-dispatch',
+    kind: 'production',
+    protects: 'workspace boundary: work is not dispatched into a directory that is no longer the recorded one',
+    why: ('A recorded cwd is a NAME, not a directory. Deleting the directory and putting a SYMLINK to '
+      + 'somewhere else in its place leaves a path that still exists and still looks valid, so a check that '
+      + 'only asks "does this exist" passes while the Host runs the turn in an attacker-chosen directory. '
+      + 'With the comparison removed, the swapped-workspace and deleted-workspace cases both dispatch.'),
+    file: 'src/lib/daemon.ts',
+    find: `      const still = verifyWorkspace(recordedCwd, WORKSPACE_FS);
+      if (!still.ok) throw workspaceChanged(recordedCwd, still.refusal);`,
+    replace: `      const still = verifyWorkspace(recordedCwd, WORKSPACE_FS); // MUTATION: the answer is not read
+      void still;`,
+    target: 'test/security',
+    expectFailure: 'a swapped workspace must refuse the dispatch',
+  },
+  {
+    name: 'workspace-path-not-resolved',
+    kind: 'production',
+    protects: 'workspace boundary: the directory a workspace path resolves to is what is recorded and sent',
+    why: ('Recording and sending the caller\'s path as given means a symlinked workspace is stored as a name '
+      + 'whose target can be changed later, and a path that does not exist or is not a directory is accepted '
+      + 'at create time and only fails much later, in the Host.'),
+    file: 'src/lib/daemon.ts',
+    find: `      const resolved = resolveWorkspace(requestedCwd, WORKSPACE_FS);
+      if ('refusal' in resolved) throw workspaceUnsafe(requestedCwd, resolved.refusal);
+      resolvedCwd = resolved.resolved;`,
+    replace: `      resolvedCwd = requestedCwd; // MUTATION: the caller's path is recorded as given, unresolved
+      void resolveWorkspace;
+      void workspaceUnsafe;`,
+    target: 'test/security',
+    expectFailure: 'the Host must receive the resolved directory',
+  },
+  {
     name: 'ipc-client-counts-the-delivery-not-the-frame',
     kind: 'production',
     protects: 'bounded input: the IPC client spends its per-reply budget per FRAME, not per delivery',
@@ -325,18 +358,14 @@ const MUTATIONS = [
       + 'longer measured a frame at all — accepted a single frame larger than the bound when the peer '
       + 'delivered it in pieces. Both halves of that are in the cases below.'),
     file: 'src/lib/ipc.ts',
-    find: `      const frames = framer.push(chunk);
-      for (const frame of frames) {
-        if (frame.bytes > this.#maxReplyBytes) {
-          this.#refuseOversize(framer, frame.bytes);
+    find: `        if (frame.size > this.#maxReplyBytes) {
+          this.#refuseOversize(framer, frame.size);
           return;
-        }
-      }`,
-    replace: `      const frames = framer.push(chunk);
-      if (chunk.length > this.#maxReplyBytes) { // MUTATION: the delivery is treated as the frame
-        this.#refuseOversize(framer, chunk.length);
-        return;
-      }`,
+        }`,
+    replace: `        if (chunk.length > this.#maxReplyBytes) { // MUTATION: the delivery is treated as the frame
+          this.#refuseOversize(framer, chunk.length);
+          return;
+        }`,
     target: 'test/network',
     expectFailure: 'reply exceeds the IPC reply limit',
   },
@@ -348,7 +377,7 @@ const MUTATIONS = [
       + 'a client that batched its requests had its connection destroyed for being efficient.'),
     file: 'src/lib/ipc.ts',
     find: `      for (const frame of frames) {
-        if (frame.bytes > maxRequestBytes) {
+        if (frame.size > maxRequestBytes) {
           refuseOversizeLine();
           return;
         }
@@ -369,8 +398,8 @@ const MUTATIONS = [
       + 'buffer without limit.'),
     file: 'src/lib/ipc.ts',
     find: `      for (const frame of frames) {
-        if (frame.bytes > this.#maxReplyBytes) {
-          this.#refuseOversize(framer, frame.bytes);
+        if (frame.size > this.#maxReplyBytes) {
+          this.#refuseOversize(framer, frame.size);
           return;
         }
       }
@@ -388,16 +417,19 @@ const MUTATIONS = [
     expectFailure: 'never sends a newline',
   },
   {
-    name: 'ipc-server-per-chunk-decode',
+    name: 'ipc-framer-drops-earlier-pieces',
     kind: 'production',
-    protects: 'framing: a request split inside a multi-byte character arrives as it was sent',
-    why: ('A chunk boundary is not a character boundary. `chunk.toString(\'utf8\')` on a chunk that ends '
-      + 'mid-sequence produces a replacement character that concatenating the next chunk cannot repair, so a '
-      + 'prompt containing multi-byte text could be stored corrupted. The mutation applies the same defect to '
-      + 'the framer: each piece of a frame decoded on its own instead of the joined frame.'),
+    protects: 'framing: a frame split across deliveries is assembled from every byte it arrived in',
+    why: ('A frame is not the delivery it arrived in. This was first defended by mutating a per-chunk text '
+      + 'decode; the framer now joins a frame\'s bytes BEFORE the caller decodes them, so "decode one piece at '
+      + 'a time" is impossible by construction rather than merely untested, and the same defect the cases '
+      + 'still have to catch is assembling the frame from fewer than all of its bytes — which truncates a '
+      + 'frame that straddled two deliveries and corrupts multi-byte text exactly as the old one did.'),
     file: 'src/lib/ipc.ts',
-    find: `      const text = body.toString('utf8');`,
-    replace: "      const text = pieces.map((part) => part.toString('utf8')).join(''); // MUTATION: per-piece decode",
+    find: `      const pieces = this.#parts.length === 0 ? [head] : [...this.#parts, head];
+      const body = pieces.length === 1 ? (pieces[0] ?? head) : Buffer.concat(pieces);`,
+    replace: `      const pieces = this.#parts.length === 0 ? [head] : [...this.#parts, head];
+      const body = pieces[pieces.length - 1] ?? head; // MUTATION: only the newest piece is kept`,
     target: 'test/network',
     expectFailure: 'split mid-character',
   },

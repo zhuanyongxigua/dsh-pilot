@@ -11,6 +11,8 @@
  * only; the product is exercised separately in test/isolated-host.
  */
 
+import { mkdirSync, realpathSync } from 'node:fs';
+import { join } from 'node:path';
 import { assert, scratchDir, startDaemon, ipcClient, waitFor } from '../helpers.mjs';
 import { FakeHost } from '../fixtures/fake-host.mjs';
 
@@ -24,13 +26,24 @@ async function rig(options = {}) {
   const scratch = scratchDir('fakehost');
   const daemon = await startDaemon({ hostBase: host.baseUrl, stateDir: `${scratch.dir}/state` });
   const ipc = await ipcClient(daemon.socketPath);
+  // A real workspace inside this rig's own scratch directory.
+  //
+  // Why the rig owns one: the cwd contract requires a session's workspace to be a directory that exists,
+  // so a fixture that names a path nobody created is a fixture that cannot start a session. The directory
+  // is real and canonicalised because the bridge records and re-verifies the RESOLVED path, and comparing
+  // against anything else would be comparing against a string no caller ever sent.
+  const workspaceDir = join(scratch.dir, 'workspace');
+  mkdirSync(workspaceDir, { recursive: true });
+  const workspace = realpathSync(workspaceDir);
   const teardown = async () => {
     ipc.close();
     await daemon.stop();
     await host.stop();
+    // Only our own temp directory: nothing outside the rig is touched, and the workspace inside it goes
+    // with it.
     scratch.cleanup();
   };
-  return { host, daemon, ipc, teardown };
+  return { host, daemon, ipc, teardown, workspace, workspaceDir };
 }
 
 /** @param {object} ipc */
@@ -118,18 +131,27 @@ export default {
   },
 
   'session.create retries idempotently with the preallocated id and reports a cwd conflict': async () => {
-    const { host, ipc, teardown } = await rig();
+    const { host, ipc, teardown, workspace, workspaceDir } = await rig();
     try {
+      // A SECOND real directory, distinct from the first, for the conflict assertion below: the conflict
+      // has to be a genuine difference between two existing workspaces, not a difference between a path
+      // and a path that does not exist.
+      const otherDir = join(workspaceDir, 'other');
+      mkdirSync(otherDir, { recursive: true });
+      const other = realpathSync(otherDir);
+      assert.notEqual(other, workspace, 'the two workspaces must be different directories');
+
       const task = await ipc.request({ op: 'task.ensure', clientKey: 'create-retry' });
       const first = await ipc.request({
-        op: 'session.start', taskId: task.task.taskId, clientKey: 'k1', cwd: '/workspace/one',
+        op: 'session.start', taskId: task.task.taskId, clientKey: 'k1', cwd: workspace,
       });
       assert.ok(first.session, `first create failed: ${JSON.stringify(first)}`);
+      assert.equal(first.session.cwd, workspace, 'the resolved workspace is what gets recorded');
       const hostId = first.session.hostSessionId;
       // Same key returns the same session without a second create on the wire.
       const before = host.requestsFor('session.create').length;
       const again = await ipc.request({
-        op: 'session.start', taskId: task.task.taskId, clientKey: 'k1', cwd: '/workspace/one',
+        op: 'session.start', taskId: task.task.taskId, clientKey: 'k1', cwd: workspace,
       });
       assert.ok(again.session, `idempotent reuse failed: ${JSON.stringify(again)}`);
       assert.equal(again.session.sessionId, first.session.sessionId);
@@ -138,10 +160,10 @@ export default {
       // A different cwd for an existing session is the host's session-conflict, surfaced as-is.
       host.dropResponseFor('session.create');
       const conflicting = host.createSession(hostId);
-      host.session(conflicting.sessionId).cwd = '/workspace/one';
+      host.session(conflicting.sessionId).cwd = workspace;
       host.stopDropping('session.create');
       const third = await ipc.request({
-        op: 'session.start', taskId: task.task.taskId, clientKey: 'k2', cwd: '/workspace/two',
+        op: 'session.start', taskId: task.task.taskId, clientKey: 'k2', cwd: other,
       });
       // Either the retry created a second session (host accepted the new id) or a typed
       // refusal/uncertainty was reported — a fabricated success is the only wrong answer.

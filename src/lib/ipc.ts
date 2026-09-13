@@ -51,11 +51,20 @@ export const MAX_IPC_REPLY_BYTES = 16 * 1024 * 1024;
 /** Maximum simultaneous gateway connections. */
 export const MAX_IPC_CONNECTIONS = 32;
 
-/** One complete newline-terminated frame, with the BYTES it occupied on the wire. */
-interface FramedLine {
-  readonly text: string;
-  /** The frame's own bytes including its newline: what a per-frame budget is about. */
-  readonly bytes: number;
+/** One complete newline-terminated frame: its bytes, and how many of them were on the wire. */
+interface FramedFrame {
+  /**
+   * The frame's bytes WITHOUT its terminator, still undecoded.
+   *
+   * Deliberately not a string. The caller's first act has to be comparing `size` against its budget, and a
+   * framer that decoded here would make that comparison happen after the work the budget exists to refuse:
+   * a peer sending one 5 MiB frame made this process allocate and decode 5 MiB before deciding it was too
+   * large. That is not a bound, it is a bound-shaped afterthought, and it was caught by CI as a timeout
+   * rather than by reasoning — see the comment at the size checks on both ends.
+   */
+  readonly body: Buffer;
+  /** The frame's own bytes including its terminator: what a per-frame budget is about. */
+  readonly size: number;
 }
 
 /**
@@ -110,8 +119,8 @@ class LineFramer {
    * Add bytes and take out every frame they completed.
    * @param chunk the bytes the socket handed over, which may hold any number of frames in any state
    */
-  push(chunk: Buffer): FramedLine[] {
-    const frames: FramedLine[] = [];
+  push(chunk: Buffer): FramedFrame[] {
+    const frames: FramedFrame[] = [];
     let rest = chunk;
     for (;;) {
       // A frame boundary cannot be in bytes already scanned: they were split and removed when they
@@ -120,17 +129,16 @@ class LineFramer {
       const index = rest.indexOf(0x0a);
       if (index < 0) break;
       const head = rest.subarray(0, index);
-      // The pieces of THIS frame, joined once. Kept in a named value so that the decode below is
-      // visibly a decode of the whole frame: decoding the pieces separately would be the per-chunk
-      // mistake this class exists to remove, and a reader should be able to see that it is not that.
+      // The pieces of THIS frame, joined once. Joining is what makes a frame boundary a character
+      // boundary, so decoding cannot be wrong here even if the peer split a character: the pieces are
+      // bytes and they are joined before anyone turns them into text.
       const pieces = this.#parts.length === 0 ? [head] : [...this.#parts, head];
       const body = pieces.length === 1 ? (pieces[0] ?? head) : Buffer.concat(pieces);
-      const text = body.toString('utf8');
       this.#parts = [];
       this.#size = 0;
-      // The frame's bytes are the line plus its terminator: the wire cost of the frame, which is what a
+      // The frame's bytes are the body plus its terminator: the wire cost of the frame, which is what a
       // bound named "bytes per frame" is about.
-      frames.push({ text, bytes: body.length + 1 });
+      frames.push({ body, size: body.length + 1 });
       rest = rest.subarray(index + 1);
     }
     if (rest.length > 0) {
@@ -371,7 +379,7 @@ export async function startIpcServer({
       framer.reset();
     };
     socket.on('data', (chunk: Buffer) => {
-      let frames: FramedLine[];
+      let frames: FramedFrame[];
       try {
         frames = framer.push(chunk);
       } catch (error) {
@@ -381,10 +389,14 @@ export async function startIpcServer({
         void error;
         return;
       }
-      // Every frame is measured on its own bytes. A chunk holding two legal requests is served, because
-      // the budget is about a frame and not about how the kernel happened to deliver it.
+      // Every frame is measured on its own bytes, and measured BEFORE it is decoded. The order IS the
+      // bound: a single 5 MiB request must cost this process one comparison, not a 5 MiB join and a 5 MiB
+      // string. An earlier revision of this file decoded first and then compared, and CI turned that into a
+      // 20 s timeout on a loaded runner — the refusal had already paid for the payload it was refusing.
+      // A chunk holding two legal requests is served, because the budget is about a frame and not about how
+      // the kernel happened to deliver it.
       for (const frame of frames) {
-        if (frame.bytes > maxRequestBytes) {
+        if (frame.size > maxRequestBytes) {
           refuseOversizeLine();
           return;
         }
@@ -397,7 +409,7 @@ export async function startIpcServer({
         return;
       }
       for (const frame of frames) {
-        const line = frame.text;
+        const line = frame.body.toString('utf8');
         if (line.trim() === '') continue;
         // Serialise per connection: a gateway must not observe interleaved replies.
         chain = chain.then(async () => {
@@ -531,9 +543,11 @@ export class IpcClient {
     const framer = new LineFramer();
     this.#socket.on('data', (chunk: Buffer) => {
       const frames = framer.push(chunk);
+      // Size before decode, for the same reason as the server side: what the gateway refuses must not
+      // first be assembled into a string.
       for (const frame of frames) {
-        if (frame.bytes > this.#maxReplyBytes) {
-          this.#refuseOversize(framer, frame.bytes);
+        if (frame.size > this.#maxReplyBytes) {
+          this.#refuseOversize(framer, frame.size);
           return;
         }
       }
@@ -544,7 +558,7 @@ export class IpcClient {
         return;
       }
       for (const frame of frames) {
-        const line = frame.text;
+        const line = frame.body.toString('utf8');
         if (line.trim() === '') continue;
         const waiter = this.#pending.shift();
         if (!waiter) {

@@ -47,7 +47,20 @@ import { OwnerLock } from './owner-lock.ts';
 import { DshHostAdapter, boundText } from './adapter.ts';
 import { redactInbound } from './redact.ts';
 import { startIpcServer, ensureAuthorityToken, readAuthorityToken, MAX_IPC_REPLY_BYTES } from './ipc.ts';
+import { resolveWorkspace, verifyWorkspace, workspaceChanged, workspaceUnsafe, type WorkspaceFs } from './workspace.ts';
+import { realpathSync, statSync } from 'node:fs';
 import type { IpcServer } from './ipc.ts';
+
+/**
+ * The filesystem operations the workspace boundary uses.
+ *
+ * Injected rather than imported inside `workspace.ts`, so the module that DECIDES is separated from the
+ * module that touches the disk, and so this file is the only place in the daemon that follows a path.
+ */
+const WORKSPACE_FS: WorkspaceFs = {
+  realpath: (path: string): string => realpathSync(path),
+  isDirectory: (path: string): boolean => statSync(path).isDirectory(),
+};
 
 /**
  * What one adapter call returns, as this file reads it.
@@ -502,10 +515,31 @@ export class Daemon {
     const keyCheck = isIdempotencyKey(`session-start:${clientKey}`);
     if (!keyCheck.ok) throw new BridgeError(ERROR_CODES.BAD_REQUEST, 'invalid client key', { reason: keyCheck.reason });
 
+    // The workspace boundary, before anything is reserved or sent.
+    //
+    // `cwd` is the one caller-supplied value this bridge hands to a component that runs tools inside it,
+    // and a path is not a directory: it can be a symlink now and a different symlink later. What gets
+    // recorded — and what the Host is told — is the directory the path RESOLVES to, so the session's
+    // workspace is a directory rather than whatever a name points at by the time work is dispatched.
+    // A path that is not absolute, does not exist, or is not a directory is refused here with a typed
+    // error, and nothing reaches the Host: there is no partway state to reconcile.
+    const requestedCwd: string | null = typeof cwd === 'string' && cwd !== '' ? cwd : null;
+    let resolvedCwd: string | null = null;
+    if (requestedCwd !== null) {
+      const resolved = resolveWorkspace(requestedCwd, WORKSPACE_FS);
+      if ('refusal' in resolved) throw workspaceUnsafe(requestedCwd, resolved.refusal);
+      resolvedCwd = resolved.resolved;
+    }
+
     // The intent's identity is (client key, cwd, preset) — NOT the preallocated host id,
     // which is minted once and then reused from the stored request. Including it would make
     // every retry look like a different payload and break key-based idempotency.
-    const intent = { cwd, agentPreset };
+    //
+    // The RESOLVED path is what the identity carries, and that is a deliberate choice with a consequence
+    // worth stating: a retry that passes the same name resolves to the same directory and finds the same
+    // operation, while a retry whose name now resolves somewhere else is refused by the workspace check
+    // above rather than quietly creating a second session in a directory the first caller never chose.
+    const intent = { cwd: resolvedCwd, agentPreset };
     const { operation, created } = this.#store.reserveOperation({
       taskId: task.task_id,
       kind: 'session.create',
@@ -519,7 +553,7 @@ export class Daemon {
     // host session id, so a non-string falls back exactly as a missing one did.
     const storedSessionId: unknown = storedRequest?.sessionId;
     const hostSessionId = typeof storedSessionId === 'string' ? storedSessionId : `session-${randomUUID()}`;
-    const requestBody = storedRequest ?? { sessionId: hostSessionId, ...(cwd ? { cwd } : {}), ...(agentPreset ? { agentPreset } : {}) };
+    const requestBody = storedRequest ?? { sessionId: hostSessionId, ...(resolvedCwd ? { cwd: resolvedCwd } : {}), ...(agentPreset ? { agentPreset } : {}) };
 
     if (!created) {
       // The preallocated host id lives in the stored request, so an operation whose response
@@ -558,7 +592,12 @@ export class Daemon {
     // — the `sessionId` in a `/api/respond` answer, for one — then named a session the Host had never
     // heard of, and nothing here could tell, because a locally minted id looks exactly like a Host's.
     const hostValue: unknown = result.value;
-    return this.#recordSessionFromCreate(task.task_id, hostValue, hostSessionId, cwd, operation.operation_id);
+    // The RESOLVED workspace is recorded, not the name the caller used, and this is load-bearing rather
+    // than tidy: the re-verification before dispatch compares the recorded path against what it resolves to
+    // NOW, so a record holding a symlinked name would fail that comparison on every later call (on macOS a
+    // temp path under /var resolves through /private/var, which is how this was caught). The record has to
+    // hold the directory itself for the comparison to mean anything.
+    return this.#recordSessionFromCreate(task.task_id, hostValue, hostSessionId, resolvedCwd, operation.operation_id);
   }
 
   /**
@@ -1723,6 +1762,23 @@ export class Daemon {
     }
     const keyCheck = isIdempotencyKey(`prompt:${clientKey}`);
     if (!keyCheck.ok) throw new BridgeError(ERROR_CODES.BAD_REQUEST, 'invalid client key', { reason: keyCheck.reason });
+
+    // The workspace is re-verified before the work is dispatched, and before the intent is even reserved.
+    //
+    // Why here and not at create time only: a session can live for days, and the recorded directory can be
+    // deleted, replaced by a file, or replaced by a SYMLINK to somewhere else in between. The Host would
+    // then run the turn in a directory this bridge never recorded and the caller never chose — which is the
+    // escape this check exists to stop. It runs before the intent is persisted so that a refusal leaves no
+    // operation row and no possibility of a later replay sending the prompt anyway.
+    //
+    // The trade this makes, stated rather than implied: a retry carrying the same client key after the
+    // workspace changed is refused instead of returning the earlier operation's recorded outcome. The
+    // refusal is the more useful answer — the caller's intent was to run work in a directory that is gone.
+    const recordedCwd: string | null = typeof session.cwd === 'string' && session.cwd !== '' ? session.cwd : null;
+    if (recordedCwd !== null) {
+      const still = verifyWorkspace(recordedCwd, WORKSPACE_FS);
+      if (!still.ok) throw workspaceChanged(recordedCwd, still.refusal);
+    }
 
     const payload = { sessionId, mode, text };
     const { operation, created } = this.#store.reserveOperation({

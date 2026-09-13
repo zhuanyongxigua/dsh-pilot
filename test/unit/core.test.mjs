@@ -10,12 +10,78 @@
 
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { assert, asRecord, ipcClient, must, mustString, scratchDir, skip } from '../helpers.mjs';
+import { assert, asRecord, collect, ipcClient, must, mustString, scratchDir, skip, spawnNode } from '../helpers.mjs';
 
 /**
  * The daemon refuses with a coded BridgeError; catch sites below assert on that code.
  * @typedef {import('../../dist/lib/errors.js').BridgeError} BridgeError
  */
+
+/**
+ * How long a daemon that is SUPPOSED to refuse gets to exit.
+ *
+ * 20s is generous for a process that is expected to print one line and exit 4 within milliseconds, and it
+ * is deliberately far below the 300s ceiling the mutation runner puts on a suite. That gap is the whole
+ * point: a suite-level timeout kills the TEST PROCESS, and a process that is killed runs no `finally`, so
+ * every child it was holding is left behind with nobody to reap it. This was not a hypothetical — a
+ * mutation that removes the owner check makes the second daemon start and stay alive, and the orphans from
+ * that path kept reconnecting to a Host that no longer existed for hours on a shared machine. A deadline
+ * this side of the runner turns that outcome into a failure the fixture can clean up after.
+ */
+const SECOND_DAEMON_EXIT_DEADLINE_MS = 20_000;
+
+/**
+ * `collect(child)` raced against a deadline. `null` means the child was still running when the deadline
+ * passed, which is a fact the callers below act on rather than wait out.
+ * @param {import('node:child_process').ChildProcess} child
+ * @param {number} timeoutMs
+ * @returns {Promise<{code: number|null, signal: string|null, stdout: string, stderr: string}|null>}
+ */
+async function collectWithin(child, timeoutMs) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      collect(child),
+      new Promise((resolve) => { timer = setTimeout(() => resolve(null), timeoutMs); }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * Terminate one fixture child and report what was observed, so a leak cannot be reported as a tidy-up.
+ * @param {import('node:child_process').ChildProcess} child
+ * @returns {Promise<'already-exited'|'terminated'|'killed'>}
+ */
+async function terminateChild(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return 'already-exited';
+  child.kill('SIGTERM');
+  if (await collectWithin(child, 10_000) !== null) return 'terminated';
+  // SIGTERM did not take. Escalating to SIGKILL is still scoped to THIS child, whose handle the fixture
+  // owns; nothing is matched by name, pattern, or ownership elsewhere on the machine.
+  child.kill('SIGKILL');
+  await collectWithin(child, 5_000);
+  return 'killed';
+}
+
+/**
+ * Require a second daemon to refuse the state directory and exit 4, within a bounded deadline.
+ *
+ * On expiry the child is terminated HERE and the failure names its pid — rather than being left to a
+ * suite-level timeout, which cannot clean up after the fixture it killed.
+ * @param {import('node:child_process').ChildProcess} child
+ * @param {object} [options]
+ * @param {number} [options.deadlineMs]
+ * @returns {Promise<{code: number|null, signal: string|null, stdout: string, stderr: string}>}
+ */
+async function requireOwnerRefusal(child, { deadlineMs = SECOND_DAEMON_EXIT_DEADLINE_MS } = {}) {
+  const outcome = await collectWithin(child, deadlineMs);
+  if (outcome !== null) return outcome;
+  const how = await terminateChild(child);
+  throw new Error(`the second daemon (pid ${String(child.pid)}) was still running ${deadlineMs}ms after `
+    + `being started on an owned state directory; it must fail closed with OWNER_HELD and exit 4 (child ${how})`);
+}
 
 export default {
   'id namespaces are separate and validated per kind': async () => {
@@ -316,15 +382,68 @@ export default {
     const scratch = scratchDir('owner-refuse');
     const stateDir = join(scratch.dir, 'state');
     let first = null;
+    // Declared OUTSIDE the try so `finally` can reach it. The child used to be bound inside the block,
+    // which meant that anything that prevented this case from reaching its `finally` — a suite-level
+    // timeout, for one — left that daemon running with no handle left anywhere to stop it.
+    let second = null;
     try {
       first = await startDaemon({ hostBase: host.baseUrl, stateDir });
       // A second daemon on the same state directory must fail closed with OWNER_HELD.
-      const { spawnNode, collect } = await import('../helpers.mjs');
-      const second = spawnNode(['dist/bin/dsh-pilot-daemon.js', '--state-dir', stateDir, '--host', host.baseUrl]);
-      const outcome = await collect(second);
+      second = spawnNode(['dist/bin/dsh-pilot-daemon.js', '--state-dir', stateDir, '--host', host.baseUrl]);
+      const outcome = await requireOwnerRefusal(second);
       assert.equal(outcome.code, 4, `expected exit 4 (owner held), got ${outcome.code}; stderr=${outcome.stderr}`);
       assert.match(outcome.stderr, /OWNER_HELD/);
     } finally {
+      // Both children, always, and the host: a refusal that did not happen is exactly the case where the
+      // second daemon needs terminating, so the cleanup cannot be conditional on the assertions passing.
+      if (second) await terminateChild(second);
+      if (first) await first.stop();
+      await host.stop();
+      scratch.cleanup();
+    }
+  },
+
+  'the owner-refuse fixture terminates its children when the expected refusal never comes': async () => {
+    // The direct regression for a leak that really happened, not a hypothetical one.
+    //
+    // The same code path the case above uses is driven here in the one situation where the expected
+    // refusal will never arrive: the second daemon gets its OWN state directory, so there is no owner
+    // conflict, it starts, and it connects to the fixture Host instead of exiting 4. A bounded collect
+    // must therefore reach its deadline, and what happens next is the whole point — the fixture has to
+    // terminate that child itself. Before this existed, the deadline did not exist either: a mutation
+    // removing the owner check turned this case into a suite-level timeout, the runner killed the test
+    // process, `finally` never ran, and the daemon survived as an orphan reconnecting to a dead Host.
+    //
+    // The oracle is the child's own exit state, which is what "not leaked" means: an exit code or a
+    // terminating signal on the handle, observed after the failure was raised.
+    const { startDaemon, scratchDir } = await import('../helpers.mjs');
+    const { FakeHost } = await import('../fixtures/fake-host.mjs');
+    const host = await new FakeHost().start();
+    const scratch = scratchDir('owner-leak');
+    let first = null;
+    let second = null;
+    try {
+      first = await startDaemon({ hostBase: host.baseUrl, stateDir: join(scratch.dir, 'state') });
+      second = spawnNode([
+        'dist/bin/dsh-pilot-daemon.js', '--state-dir', join(scratch.dir, 'other-state'), '--host', host.baseUrl,
+      ]);
+      // A short deadline on purpose: this case is about what the fixture does when the deadline expires,
+      // and it must not spend the real 20s to find out.
+      const failure = await requireOwnerRefusal(second, { deadlineMs: 1_500 })
+        .then(() => { throw new Error('a second daemon on its own state directory must NOT refuse'); },
+          (thrown) => thrown);
+      assert.match(/** @type {Error} */ (failure).message, /still running/,
+        'the failure must be reported as the child not exiting, not as something else');
+      assert.equal(/** @type {Error} */ (failure).message.includes(String(second.pid)), true,
+        'the failure must name the child it could not stop, so a leak can be found from the log');
+      // The assertion that makes this a regression: the child is GONE.
+      const exited = second.exitCode !== null || second.signalCode !== null;
+      assert.equal(exited, true,
+        `the fixture must not leave the second daemon running: pid ${String(second.pid)} is still alive`);
+      assert.notEqual(second.exitCode, null,
+        'the daemon must have exited on the fixture\'s own signal, not been left to the OS');
+    } finally {
+      if (second) await terminateChild(second);
       if (first) await first.stop();
       await host.stop();
       scratch.cleanup();

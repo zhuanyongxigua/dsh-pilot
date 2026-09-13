@@ -418,3 +418,71 @@ pong. A fixture that produces frames a correct client must reject hides parser b
 them, so it now refuses the same frames. It remains a TEST helper: nothing in this section is evidence
 about the official Host, and the production parser's rules are asserted against a raw peer, not against
 this fixture.
+
+## C-10: the workspace boundary — resolve and record, or refuse
+
+**The tension.** `cwd` is the one caller-supplied value this bridge hands to a component that runs tools
+inside it, and it is a path. A path is a name, not a directory: between the moment a session is created and
+the moment work is dispatched, the name can be deleted, replaced by a file, or replaced by a symlink
+pointing somewhere else. The bridge cannot confine what a turn does on the Host's filesystem — that
+authority is the Host's — so the question is what it can enforce, and there are two candidate answers.
+
+**Option A: refuse every `cwd` that is a symlink (or is not under some configured root).** Attractive
+because it is a flat "no", and wrong for this bridge: the Host's own workspace handling legitimately accepts
+resolved paths, real deployments put their workspaces behind links, and a rule this bridge invents about
+which directories are allowed would refuse working configurations for a security property it does not
+actually control. It also cannot be enforced well from here — the check would be a prefix comparison on
+strings, which `..` and a nested link both defeat, i.e. a defence that looks like one and is not.
+
+**Option B (chosen): resolve at create, record the directory, re-verify before dispatch.** A `cwd` is
+resolved with `realpath` at `session.create`; the RESOLVED directory is what the session records and what
+the Host is told; a path that is relative, missing, or not a directory is refused with `WORKSPACE_UNSAFE`
+before anything is reserved or sent. Before `session.prompt` dispatches, the recorded directory is
+re-resolved and compared against itself: because the record holds a resolved path, "still the same
+directory" is exactly "this path still resolves to itself and is still a directory". A swap to a symlink
+resolves elsewhere, a deletion does not resolve at all, and a file is not a directory — all three are
+`WORKSPACE_CHANGED`, thrown BEFORE the operation is reserved, so no prompt can reach the Host and no durable
+intent is left behind for a later replay to send.
+
+**Why this is the honest shape.** It enforces the part this process owns — the value it hands over — and
+claims nothing about the part it does not. It is also checkable: "no prompt reached the Host" is asserted
+against the fake Host's received-request log rather than against our own reply, so a refusal that still
+dispatched could not pass.
+
+**The trades, stated rather than implied.**
+
+1. **A symlinked workspace is accepted and resolved, not refused.** A caller who passes a link gets a
+   session whose workspace is the directory the link pointed at when the session was created. If the link
+   is later re-pointed, the session is unaffected — which is the point — and a caller wanting the new target
+   creates a session for it.
+2. **The operation's identity carries the resolved path.** A retry with the same name and the same target
+   resolves identically and finds the same operation; a retry whose name now resolves elsewhere is refused
+   by the workspace check rather than quietly creating a second session in a directory the first caller
+   never chose.
+3. **A same-key retry after a workspace change is refused instead of returning the earlier outcome.** Both
+   answers are defensible; the refusal is the more useful one, because the caller's intent was to run work
+   in a directory that no longer exists. It is a real behavioural choice, so it is recorded here rather
+   than left for a reader to discover from a test.
+4. **The check runs on every dispatch, not once.** It costs two filesystem calls per prompt, which is
+   affordable for this surface and is the only way the property holds for a session that lives for days.
+5. **A workspace must already exist when the session is created.** This is the one part callers will
+   notice, so it is stated plainly here rather than discovered from an error: a missing path is refused
+   with `WORKSPACE_UNSAFE`, and the caller creates the directory first. The alternative was to record a
+   canonical path for a directory that does not exist yet, on the theory that the Host creates it — and it
+   was tried, because it would have been less disruptive. It was withdrawn: the Host's behaviour for a
+   missing `cwd` is not something this project has measured, `workspace-invalid-path` is a Host-side code
+   this fixture cannot produce, and a recorded path whose target is chosen by whoever creates it later is
+   exactly the state the requirement is about. Refusing is the answer that is verifiable from here.
+
+**The cost of that, paid in fixtures rather than in the contract.** Applying this to the suite failed eight
+cases at once, and it was worth being clear about why before changing anything: `fake-host/contract` named
+`/workspace/one`, `mcp-e2e/multi-caller` named a fixed `/tmp/multi-caller-workspace`, and `mcp-e2e/stdio`
+named a fixed `/tmp/fixture-workspace`. None of those directories was ever created — the fixtures had been
+relying on a Host-side tolerance this bridge never documented, and the failures were missing fixture setup,
+not eight daemon defects. Each rig now creates its OWN real workspace inside the scratch directory it
+already owned, canonicalised with `realpath` because that is what the bridge records and re-verifies;
+`multi-caller` shares one workspace across every caller and across the daemon restart within a single test,
+which is what its "one durable session" assertions are about; the `cwd`-conflict case uses a second, real,
+distinct directory so the conflict is between two workspaces that exist; and every cleanup removes only the
+directory the rig created. No fixed path under the OS temp root is created or depended on, and the
+production contract was not relaxed to make a fixture pass.

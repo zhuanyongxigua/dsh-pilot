@@ -12,6 +12,7 @@
  */
 
 import { join } from 'node:path';
+import { mkdirSync, realpathSync } from 'node:fs';
 import { assert, collect, ipcClient, jsonLines, scratchDir, spawnNode, startDaemon, waitFor } from '../helpers.mjs';
 import { FakeHost } from '../fixtures/fake-host.mjs';
 
@@ -85,11 +86,17 @@ async function startMcpClient({ socketPath, stateDir }) {
   };
 }
 
-/** Bring up fake Host + daemon + MCP gateway. */
+/** Bring up fake Host + daemon + MCP gateway, with a real workspace in this rig's scratch directory. */
 async function rig(label) {
   const host = await new FakeHost().start();
   const scratch = scratchDir(label);
   const stateDir = join(scratch.dir, 'state');
+  // A session's cwd must be an existing directory, so the fixture creates the one it is about to name —
+  // inside its own scratch directory, and canonicalised because the bridge records and re-verifies the
+  // RESOLVED path. The previous fixed path under the OS temp root was created by nobody.
+  const workspaceDir = join(scratch.dir, 'workspace');
+  mkdirSync(workspaceDir, { recursive: true });
+  const workspace = realpathSync(workspaceDir);
   const daemon = await startDaemon({ hostBase: host.baseUrl, stateDir });
   const client = await startMcpClient({ socketPath: daemon.socketPath, stateDir });
   const teardown = async () => {
@@ -98,7 +105,7 @@ async function rig(label) {
     await host.stop();
     scratch.cleanup();
   };
-  return { host, daemon, client, teardown, stateDir };
+  return { host, daemon, client, teardown, stateDir, workspace };
 }
 
 /** Parse the JSON payload a tool result carries. */
@@ -142,7 +149,7 @@ export default {
   },
 
   'a full session lifecycle driven only through MCP tools': async () => {
-    const { client, teardown } = await rig('mcp-lifecycle');
+    const { client, teardown, workspace } = await rig('mcp-lifecycle');
     try {
       await client.request('initialize', {
         protocolVersion: PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'c', version: '0' },
@@ -155,7 +162,7 @@ export default {
       assert.match(task.task.taskId, /^task_/);
 
       const session = toolPayload(await client.callTool('dsh_session_start', {
-        taskId: task.task.taskId, clientKey: 'lifecycle-session', cwd: '/tmp/fixture-workspace',
+        taskId: task.task.taskId, clientKey: 'lifecycle-session', cwd: workspace,
       }));
       assert.ok(session.session, `session.start returned no session: ${JSON.stringify(session)}`);
       assert.match(session.session.sessionId, /^sess_/);

@@ -14,7 +14,7 @@
  * Opt-in: `--isolated`.
  */
 
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { assert, ipcClient, skip, startDaemon, waitFor } from '../helpers.mjs';
 import { OPERATOR_SANDBOX_MODE } from '../fixtures/mock-provider.mjs';
@@ -58,6 +58,10 @@ async function rig(label) {
   const openSession = async (options = {}) => {
     const task = await ipc.request({ op: 'task.ensure', clientKey: key('task') });
     const workspace = join(host.scratch.dir, options.workspace ?? 'workspace');
+    // Created here rather than left to the Host: a session's cwd must be an existing directory, which is
+    // both what the bridge now enforces (`security/workspace-cwd`) and what a real caller does. Relying on
+    // the Host to create it would have made these cases depend on behaviour this project does not control.
+    mkdirSync(workspace, { recursive: true });
     const started = await ipc.request({
       op: 'session.start',
       taskId: task.task.taskId,
@@ -365,6 +369,12 @@ export default {
       const markerB = 'SESSION-B-MARKER-22bb';
       const workspaceA = join(r.host.scratch.dir, 'ws-a');
       const workspaceB = join(r.host.scratch.dir, 'ws-b');
+      // Real directories, because a session's cwd must be one: the real Host accepted these paths without
+      // them existing, and this bridge no longer does (see docs/conflicts.md C-10). The test's own oracle
+      // is two sessions staying isolated on a real Host, so the workspaces are made real rather than the
+      // production rule being relaxed for a fixture.
+      mkdirSync(workspaceA, { recursive: true });
+      mkdirSync(workspaceB, { recursive: true });
 
       const taskA = await r.ipc.request({ op: 'task.ensure', clientKey: r.key('task-a') });
       const taskB = await r.ipc.request({ op: 'task.ensure', clientKey: r.key('task-b') });

@@ -30,6 +30,7 @@
  * Opt-in: `--isolated`.
  */
 
+import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { assert, ipcClient, skip, startDaemon, waitFor } from '../helpers.mjs';
 import { MOCK_API_KEY_ENV, resolveDshBin, startMockedDshHost } from './rig.mjs';
@@ -128,6 +129,10 @@ export default {
     requireIsolated(context);
     const host = await startMockedDshHost({ label: 'isolated-history' });
     const stateDir = join(host.scratch.dir, 'state');
+    // A session's cwd must be an existing directory — the rule the bridge now enforces and the rule a real
+    // caller lives with — so the fixture creates the one it is about to use.
+    const workspace = join(host.scratch.dir, 'workspace');
+    mkdirSync(workspace, { recursive: true });
     const attached = await attach('isolated-history', stateDir, host.hostBase);
     try {
       const marker = 'HISTORY-PAGE-MARKER-7f52';
@@ -136,7 +141,7 @@ export default {
       const { taskId } = task.task;
       const started = await attached.ipc.request({
         op: 'session.start', taskId, clientKey: 'history-session',
-        cwd: join(host.scratch.dir, 'workspace'),
+        cwd: workspace,
       });
       assert.equal(started.operation.state, 'succeeded', JSON.stringify(started.operation));
       const { sessionId } = started.session;
@@ -217,11 +222,13 @@ export default {
       const marker = 'REATTACH-MARKER-3b18';
       host.mock.routeByText('Reply with the marker', { text: marker });
       first = await attach('isolated-reattach', stateDir, host.hostBase);
+      const workspace = join(host.scratch.dir, 'workspace');
+      mkdirSync(workspace, { recursive: true });
       const task = await first.ipc.request({ op: 'task.ensure', clientKey: 'reattach-task' });
       const { taskId } = task.task;
       const started = await first.ipc.request({
         op: 'session.start', taskId, clientKey: 'reattach-session',
-        cwd: join(host.scratch.dir, 'workspace'),
+        cwd: workspace,
       });
       assert.equal(started.operation.state, 'succeeded', JSON.stringify(started.operation));
       const { sessionId } = started.session;

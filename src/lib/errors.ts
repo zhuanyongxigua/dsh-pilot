@@ -55,6 +55,13 @@ export const ERROR_CODES = Object.freeze({
   // Local filesystem safety: a path this process owns turned out not to be the file it expected
   UNSAFE_STATE_PATH: 'UNSAFE_STATE_PATH',
 
+  // Workspace (cwd) boundary. Two codes, because the two cases need different responses from a caller:
+  // WORKSPACE_UNSAFE is an argument this call cannot use (create a session with a usable directory),
+  // WORKSPACE_CHANGED is a session whose workspace moved out from under it (this call must not dispatch,
+  // and retrying it is not the fix).
+  WORKSPACE_UNSAFE: 'WORKSPACE_UNSAFE',
+  WORKSPACE_CHANGED: 'WORKSPACE_CHANGED',
+
   // Resource bounds
   RESULT_TOO_LARGE: 'RESULT_TOO_LARGE',
   BUFFER_OVERFLOW: 'BUFFER_OVERFLOW',

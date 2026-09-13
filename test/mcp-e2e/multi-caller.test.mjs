@@ -37,6 +37,7 @@
 
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { mkdirSync, realpathSync } from 'node:fs';
 import { asRecord, assert, collect, jsonLines, scratchDir, spawnNode, startDaemon, waitFor } from '../helpers.mjs';
 import { FakeHost } from '../fixtures/fake-host.mjs';
 
@@ -45,7 +46,6 @@ const PROTOCOL_VERSION = '2024-11-05';
 const TASK_KEY = 'multi-caller-task';
 /** The idempotency key that names the task's session; the same value must resolve to the same session. */
 const SESSION_KEY = 'multi-caller-session';
-const CWD = '/tmp/multi-caller-workspace';
 
 /**
  * One parsed JSON-RPC reply, as far as this client reads it.
@@ -200,6 +200,13 @@ async function rig(label) {
   const host = await new FakeHost().start();
   const scratch = scratchDir(label);
   const stateDir = join(scratch.dir, 'state');
+  // ONE real workspace per test, inside this rig's own scratch directory, canonicalised because the bridge
+  // records and re-verifies the resolved path. Every caller in the test — and the daemon on either side of
+  // a restart — names this same directory, so "the same durable session" is asserted against a workspace
+  // that really exists rather than against a fixed path under the OS temp root that nothing created.
+  const workspaceDir = join(scratch.dir, 'workspace');
+  mkdirSync(workspaceDir, { recursive: true });
+  const workspace = realpathSync(workspaceDir);
   let daemon = await startDaemon({ hostBase: host.baseUrl, stateDir });
   /** @type {Array<Awaited<ReturnType<typeof startMcpClient>>>} */
   const callers = [];
@@ -207,6 +214,7 @@ async function rig(label) {
   return {
     host,
     stateDir,
+    workspace,
     get daemon() { return daemon; },
     /** @param {string} name */
     startCaller: async (name) => {
@@ -343,11 +351,12 @@ function journalSessionIds(stateDir, taskId) {
  * turn the fake Host completes deterministically.
  * @param {McpCaller} caller
  * @param {string} probeText
+ * @param {string} workspace the rig's real workspace directory
  */
-async function createTaskAndSession(caller, probeText) {
+async function createTaskAndSession(caller, probeText, workspace) {
   const task = toolJson(await caller.callTool('dsh_task_start', { clientKey: TASK_KEY }));
   const session = toolJson(await caller.callTool('dsh_session_start', {
-    taskId: task.task.taskId, clientKey: SESSION_KEY, cwd: CWD,
+    taskId: task.task.taskId, clientKey: SESSION_KEY, cwd: workspace,
   }));
   const prompt = toolJson(await caller.callTool('dsh_session_prompt', {
     taskId: task.task.taskId, sessionId: session.session.sessionId, clientKey: 'multi-caller-prompt-1', text: probeText,
@@ -392,7 +401,7 @@ export default {
     const r = await rig('mcp-multi-snapshot');
     try {
       const a = await r.startCaller('A');
-      const created = await createTaskAndSession(a, 'first prompt from caller A');
+      const created = await createTaskAndSession(a, 'first prompt from caller A', r.workspace);
       await waitForTurnEnded(a, created);
 
       // A second MCP client PROCESS: its own stdin/stdout, its own gateway, same daemon, same state.
@@ -445,7 +454,7 @@ export default {
     const r = await rig('mcp-multi-cursor');
     try {
       const a = await r.startCaller('A');
-      const created = await createTaskAndSession(a, 'cursor probe');
+      const created = await createTaskAndSession(a, 'cursor probe', r.workspace);
       await waitForTurnEnded(a, created);
       const b = await r.startCaller('B');
       const args = { taskId: created.taskId, sessionId: created.sessionId };
@@ -497,7 +506,7 @@ export default {
     const r = await rig('mcp-second-attach');
     try {
       const a = await r.startCaller('A');
-      const created = await createTaskAndSession(a, 'attach probe');
+      const created = await createTaskAndSession(a, 'attach probe', r.workspace);
       await waitForTurnEnded(a, created);
 
       const before = journalSessionIds(r.stateDir, created.taskId);
@@ -506,7 +515,7 @@ export default {
 
       const b = await r.startCaller('B');
       const attach = toolJson(await b.callTool('dsh_session_start', {
-        taskId: created.taskId, clientKey: SESSION_KEY, cwd: CWD,
+        taskId: created.taskId, clientKey: SESSION_KEY, cwd: r.workspace,
       }));
       assert.ok(attach.session !== null, `a second attach must return the session it attached to, not null: ${brief(attach)}`);
       assert.equal(attach.session.sessionId, created.sessionId, 'the second attach must return the SAME session id');
@@ -545,7 +554,7 @@ export default {
     const r = await rig('mcp-caller-restart');
     try {
       const a = await r.startCaller('A');
-      const created = await createTaskAndSession(a, 'restart probe');
+      const created = await createTaskAndSession(a, 'restart probe', r.workspace);
       await waitForTurnEnded(a, created);
       const args = { taskId: created.taskId, sessionId: created.sessionId };
 
@@ -567,7 +576,7 @@ export default {
       const taskC = toolJson(await c.callTool('dsh_task_start', { clientKey: TASK_KEY }));
       assert.equal(taskC.task.taskId, created.taskId, 'the new process must resolve the same task id');
       assert.equal(taskC.created, false);
-      const attachC = toolJson(await c.callTool('dsh_session_start', { taskId: created.taskId, clientKey: SESSION_KEY, cwd: CWD }));
+      const attachC = toolJson(await c.callTool('dsh_session_start', { taskId: created.taskId, clientKey: SESSION_KEY, cwd: r.workspace }));
       assert.ok(attachC.session !== null, `the new process must attach to the existing session, not get null: ${brief(attachC)}`);
       assert.equal(attachC.session.sessionId, created.sessionId, 'the new process must resolve the same session id');
       assert.equal(attachC.reused, true);
@@ -587,7 +596,7 @@ export default {
     const r = await rig('mcp-id-restart');
     try {
       const a = await r.startCaller('A');
-      const created = await createTaskAndSession(a, 'id stability probe');
+      const created = await createTaskAndSession(a, 'id stability probe', r.workspace);
       await waitForTurnEnded(a, created);
       const args = { taskId: created.taskId, sessionId: created.sessionId };
 
@@ -647,7 +656,7 @@ export default {
       assert.notEqual(secondDaemonPid, firstDaemonPid,
         'the daemon must be a new operating-system process, or "across a restart" means nothing');
 
-      const reAttachAfterRestart = toolJson(await c.callTool('dsh_session_start', { taskId: before.taskId, clientKey: SESSION_KEY, cwd: CWD }));
+      const reAttachAfterRestart = toolJson(await c.callTool('dsh_session_start', { taskId: before.taskId, clientKey: SESSION_KEY, cwd: r.workspace }));
       assert.ok(reAttachAfterRestart.session !== null,
         `the re-attach after a restart must return the durable session, not null: ${brief(reAttachAfterRestart)}`);
       const after = {
@@ -666,7 +675,7 @@ export default {
       // The re-attach is the same session, not a replacement: one session, one session.create, ever.
       assert.deepEqual(journalSessionIds(r.stateDir, before.taskId), [before.sessionId], 'the session count must still be exactly one after the restart');
       assert.equal(r.host.requestsFor('session.create').length, 1, 'the re-attach after a restart must not create another Host session');
-      const reAttach = toolJson(await c.callTool('dsh_session_start', { taskId: before.taskId, clientKey: SESSION_KEY, cwd: CWD }));
+      const reAttach = toolJson(await c.callTool('dsh_session_start', { taskId: before.taskId, clientKey: SESSION_KEY, cwd: r.workspace }));
       assert.equal(reAttach.reused, true);
       assert.equal(reAttach.operation.operationId, created.createOperationId, 'the session.create operation must be the same durable operation after the restart');
     } finally {
@@ -680,7 +689,7 @@ export default {
       const a = await r.startCaller('A');
       const task = toolJson(await a.callTool('dsh_task_start', { clientKey: TASK_KEY }));
       const session = toolJson(await a.callTool('dsh_session_start', {
-        taskId: task.task.taskId, clientKey: SESSION_KEY, cwd: CWD,
+        taskId: task.task.taskId, clientKey: SESSION_KEY, cwd: r.workspace,
       }));
       const taskId = task.task.taskId;
       const sessionId = session.session.sessionId;

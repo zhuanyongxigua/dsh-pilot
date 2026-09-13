@@ -72,6 +72,9 @@ export function jsonRpcCode(code: string): number {
     case 'CONFLICT':
     case 'NOT_FOUND':
     case 'ILLEGAL_TRANSITION':
+    // The caller passed a workspace this process cannot use. That is an argument error, and a caller can
+    // only act on it if it is told so: the default arm would report it as our internal failure.
+    case 'WORKSPACE_UNSAFE':
       return -32602;
     case 'UNSUPPORTED':
       return -32601;
