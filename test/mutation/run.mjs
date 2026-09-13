@@ -316,6 +316,51 @@ const MUTATIONS = [
     expectFailure: 'invalid arguments',
   },
   {
+    name: 'ipc-client-counts-the-delivery-not-the-frame',
+    kind: 'production',
+    protects: 'bounded input: the IPC client spends its per-reply budget per FRAME, not per delivery',
+    why: ('A `data` event is what the kernel chose to hand over, not what the peer framed: it can carry two '
+      + 'complete replies. Adding the whole chunk to the counter before splitting it on newlines refused two '
+      + 'legal replies for their combined size, failed every pending caller for it, and — because the check no '
+      + 'longer measured a frame at all — accepted a single frame larger than the bound when the peer '
+      + 'delivered it in pieces. Both halves of that are in the cases below.'),
+    file: 'src/lib/ipc.ts',
+    find: `      const frames = framer.push(chunk);
+      for (const frame of frames) {
+        if (frame.bytes > this.#maxReplyBytes) {
+          this.#refuseOversize(framer, frame.bytes);
+          return;
+        }
+      }`,
+    replace: `      const frames = framer.push(chunk);
+      if (chunk.length > this.#maxReplyBytes) { // MUTATION: the delivery is treated as the frame
+        this.#refuseOversize(framer, chunk.length);
+        return;
+      }`,
+    target: 'test/network',
+    expectFailure: 'reply exceeds the IPC reply limit',
+  },
+  {
+    name: 'ipc-server-counts-the-delivery-not-the-line',
+    kind: 'production',
+    protects: 'bounded input: the daemon spends its per-request-line budget per LINE, not per delivery',
+    why: ('Same defect, server side: two pipelined requests batched into one write were refused together, so '
+      + 'a client that batched its requests had its connection destroyed for being efficient.'),
+    file: 'src/lib/ipc.ts',
+    find: `      for (const frame of frames) {
+        if (frame.bytes > maxRequestBytes) {
+          refuseOversizeLine();
+          return;
+        }
+      }`,
+    replace: `      if (chunk.length > maxRequestBytes) { // MUTATION: the delivery is treated as the line
+        refuseOversizeLine();
+        return;
+      }`,
+    target: 'test/network',
+    expectFailure: 'the server never answered both lines',
+  },
+  {
     name: 'ipc-client-receive-bound-removed',
     kind: 'production',
     protects: 'bounded input: the IPC client bounds the bytes it holds for one reply',
@@ -323,8 +368,22 @@ const MUTATIONS = [
       + 'ACCEPTED while the client capped nothing, so a peer that never sent a newline grew a gateway '
       + 'buffer without limit.'),
     file: 'src/lib/ipc.ts',
-    find: '      if (this.#received > this.#maxReplyBytes) {',
-    replace: '      if (this.#received > Number.MAX_SAFE_INTEGER) { // MUTATION: no receive bound',
+    find: `      for (const frame of frames) {
+        if (frame.bytes > this.#maxReplyBytes) {
+          this.#refuseOversize(framer, frame.bytes);
+          return;
+        }
+      }
+      // An unterminated frame may hold at most one frame's worth of bytes, so this is where a peer that
+      // never sends a newline is refused instead of being buffered for ever.
+      if (framer.pendingBytes > this.#maxReplyBytes) {
+        this.#refuseOversize(framer, framer.pendingBytes);
+        return;
+      }`,
+    replace: `      for (const frame of frames) {
+        void frame; // MUTATION: no receive bound at all, per frame or on the remainder
+      }
+      void framer.pendingBytes;`,
     target: 'test/network',
     expectFailure: 'never sends a newline',
   },
@@ -334,10 +393,11 @@ const MUTATIONS = [
     protects: 'framing: a request split inside a multi-byte character arrives as it was sent',
     why: ('A chunk boundary is not a character boundary. `chunk.toString(\'utf8\')` on a chunk that ends '
       + 'mid-sequence produces a replacement character that concatenating the next chunk cannot repair, so a '
-      + 'prompt containing multi-byte text could be stored corrupted.'),
+      + 'prompt containing multi-byte text could be stored corrupted. The mutation applies the same defect to '
+      + 'the framer: each piece of a frame decoded on its own instead of the joined frame.'),
     file: 'src/lib/ipc.ts',
-    find: '      buffer += decoder.write(chunk);',
-    replace: "      buffer += chunk.toString('utf8'); // MUTATION: per-chunk decode",
+    find: `      const text = body.toString('utf8');`,
+    replace: "      const text = pieces.map((part) => part.toString('utf8')).join(''); // MUTATION: per-piece decode",
     target: 'test/network',
     expectFailure: 'split mid-character',
   },
@@ -490,10 +550,11 @@ function makeSandbox() {
 }
 
 /**
- * One control's outcome. `kind`, `protects` and `invalid` are genuinely absent on the "the mutation
+ * One control's outcome. `kind`, `protects`, `invalid` and `notApplied` are genuinely absent on most
+ * outcomes, so a reader may treat absence as false rather than as a missing entry. The one control's outcome. `kind`, `protects` and `invalid` are genuinely absent on the "the mutation
  * did not apply" case, which is reported before any suite runs — so the summary reads their absence
  * as it reads `false` rather than an entry being invented for them.
- * @type {{name: string, caught: boolean, failed: number, passed: number, timedOut: number, skipped: number, detail: string, kind?: 'production'|'fixture', protects?: string|null, invalid?: boolean}[]}
+ * @type {{name: string, caught: boolean, failed: number, passed: number, timedOut: number, skipped: number, detail: string, kind?: 'production'|'fixture', protects?: string|null, invalid?: boolean, notApplied?: boolean}[]}
  */
 const results = [];
 
@@ -503,8 +564,13 @@ for (const mutation of selected) {
     const path = join(sandbox, mutation.file);
     const original = readFileSync(path, 'utf8');
     if (!original.includes(mutation.find)) {
+      // NOT a survivor, and it must not be reported as one. A survivor means "the suite failed to notice
+      // this defect"; an anchor that no longer exists means the defect was never introduced and no test
+      // was given the chance to notice anything. Reported as NOT-APPLIED and counted separately, because
+      // collapsing the two makes a dead control look like a weak suite — the opposite of the truth, and
+      // exactly the reading that let two stale anchors in this file go unnoticed once already.
       results.push({
-        name: mutation.name, caught: false, failed: 0, passed: 0, timedOut: 0, skipped: 0,
+        name: mutation.name, caught: false, notApplied: true, failed: 0, passed: 0, timedOut: 0, skipped: 0,
         detail: `mutation did not apply: the expected anchor is gone from ${mutation.file} (the code changed; update the mutation)`,
       });
       continue;
@@ -584,10 +650,11 @@ for (const mutation of selected) {
 
 process.stdout.write('\nmutation / negative controls\n');
 for (const result of results) {
-  process.stdout.write(`${result.caught ? 'caught  ' : result.invalid ? 'INVALID ' : 'SURVIVED'} ${result.name}\n`);
+  process.stdout.write(`${result.caught ? 'caught  ' : result.invalid ? 'INVALID ' : result.notApplied ? 'NOT-APPLIED ' : 'SURVIVED'} ${result.name}\n`);
   process.stdout.write(`    ${result.detail}\n`);
 }
-const survived = results.filter((result) => !result.caught && !result.invalid).length;
+const notApplied = results.filter((result) => result.notApplied).length;
+const survived = results.filter((result) => !result.caught && !result.invalid && !result.notApplied).length;
 const invalid = results.filter((result) => result.invalid).length;
 const byKind = {};
 for (const result of results) {
@@ -596,7 +663,7 @@ for (const result of results) {
   byKind[kind].total += 1;
   if (result.caught) byKind[kind].caught += 1;
 }
-process.stdout.write(`\nmutations=${results.length} caught=${results.length - invalid - survived} survived=${survived} invalid=${invalid}\n`);
+process.stdout.write(`\nmutations=${results.length} caught=${results.length - invalid - survived - notApplied} survived=${survived} invalid=${invalid} notApplied=${notApplied}\n`);
 // Reported by kind ON PURPOSE. A fixture control proves the fake Host is a faithful stand-in; only a
 // production control is evidence that this bridge notices its own defect. Collapsing the two into one
 // number would overstate what the suite has demonstrated.
@@ -641,13 +708,14 @@ if (jsonPath) {
     root: ROOT,
     results,
     mutations: results.length,
-    caught: results.length - survived - invalid,
+    caught: results.length - survived - invalid - notApplied,
     survived,
     invalid,
+    notApplied,
     byKind,
     obligations: obligationTable,
   }, null, 2)}\n`);
   process.stdout.write(`machine-readable report: ${jsonPath}\n`);
 }
 
-process.exit(survived > 0 || invalid > 0 ? 1 : 0);
+process.exit(survived > 0 || invalid > 0 || notApplied > 0 ? 1 : 0);

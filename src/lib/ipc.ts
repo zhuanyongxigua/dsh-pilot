@@ -23,7 +23,6 @@ import {
   openSync, readFileSync, unlinkSync, writeSync,
 } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
-import { StringDecoder } from 'node:string_decoder';
 import { join } from 'node:path';
 import { BridgeError, ERROR_CODES, toBridgeError } from './errors.ts';
 
@@ -51,6 +50,96 @@ export const MAX_IPC_LINE_BYTES = 4 * 1024 * 1024;
 export const MAX_IPC_REPLY_BYTES = 16 * 1024 * 1024;
 /** Maximum simultaneous gateway connections. */
 export const MAX_IPC_CONNECTIONS = 32;
+
+/** One complete newline-terminated frame, with the BYTES it occupied on the wire. */
+interface FramedLine {
+  readonly text: string;
+  /** The frame's own bytes including its newline: what a per-frame budget is about. */
+  readonly bytes: number;
+}
+
+/**
+ * Assemble newline-delimited frames out of a byte stream, counting each frame in RAW BYTES.
+ *
+ * This exists because the two things a socket hands you are not the things a protocol is made of. A
+ * single `data` event can carry several complete frames, half of one, or the tail of one and the head of
+ * the next; the kernel decides, and it is not the peer's framing. Both ends of this socket used to treat
+ * a chunk as if it were a frame: they added `chunk.length` to a counter, compared THAT against a per-frame
+ * budget, and only then split the chunk on newlines. Two legal replies whose combined size exceeded the
+ * budget were therefore refused together, and a request that arrived batched with another was refused for
+ * the other's size — the bound rejected traffic it was not about.
+ *
+ * The other half of the same mistake was the reset: the counter was restored from
+ * `Buffer.byteLength(buffer)`, the re-encoded length of the DECODED remainder, so the incomplete trailing
+ * integer of a multi-byte character, which a streaming decoder holds OUTSIDE that string, was not counted
+ * at all. Framing on the raw bytes removes the question: a frame's size is the distance between the
+ * newlines around it, exact by construction, and there is no decoder in the accounting path to lose bytes
+ * in.
+ *
+ * Decoding each frame on its own is correct rather than a compromise, and this is why: a newline byte can
+ * never occur inside a UTF-8 sequence (continuation bytes are all >= 0x80), so a frame boundary is always
+ * a character boundary, and a frame's bytes always decode to its text in full.
+ */
+class LineFramer {
+  /**
+   * The pieces of the frame being received, and their total. Held as a list rather than as one growing
+   * Buffer so that each arriving chunk is appended instead of copied: a large frame delivered in many
+   * chunks would otherwise re-copy everything received so far on every chunk. Nothing here needs the
+   * joined bytes until a newline says the frame is complete, and that join happens once per frame.
+   */
+  #parts: Buffer[] = [];
+  #size = 0;
+
+  /**
+   * Bytes buffered for a frame that has not been terminated by a newline yet.
+   *
+   * The honest remainder: with a per-frame budget, an unterminated frame may hold at most one frame's
+   * worth of bytes, and this is the number to compare against it.
+   */
+  get pendingBytes(): number {
+    return this.#size;
+  }
+
+  /** Drop everything buffered. Called after a refusal, so nothing is handed to a dead connection. */
+  reset(): void {
+    this.#parts = [];
+    this.#size = 0;
+  }
+
+  /**
+   * Add bytes and take out every frame they completed.
+   * @param chunk the bytes the socket handed over, which may hold any number of frames in any state
+   */
+  push(chunk: Buffer): FramedLine[] {
+    const frames: FramedLine[] = [];
+    let rest = chunk;
+    for (;;) {
+      // A frame boundary cannot be in bytes already scanned: they were split and removed when they
+      // arrived, so only the newest bytes ever need searching — which is why this loop starts from the
+      // current piece rather than rescanning everything buffered.
+      const index = rest.indexOf(0x0a);
+      if (index < 0) break;
+      const head = rest.subarray(0, index);
+      // The pieces of THIS frame, joined once. Kept in a named value so that the decode below is
+      // visibly a decode of the whole frame: decoding the pieces separately would be the per-chunk
+      // mistake this class exists to remove, and a reader should be able to see that it is not that.
+      const pieces = this.#parts.length === 0 ? [head] : [...this.#parts, head];
+      const body = pieces.length === 1 ? (pieces[0] ?? head) : Buffer.concat(pieces);
+      const text = body.toString('utf8');
+      this.#parts = [];
+      this.#size = 0;
+      // The frame's bytes are the line plus its terminator: the wire cost of the frame, which is what a
+      // bound named "bytes per frame" is about.
+      frames.push({ text, bytes: body.length + 1 });
+      rest = rest.subarray(index + 1);
+    }
+    if (rest.length > 0) {
+      this.#parts.push(rest);
+      this.#size += rest.length;
+    }
+    return frames;
+  }
+}
 
 /** Path of the authority token that gates approval decisions. */
 export interface AuthorityToken {
@@ -82,6 +171,13 @@ export interface StartIpcServerOptions {
   readonly handle: IpcRequestHandler;
   /** Cap on one reply frame, in bytes. Defaults to the shared {@link MAX_IPC_REPLY_BYTES}. */
   readonly maxReplyBytes?: number;
+  /**
+   * Cap on one REQUEST line, in bytes. Defaults to {@link MAX_IPC_LINE_BYTES}.
+   *
+   * Configurable for the same reason the reply bound is: the property under test is "the budget is spent
+   * per frame, not per delivery", and a case that can only be run at 4 MiB is a case nobody runs.
+   */
+  readonly maxRequestBytes?: number;
 }
 
 /**
@@ -227,7 +323,9 @@ export function readAuthorityToken(stateDir: string): string | null {
 }
 
 /** Start the daemon's IPC endpoint. */
-export async function startIpcServer({ stateDir, handle, maxReplyBytes = MAX_IPC_REPLY_BYTES }: StartIpcServerOptions): Promise<IpcServer> {
+export async function startIpcServer({
+  stateDir, handle, maxReplyBytes = MAX_IPC_REPLY_BYTES, maxRequestBytes = MAX_IPC_LINE_BYTES,
+}: StartIpcServerOptions): Promise<IpcServer> {
   const path = socketPathFor(stateDir);
   if (existsSync(path)) {
     // Reaching here means the owner lock is already held, so the endpoint is an orphan from a
@@ -243,55 +341,63 @@ export async function startIpcServer({ stateDir, handle, maxReplyBytes = MAX_IPC
       live -= 1;
       return;
     }
-    let buffer = '';
-    let received = 0;
-    // A STREAMING decoder, not `chunk.toString('utf8')`. The per-chunk form this replaced was wrong in
-    // the same way the byte count had been wrong, and the mistake is the same shape: a chunk boundary is
-    // not a character boundary. `toString` on a chunk that ends in the middle of a multi-byte sequence
-    // produces a replacement character, and concatenating the next chunk does not repair it, so a
-    // request whose text was split at that byte arrived here with U+FFFD where the peer sent a
-    // character. `StringDecoder` holds an incomplete trailing sequence back until its continuation
-    // arrives, which is the only correct way to turn a byte stream into text.
-    const decoder = new StringDecoder('utf8');
+    // Frames, not chunks. The budget below is named per REQUEST LINE and is now spent per request line:
+    // the previous form compared a counter of everything that had arrived in the current chunk against
+    // that budget, so two requests batched into one write were refused together even though each was
+    // legal, and the reset afterwards re-measured the DECODED remainder and lost the bytes a streaming
+    // decoder was holding on to. `LineFramer` returns each frame with its exact byte length and reports
+    // the bytes still waiting for a newline, which is the only quantity a per-frame budget can bound.
+    const framer = new LineFramer();
     let chain: Promise<void> = Promise.resolve();
-    // No `setEncoding` here, on purpose, and this is a FIX rather than a port.
+    // The history of this one budget is worth keeping, because it was wrong twice in two different ways.
     //
-    // The budget below is named MAX_IPC_LINE_BYTES and its comment promises BYTES RECEIVED, but the
-    // previous code called `setEncoding('utf8')` and then measured `chunk.length` and `buffer.length`.
-    // Those are UTF-16 code units, not bytes: one character can be up to 3 bytes in UTF-8 and a
-    // surrogate pair is 2 units for 4 bytes, so a peer could deliver a line roughly 3x the configured
-    // limit while every comparison stayed under it. That is a security bound that does not bound what
-    // it says it bounds, in the one place — the daemon's local control socket — where the bound is the
-    // defence. Reading raw Buffers and decoding explicitly makes `received` true bytes.
+    // First it called `setEncoding('utf8')` and measured `chunk.length` and `buffer.length` — UTF-16 code
+    // units, not bytes, so a peer could deliver a line roughly 3x the configured limit while every
+    // comparison stayed under it. That is a security bound that does not bound what it says it bounds, in
+    // the one place this project has one. Reading raw Buffers fixed the unit.
     //
-    // Decoding per chunk matches what `setEncoding` did: it is the same `StringDecoder`-equivalent
-    // path for an already-valid split of the stream, so line splitting is unchanged.
+    // Then it added the whole CHUNK to a counter before splitting that chunk into lines, and restored the
+    // counter from `Buffer.byteLength(remainder)`. The unit was right and the SUBJECT was wrong: a `data`
+    // event is a delivery, not a frame, so two legal requests batched into one write were refused for their
+    // combined size, and the reset re-encoded the decoded remainder, dropping the bytes a streaming decoder
+    // was holding for an incomplete character at the frame's end. `LineFramer` measures each frame's own
+    // bytes and reports the bytes still waiting for a newline; see its comment for why per-frame decoding
+    // is exact rather than a compromise.
+    /** The one refusal for an over-budget frame: destroy rather than wait for a flooding peer to close. */
+    const refuseOversizeLine = (): void => {
+      const payload = `${JSON.stringify({ ok: false, error: { code: ERROR_CODES.OVERSIZE, message: 'ipc line too large' } })}\n`;
+      socket.end(payload, () => socket.destroy());
+      setTimeout(() => socket.destroy(), 250).unref?.();
+      framer.reset();
+    };
     socket.on('data', (chunk: Buffer) => {
-      received += chunk.length;
-      if (received > MAX_IPC_LINE_BYTES) {
-        const payload = `${JSON.stringify({ ok: false, error: { code: ERROR_CODES.OVERSIZE, message: 'ipc line too large' } })}\n`;
-        // Destroy rather than half-close: `end()` waits for the peer, and a peer that is
-        // deliberately flooding is not going to close its side.
-        socket.end(payload, () => socket.destroy());
-        setTimeout(() => socket.destroy(), 250).unref?.();
-        buffer = '';
+      let frames: FramedLine[];
+      try {
+        frames = framer.push(chunk);
+      } catch (error) {
+        // `push` cannot fail by design; this keeps a surprise out of an event handler, where an uncaught
+        // throw would take the whole daemon down for one bad peer.
+        socket.destroy();
+        void error;
         return;
       }
-      buffer += decoder.write(chunk);
-      if (buffer.length > MAX_IPC_LINE_BYTES) {
-        socket.end(`${JSON.stringify({ ok: false, error: { code: ERROR_CODES.OVERSIZE, message: 'ipc line too large' } })}\n`, () => socket.destroy());
-        setTimeout(() => socket.destroy(), 250).unref?.();
-        buffer = '';
+      // Every frame is measured on its own bytes. A chunk holding two legal requests is served, because
+      // the budget is about a frame and not about how the kernel happened to deliver it.
+      for (const frame of frames) {
+        if (frame.bytes > maxRequestBytes) {
+          refuseOversizeLine();
+          return;
+        }
+      }
+      // And the bytes still waiting for a newline are the other half of the same budget: an unterminated
+      // frame can never legally hold more than one frame's worth, so this is the point at which a peer
+      // that never sends a newline is refused rather than buffered.
+      if (framer.pendingBytes > maxRequestBytes) {
+        refuseOversizeLine();
         return;
       }
-      let index = buffer.indexOf('\n');
-      while (index >= 0) {
-        const line = buffer.slice(0, index);
-        buffer = buffer.slice(index + 1);
-        // A completed line resets the receive budget: the limit is per line, not per lifetime. The
-        // remainder is measured in bytes here too, so a partial trailing line is counted honestly.
-        received = Buffer.byteLength(buffer, 'utf8');
-        index = buffer.indexOf('\n');
+      for (const frame of frames) {
+        const line = frame.text;
         if (line.trim() === '') continue;
         // Serialise per connection: a gateway must not observe interleaved replies.
         chain = chain.then(async () => {
@@ -405,8 +511,6 @@ interface IpcWaiter {
  */
 export class IpcClient {
   #socket: Socket;
-  #buffer = '';
-  #received = 0;
   #pending: IpcWaiter[] = [];
   #closed = false;
   #maxReplyBytes: number;
@@ -418,32 +522,29 @@ export class IpcClient {
   }) {
     this.#maxReplyBytes = maxReplyBytes;
     this.#socket = netConnect(socketPath);
-    // Raw Buffers and an explicit decoder, as on the server side: a byte count must be measured in
-    // bytes, and text must be assembled across chunk boundaries rather than per chunk.
-    const decoder = new StringDecoder('utf8');
+    // Frames, not chunks — the same correction as the server side, and for the same reason: a `data` event
+    // is a delivery, not a protocol frame. It can carry two complete replies, and this code used to add the
+    // whole chunk to one counter before splitting it, so two legal replies whose combined size exceeded the
+    // budget were refused together, and a reply batched behind another was refused for the other's size.
+    // The counter was also restored from the re-encoded DECODED remainder, which silently dropped the
+    // bytes a streaming decoder was holding for an incomplete multi-byte character at the frame's end.
+    const framer = new LineFramer();
     this.#socket.on('data', (chunk: Buffer) => {
-      this.#received += chunk.length;
-      if (this.#received > this.#maxReplyBytes) {
-        // Destroy rather than end: a peer that is flooding is not going to honour a half-close, and the
-        // pending callers must not be left waiting for a frame that can never arrive within the bound.
-        this.#buffer = '';
-        const refusal = new BridgeError(ERROR_CODES.OVERSIZE, 'reply exceeds the IPC reply limit', {
-          maxReplyBytes: this.#maxReplyBytes,
-          receivedBytes: this.#received,
-        });
-        this.#socket.destroy();
-        this.#failAll(refusal);
+      const frames = framer.push(chunk);
+      for (const frame of frames) {
+        if (frame.bytes > this.#maxReplyBytes) {
+          this.#refuseOversize(framer, frame.bytes);
+          return;
+        }
+      }
+      // An unterminated frame may hold at most one frame's worth of bytes, so this is where a peer that
+      // never sends a newline is refused instead of being buffered for ever.
+      if (framer.pendingBytes > this.#maxReplyBytes) {
+        this.#refuseOversize(framer, framer.pendingBytes);
         return;
       }
-      this.#buffer += decoder.write(chunk);
-      let index = this.#buffer.indexOf('\n');
-      while (index >= 0) {
-        const line = this.#buffer.slice(0, index);
-        this.#buffer = this.#buffer.slice(index + 1);
-        // A completed frame resets the budget: the bound is per reply, not per connection lifetime, and
-        // the remainder is counted in bytes rather than in characters.
-        this.#received = Buffer.byteLength(this.#buffer, 'utf8');
-        index = this.#buffer.indexOf('\n');
+      for (const frame of frames) {
+        const line = frame.text;
         if (line.trim() === '') continue;
         const waiter = this.#pending.shift();
         if (!waiter) {
@@ -472,6 +573,25 @@ export class IpcClient {
     });
     this.#socket.on('error', (error) => this.#failAll(error));
     this.#socket.on('close', () => this.#failAll(new BridgeError(ERROR_CODES.HOST_UNREACHABLE, 'daemon connection closed', {})));
+  }
+
+  /**
+   * Refuse one connection for a frame over the receive bound, and settle everything waiting on it.
+   *
+   * Destroy rather than end: a peer that is flooding is not going to honour a half-close, and the pending
+   * callers must not be left waiting for a frame that can never arrive inside the bound. The buffer is
+   * released with the connection, and the error names both the bound and the bytes that crossed it.
+   * @param framer the framer holding this connection's partial frame
+   * @param bytes the frame size that broke the bound
+   */
+  #refuseOversize(framer: LineFramer, bytes: number): void {
+    framer.reset();
+    const refusal = new BridgeError(ERROR_CODES.OVERSIZE, 'reply exceeds the IPC reply limit', {
+      maxReplyBytes: this.#maxReplyBytes,
+      receivedBytes: bytes,
+    });
+    this.#socket.destroy();
+    this.#failAll(refusal);
   }
 
   #failAll(error: unknown): void {

@@ -73,7 +73,349 @@ function codeOf(error) {
   return error && typeof error === 'object' && 'code' in error ? String(error.code) : '';
 }
 
+/** A reply frame whose total wire size — body bytes plus its newline — is exactly `total`. @param {number} total @param {string} tag */
+function replyOfExactSize(total, tag) {
+  const overhead = Buffer.byteLength(JSON.stringify({ ok: true, value: { tag, pad: '' } })) + 1;
+  assert.ok(total > overhead, `a frame of ${total} bytes cannot hold even an empty payload (needs > ${overhead})`);
+  const fill = total - overhead;
+  // Three-byte characters and then single bytes, so EVERY total is reachable and the padding is not
+  // silently rounded to a multiple of three.
+  const pad = '中'.repeat(Math.floor(fill / 3)) + 'x'.repeat(fill % 3);
+  const body = JSON.stringify({ ok: true, value: { tag, pad } });
+  assert.equal(Buffer.byteLength(body) + 1, total, 'the constructed frame must be exactly this size');
+  return body;
+}
+
+/**
+ * A reply frame of exactly `total` wire bytes whose LAST payload character is three bytes wide.
+ *
+ * This exists so a delivery split can be placed INSIDE a character rather than near one. The tail of a
+ * JSON frame is `"}` plus the newline — four ASCII bytes — so subtracting a couple of bytes from the end
+ * splits quoted ASCII and proves nothing about multi-byte handling. Here the padding ENDS in `中`, and the
+ * case locates that character's real byte offset instead of assuming one.
+ * @param {number} total @param {string} tag
+ */
+function replyOfExactSizeEndingInMultibyte(total, tag) {
+  const overhead = Buffer.byteLength(JSON.stringify({ ok: true, value: { tag, pad: '' } })) + 1;
+  const fill = total - overhead;
+  assert.ok(fill >= 3, `a frame of ${total} bytes cannot hold a three-byte character (needs ${fill} free bytes)`);
+  const pad = `${'x'.repeat(fill - 3)}中`;
+  const body = JSON.stringify({ ok: true, value: { tag, pad } });
+  assert.equal(Buffer.byteLength(body) + 1, total, 'the constructed frame must be exactly this size');
+  return body;
+}
+
+/**
+ * Locate the wire bytes and the interior offset of the last three-byte character in a frame.
+ *
+ * The assertions here are the point: they state that the split really does fall inside the character —
+ * the first part ends with the character's LEADING byte and the second begins with a CONTINUATION byte —
+ * and that the two parts rejoin into the bytes that were sent, so the oracle cannot be satisfied by a
+ * split somewhere in the JSON punctuation.
+ * @param {Buffer} bytes the whole frame, newline included
+ */
+function splitInsideLastCharacter(bytes) {
+  const wide = Buffer.from('中', 'utf8');
+  assert.equal(wide.length, 3, 'this case is written for a three-byte character');
+  const at = bytes.lastIndexOf(wide);
+  assert.ok(at >= 0, 'the frame must contain the wide character it was built around');
+  assert.ok(bytes.subarray(at, at + 3).equals(wide), 'the located offset must hold the whole sequence');
+  const cut = at + 1;
+  const first = bytes.subarray(0, cut);
+  const second = bytes.subarray(cut);
+  assert.equal(first[first.length - 1], wide[0], 'the first delivery must end on the character\'s leading byte');
+  assert.ok(first[first.length - 1] >= 0xc0, 'a leading byte is >= 0xc0, so the character really is cut open');
+  assert.equal(second.length > 0 && second[0] >= 0x80 && second[0] < 0xc0, true,
+    'the second delivery must begin with a continuation byte (0x80-0xbf)');
+  assert.ok(Buffer.concat([first, second]).equals(bytes), 'and the two parts must rejoin into what was sent');
+  return { cut, first, second };
+}
+
 export default {
+  'two replies delivered in ONE write are both answered, though together they exceed the per-reply bound': async () => {
+    // THE COALESCING BOUNDARY, and the defect this case exists for. A `data` event is a delivery, not a
+    // protocol frame: the kernel may hand over two complete replies at once. The client added the whole
+    // chunk to a counter and compared THAT against a per-reply budget, so two legal replies were refused
+    // together — the bound rejecting traffic it was not about — and every pending caller was failed for
+    // it. Each reply here is comfortably inside the bound and the pair is comfortably outside it.
+    const CAP_LOCAL = 512;
+    const pairs = 12;
+    /** @param {number} n */
+    const pairFor = (n) => [replyOfExactSize(300, `p${n}a`), replyOfExactSize(300, `p${n}b`)];
+    for (const body of pairFor(1)) {
+      assert.ok(Buffer.byteLength(body) + 1 <= CAP_LOCAL, 'each reply must be inside the bound');
+    }
+    assert.ok(pairFor(1).reduce((sum, body) => sum + Buffer.byteLength(body) + 1, 0) > CAP_LOCAL,
+      'and the pair must together exceed it, or this case proves nothing');
+
+    const p = await peer('coalesced', (socket) => {
+      let text = '';
+      let seen = 0;
+      socket.on('data', (chunk) => {
+        text += chunk.toString('utf8');
+        let index = text.indexOf('\n');
+        while (index >= 0) {
+          const line = text.slice(0, index);
+          text = text.slice(index + 1);
+          if (line.includes('"tail"')) {
+            // The probe at the end, answered on its own so the case can tell "the later request got its
+            // own reply" from "a queued earlier frame was handed to it".
+            socket.write(`${replyOfExactSize(300, 'tail-only')}\n`);
+          } else {
+            seen += 1;
+            // Every SECOND request is answered together with the one before it, in a single write.
+            if (seen % 2 === 0) {
+              const [a, b] = pairFor(seen / 2);
+              socket.write(`${a}\n${b}\n`);
+            }
+          }
+          index = text.indexOf('\n');
+        }
+      });
+    });
+    const client = new IpcClient({ socketPath: p.socketPath, maxReplyBytes: CAP_LOCAL });
+    try {
+      for (let n = 1; n <= pairs; n += 1) {
+        const [first, second] = await Promise.all([
+          client.request({ op: 'pair', part: `${n}a` }),
+          client.request({ op: 'pair', part: `${n}b` }),
+        ]);
+        // Each caller must receive ITS OWN reply, in order: a coalesced delivery still has to be split
+        // into frames and handed out one per waiter.
+        assert.equal(/** @type {{tag?: string}} */ (first).tag, `p${n}a`, `pair ${n}: the first reply must be the first caller's`);
+        assert.equal(/** @type {{tag?: string}} */ (second).tag, `p${n}b`, `pair ${n}: the second reply must be the second caller's`);
+      }
+      // And nothing was polluted by the pairing: a later request gets its own reply.
+      const tail = /** @type {{tag?: string}} */ (await client.request({ op: 'tail' }));
+      assert.equal(tail.tag, 'tail-only', 'a later request must be answered from its own frame, not a queued earlier one');
+      assert.equal(client.pendingRequests, 0, 'no waiter may be left behind');
+    } finally {
+      client.close();
+      await p.stop();
+    }
+  },
+
+  'a frame split so that one delivery carries its tail and the next frame\'s head is parsed as two frames': async () => {
+    // The other shape of the same mistake: one delivery holding the END of one frame and the BEGINNING of
+    // another. Nothing about the reply boundary lines up with the delivery boundary, and both frames must
+    // come out whole with their own byte counts.
+    const CAP_LOCAL = 512;
+    const p = await peer('straddle', (socket) => {
+      let text = '';
+      let seen = 0;
+      socket.on('data', (chunk) => {
+        text += chunk.toString('utf8');
+        let index = text.indexOf('\n');
+        while (index >= 0) {
+          text = text.slice(index + 1);
+          seen += 1;
+          index = text.indexOf('\n');
+          if (seen !== 2) continue;
+          const first = JSON.stringify({ ok: true, value: { tag: 'straddle-1', pad: 'y'.repeat(120) } });
+          const second = JSON.stringify({ ok: true, value: { tag: 'straddle-2', pad: 'z'.repeat(120) } });
+          const both = Buffer.from(`${first}\n${second}\n`, 'utf8');
+          // One write: `splitAt` is inside the first frame's JSON, so the delivery boundary falls in the
+          // middle of a frame rather than at a newline. The second write carries the rest.
+          const splitAt = Math.floor(Buffer.byteLength(first, 'utf8') / 2);
+          socket.write(both.subarray(0, splitAt));
+          setTimeout(() => socket.write(both.subarray(splitAt)), 5);
+        }
+      });
+    });
+    const client = new IpcClient({ socketPath: p.socketPath, maxReplyBytes: CAP_LOCAL });
+    try {
+      const [first, second] = await Promise.all([
+        client.request({ op: 'straddle' }),
+        client.request({ op: 'straddle' }),
+      ]);
+      assert.equal(/** @type {{tag?: string}} */ (first).tag, 'straddle-1', 'the frame whose tail arrived first must be delivered');
+      assert.equal(/** @type {{tag?: string}} */ (second).tag, 'straddle-2', 'and the frame whose head came with it must follow');
+      assert.equal(client.pendingRequests, 0, 'both waiters must be settled');
+    } finally {
+      client.close();
+      await p.stop();
+    }
+  },
+
+  'a reply of exactly the bound is accepted and one byte more is refused, with the last character split across deliveries': async () => {
+    // The boundary itself, asserted on both sides of it, and delivered in the shape that used to be
+    // miscounted: the frame's final multi-byte character arrives in the NEXT delivery, so any accounting
+    // done on the decoded remainder would be short by that character's leading bytes.
+    //
+    // The split is placed by LOCATING the wide character's byte offset, not by subtracting a constant from
+    // the frame length: a JSON frame ends with `"}` and a newline, so a constant offset splits quoted ASCII
+    // and would leave this case proving nothing about multi-byte handling while appearing to.
+    const CAP_LOCAL = 512;
+    const atBound = Buffer.from(`${replyOfExactSizeEndingInMultibyte(CAP_LOCAL, 'at-bound')}\n`, 'utf8');
+    const overBound = Buffer.from(`${replyOfExactSizeEndingInMultibyte(CAP_LOCAL + 1, 'over-bound')}\n`, 'utf8');
+    assert.equal(atBound.length, CAP_LOCAL, 'the accepted frame is exactly the bound, terminator included');
+    assert.equal(overBound.length, CAP_LOCAL + 1, 'and the refused one is exactly one byte more');
+    // These assertions are the evidence that the delivery boundary is inside the character: `first` ends on
+    // the three-byte character's leading byte, `second` starts on a continuation byte, and the two rejoin
+    // into the frame that was sent.
+    const atSplit = splitInsideLastCharacter(atBound);
+    const overSplit = splitInsideLastCharacter(overBound);
+    assert.ok(atSplit.cut < atBound.length - 4, 'the split must be inside the payload, not in the JSON tail');
+
+    const p = await peer('boundary', (socket) => {
+      let text = '';
+      let seen = 0;
+      socket.on('data', (chunk) => {
+        text += chunk.toString('utf8');
+        let index = text.indexOf('\n');
+        while (index >= 0) {
+          text = text.slice(index + 1);
+          seen += 1;
+          index = text.indexOf('\n');
+          const { first, second } = seen === 1 ? atSplit : overSplit;
+          socket.write(first);
+          setTimeout(() => socket.write(second), 5);
+        }
+      });
+    });
+    const client = new IpcClient({ socketPath: p.socketPath, maxReplyBytes: CAP_LOCAL });
+    try {
+      const accepted = /** @type {{tag?: string}} */ (await client.request({ op: 'boundary' }));
+      assert.equal(accepted.tag, 'at-bound', 'a frame of exactly the bound must be accepted, not rounded down');
+      assert.equal(client.pendingRequests, 0, 'and its waiter must be settled');
+
+      const refused = await client.request({ op: 'boundary' }).then(
+        () => { throw new Error('a frame one byte over the bound must be refused'); },
+        (thrown) => thrown,
+      );
+      assert.equal(codeOf(refused), 'OVERSIZE', `one byte over must be refused, got ${codeOf(refused)}`);
+      assert.equal(/** @type {{details?: {receivedBytes?: number}}} */ (refused).details?.receivedBytes, CAP_LOCAL + 1,
+        'and the refusal must report the frame size that crossed the bound, not a delivery size');
+      assert.equal(client.pendingRequests, 0, 'a refused connection must leave no waiter behind');
+    } finally {
+      client.close();
+      await p.stop();
+    }
+  },
+
+  'a delivery holding one complete reply plus the start of the next, cut inside a character, crosses neither frames nor waiters': async () => {
+    // The combined shape, and the one that is easiest to get wrong in a way no single-frame case can see:
+    // one `data` event carries a COMPLETE frame (whose size must be spent against the budget and then
+    // released) followed by a PARTIAL frame whose bytes are sitting inside a three-byte character. The
+    // first frame must be delivered to its own waiter, the partial bytes must be held and completed by the
+    // next delivery, and neither waiter may receive the other's reply.
+    const CAP_LOCAL = 512;
+    const first = Buffer.from(`${replyOfExactSize(300, 'first-reply')}\n`, 'utf8');
+    const second = Buffer.from(`${replyOfExactSizeEndingInMultibyte(300, 'second-reply')}\n`, 'utf8');
+    assert.ok(first.length <= CAP_LOCAL && second.length <= CAP_LOCAL, 'each frame must be inside the bound');
+    const { first: secondHead, second: secondTail, cut } = splitInsideLastCharacter(second);
+    assert.ok(cut > 10, 'the partial frame must carry real bytes before its cut character');
+
+    const p = await peer('tp', (socket) => {
+      let text = '';
+      let seen = 0;
+      socket.on('data', (chunk) => {
+        text += chunk.toString('utf8');
+        let index = text.indexOf('\n');
+        while (index >= 0) {
+          const line = text.slice(0, index);
+          text = text.slice(index + 1);
+          seen += 1;
+          index = text.indexOf('\n');
+          if (line.includes('"probe"')) {
+            socket.write(`${replyOfExactSize(300, 'probe-reply')}\n`);
+            continue;
+          }
+          if (seen !== 2) continue;
+          // ONE delivery: the whole of the first reply, then the second reply up to the middle of its
+          // final character. The rest follows in a later delivery.
+          socket.write(Buffer.concat([first, secondHead]));
+          setTimeout(() => socket.write(secondTail), 5);
+        }
+      });
+    });
+    const client = new IpcClient({ socketPath: p.socketPath, maxReplyBytes: CAP_LOCAL });
+    try {
+      const [one, two] = await Promise.all([
+        client.request({ op: 'burst', part: 'one' }),
+        client.request({ op: 'burst', part: 'two' }),
+      ]);
+      assert.equal(/** @type {{tag?: string}} */ (one).tag, 'first-reply',
+        'the complete frame in that delivery must go to its own waiter');
+      assert.equal(/** @type {{tag?: string}} */ (two).tag, 'second-reply',
+        'and the frame completed by the NEXT delivery must go to the other, decoded from its first byte');
+      assert.equal(client.pendingRequests, 0, 'nothing may be left waiting after a frame straddles deliveries');
+      const probe = /** @type {{tag?: string}} */ (await client.request({ op: 'probe' }));
+      assert.equal(probe.tag, 'probe-reply', 'and a later request must still get its own reply, not a held one');
+      assert.equal(client.pendingRequests, 0, 'the pairing must be back to one reply per waiter');
+    } finally {
+      client.close();
+      await p.stop();
+    }
+  },
+
+  'the daemon serves two request lines delivered in one write, each legal and together over the per-line bound': async () => {
+    // The server's half of the same mistake, and the reason it is fixed in this module too: the daemon
+    // added every byte that arrived in a chunk to one counter and compared it against a budget named per
+    // REQUEST LINE, so two pipelined requests batched into one write were refused together — a client that
+    // batched its requests would have its connection destroyed for being efficient.
+    const { startIpcServer, ensureAuthorityToken } = await import('../../dist/lib/ipc.js');
+    const scratch = scratchDir('ipc-server-coalesced');
+    const lineCap = 512;
+    ensureAuthorityToken(scratch.dir);
+    /** @type {{op?: string}[]} */
+    const handled = [];
+    const server = await startIpcServer({
+      stateDir: scratch.dir,
+      maxRequestBytes: lineCap,
+      maxReplyBytes: 4096,
+      handle: async (request) => {
+        handled.push(/** @type {{op?: string}} */ (request));
+        return { op: /** @type {{op?: string}} */ (request).op, ok: true };
+      },
+    });
+    try {
+      /** @param {string} op @param {number} pad */
+      const lineOfExactSize = (op, pad) => {
+        const body = JSON.stringify({ op, pad: 'x'.repeat(pad) });
+        assert.ok(Buffer.byteLength(body, 'utf8') + 1 <= lineCap, 'each request line must be inside the bound');
+        return body;
+      };
+      const first = lineOfExactSize('first', 300);
+      const second = lineOfExactSize('second', 300);
+      assert.ok(Buffer.byteLength(first, 'utf8') + Buffer.byteLength(second, 'utf8') + 2 > lineCap,
+        'the two lines together must exceed the bound, or this case proves nothing');
+
+      const replies = await new Promise((resolvePromise, rejectPromise) => {
+        const socket = connect(server.path);
+        const timer = setTimeout(() => rejectPromise(new Error('the server never answered both lines')), 5000);
+        const out = [];
+        let text = '';
+        socket.on('error', (error) => { clearTimeout(timer); rejectPromise(error); });
+        socket.on('data', (chunk) => {
+          text += chunk.toString('utf8');
+          let index = text.indexOf('\n');
+          while (index >= 0) {
+            out.push(JSON.parse(text.slice(0, index)));
+            text = text.slice(index + 1);
+            if (out.length === 2) {
+              clearTimeout(timer);
+              socket.end();
+              resolvePromise(out);
+              return;
+            }
+            index = text.indexOf('\n');
+          }
+        });
+        socket.on('connect', () => {
+          // ONE write carrying both complete request lines.
+          socket.write(`${first}\n${second}\n`);
+        });
+      });
+      assert.equal(handled.length, 2, `both request lines must be handled, got ${handled.length}`);
+      assert.deepEqual(replies.map((reply) => reply.value?.op), ['first', 'second'],
+        'and both must be answered, in order, which is what the per-connection chain is for');
+    } finally {
+      await server.close();
+      scratch.cleanup();
+    }
+  },
+
   'a peer that never sends a newline is refused on received bytes instead of being buffered forever': async () => {
     // A peer that accepts a request and then sends bytes for ever, with no newline in any of them. Before
     // the bound existed this grew the client's buffer until the process ran out of memory, which is a

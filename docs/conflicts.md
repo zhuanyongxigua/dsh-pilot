@@ -347,6 +347,54 @@ replacement character that concatenating the next chunk cannot repair. Both ends
 decoder, tested by writing one byte at a time — including the daemon's request path, where a prompt
 containing multi-byte text could be stored and forwarded corrupted.
 
+**C-8a: the first fix to that budget got the UNIT right and the SUBJECT wrong, and both ends had it.**
+The decoder change left the accounting alone, and the accounting was: add every byte that arrived in the
+current chunk to one counter, compare THAT against a budget named per frame, and only then split the
+chunk on newlines; after each completed frame, restore the counter from `Buffer.byteLength(remainder)`,
+the re-encoded length of the DECODED remainder. Three consequences, and the review called the first one
+correctly:
+
+- **Two legal replies were refused together.** A `data` event is a delivery, not a protocol frame, and the
+  kernel is free to hand over two complete replies at once — or the tail of one and the head of the next.
+  With one counter holding both, each reply inside the bound and the pair outside it, the client refused
+  the connection and failed *every* pending caller for a size the budget was not about. The daemon had the
+  identical defect on request lines: a client that batched two requests into one write had its connection
+  destroyed for being efficient.
+- **A frame could pass while its bytes exceeded the bound.** Because the comparison stopped being about a
+  frame at all: one frame of `cap + 1` bytes delivered as two chunks of `cap - 1` and `2` never tripped
+  it. The bound's promise — "at most this many bytes per reply" — was not kept in either direction.
+- **The reset undercounted.** The bytes a streaming decoder holds for an incomplete trailing sequence do
+  not appear in the decoded string, so re-encoding the remainder was short by up to three bytes per
+  frame transition.
+
+**Decision: frame on the raw bytes and measure the frame.** `LineFramer` accumulates `Buffer`s, finds
+newline BYTES, and hands back each frame with the exact distance between its newlines; the bytes still
+waiting for a newline are reported as their own number, which is what an unterminated frame may legally
+hold. There is no decoder in the accounting path, so there is nothing to lose bytes in, and every frame's
+size is exact by construction rather than by re-encoding.
+
+**Why decoding per frame is exact, not a compromise.** A newline byte can never occur inside a UTF-8
+sequence — continuation bytes are all `>= 0x80` — so a frame boundary is always a character boundary and a
+frame's bytes always decode to its text in full. That is why the fix is *per frame* rather than a
+streaming decoder: the decoder stays only where the bytes are not yet known to be a complete unit, which
+is now nowhere on this socket.
+
+**The test's split had to be made real before it could be evidence.** The first boundary case placed its
+delivery split at a constant offset from the end of the frame. A JSON frame ends with `"}` and a newline, so
+that offset cut quoted ASCII, and the case would have kept passing — with an `endsWith` assertion that cannot
+distinguish the two — while never splitting a character at all. It now locates the byte offset of the last
+three-byte character and asserts the split's structure: leading byte before the cut (`>= 0xc0`), continuation
+byte after it (`0x80-0xbf`), the halves rejoining into the sent bytes, and the frame sizes exactly `cap` and
+`cap + 1`. A case whose own construction silently rounds its padding is a case that cannot fail.
+
+**The server's request-line bound became configurable, for the same reason the reply bound is.**
+`startIpcServer` takes `maxRequestBytes` (default `MAX_IPC_LINE_BYTES`): the property under test is
+"the budget is spent per frame, not per delivery", and a property whose only test must run at 4 MiB is a
+property nobody tests. Two controls hold it — `ipc-client-counts-the-delivery-not-the-frame` and
+`ipc-server-counts-the-delivery-not-the-line` — and each fails the cases that assert frames *and* the
+case that asserts the boundary, which is how the delivery-shaped comparison was caught accepting an
+over-bound frame in pieces.
+
 ## C-9: a control frame's own rules, which are not a size limit
 
 **The tension.** "Accept what a peer sends and answer it" conflicts with RFC 6455 §5.5 as soon as a

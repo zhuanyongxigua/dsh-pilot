@@ -506,3 +506,37 @@ negative control that was actually run (a control that is not run is a claim, no
 Not fixed, and named so nobody reads this table as complete: the `cwd`/workspace half of FR-SEC-4, the
 `session.wait` `sinceSeq` capability (withdrawn rather than built), and the two cancellation-scope gaps
 already recorded at `docs/test-matrix.md` line 329.
+
+## 11. The framing budget, corrected again: a delivery is not a frame
+
+`00983ac` and `6497080` both bounded "bytes per frame" and both measured something else. The first
+measured characters instead of bytes. The second measured BYTES — but of the wrong thing: everything the
+current `data` event happened to carry, compared before that chunk was split on newlines, and restored
+after each frame from the re-encoded length of the decoded remainder. Three consequences, all of them
+observable, and the reviewed candidate had all three on BOTH ends of the socket:
+
+| Defect | Test | Control that was run |
+| --- | --- | --- |
+| Two legal replies delivered in one write were refused together, and every pending caller was failed for it | `network/ipc-bounds::two replies delivered in ONE write are both answered, though together they exceed the per-reply bound` (12 pairs, 12 sequential rounds, each pair in a single write, each reply 300 bytes against a 512-byte bound) | `ipc-client-counts-the-delivery-not-the-frame` fails it with `reply exceeds the IPC reply limit` |
+| A frame of `cap + 1` bytes was ACCEPTED when the peer delivered it in pieces, because the comparison had stopped being about a frame | `network/ipc-bounds::a reply of exactly the bound is accepted and one byte more is refused, with the last character split across deliveries` | the same control accepts the over-bound frame and fails the case with `a frame one byte over the bound must be refused` |
+| The reset undercounted by the bytes a streaming decoder holds for an incomplete trailing sequence (up to 3 per frame transition) | the same boundary case, whose accepted frame is exactly the bound and whose delivery split is placed inside its final three-byte character by LOCATING that character's offset | removed by construction: the framer reports raw bytes, so there is no decoder in the accounting path to lose them in |
+| A delivery carrying one complete frame and the start of the next, cut inside a character — the shape where a completed frame, a partial frame and two waiters are all live at once | `network/ipc-bounds::a delivery holding one complete reply plus the start of the next, cut inside a character, crosses neither frames nor waiters` | `ipc-client-counts-the-delivery-not-the-frame` fails it with `reply exceeds the IPC reply limit` |
+| The daemon refused two request lines batched into one write, each legal and together over the per-line bound | `network/ipc-bounds::the daemon serves two request lines delivered in one write, each legal and together over the per-line bound` | `ipc-server-counts-the-delivery-not-the-line` fails it with `the server never answered both lines` |
+| A frame straddling two deliveries — one carrying its tail and the next frame's head | `network/ipc-bounds::a frame split so that one delivery carries its tail and the next frame's head is parsed as two frames` | the delivery-shaped control does not fail this one, and this row says so rather than implying it does: a straddling frame is also mis-measured as a whole delivery, but each piece stays under the bound, so the case pins the requirement instead of the defect |
+
+**How the split is placed, and why that had to be fixed too.** The first version of the boundary case
+chose its delivery split as `bytes.length - 2`. A JSON frame ends with `"}` and a newline, so that offset
+splits quoted ASCII: the case would have gone on passing while proving nothing about multi-byte handling,
+and an `endsWith` assertion could not tell the difference. The case now builds a frame whose padding ENDS
+in `中`, LOCATES that character's byte offset in the frame, and asserts the structure of the split — the
+first delivery ends on the character's leading byte (`>= 0xc0`), the second begins on a continuation byte
+(`0x80-0xbf`), and the two rejoin into exactly the bytes that were sent. The exact `cap` and `cap + 1`
+frame sizes are asserted too, so a case that silently rounded its own padding would fail rather than pass.
+
+The fix is `LineFramer` in `src/lib/ipc.ts`: newline BYTES on an accumulated `Buffer`, each frame
+returned with its exact size, and the bytes still waiting for a newline reported as their own number so an
+unterminated frame is refused at one frame's worth rather than buffered. Decoding per frame is exact
+rather than a compromise because a newline byte cannot occur inside a UTF-8 sequence, so a frame boundary
+is always a character boundary; `docs/conflicts.md` C-8a has the reasoning and the decision record.
+`startIpcServer` gained `maxRequestBytes` so the daemon's half can be tested at 512 bytes instead of
+4 MiB, which is the difference between a property with a test and a property with a comment.
