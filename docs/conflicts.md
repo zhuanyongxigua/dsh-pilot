@@ -486,3 +486,33 @@ which is what its "one durable session" assertions are about; the `cwd`-conflict
 distinct directory so the conflict is between two workspaces that exist; and every cleanup removes only the
 directory the rig created. No fixed path under the OS temp root is created or depended on, and the
 production contract was not relaxed to make a fixture pass.
+
+## C-11: a hostile-peer oracle that waited on an event the test itself prevented
+
+**What failed.** `security/bounds::a hostile IPC line is refused without taking the daemon down` passed on
+macOS and timed out on Linux CI at its 20 s wait for the client socket to close. The daemon was doing the
+right thing; the case was not observing it.
+
+**The hypothesis, stated as a hypothesis.** The case wrote a 5 MiB line and then watched only for `close`.
+It never attached a `data` listener and never resumed the socket, so its readable side stayed paused with
+the daemon's short refusal and the FIN sitting unread in the buffer. A paused stream delivers neither `end`
+nor the automatic writable-side end that follows it, so `close` need not arrive — and because no `error`
+listener was attached either, a platform that delivered the refusal as a reset would have thrown an uncaught
+error instead of timing out. That last detail is what the recorded failure looks like: a TIMEOUT, not a
+crash, which means no reset was delivered on that run.
+
+**What is proved and what is not.** A loopback reproduction was attempted and did NOT reproduce the
+mechanism on macOS, where the same shape closed in 22 ms via ECONNRESET — reported so the platform
+difference is on the record rather than smoothed over. So the root cause above remains a HYPOTHESIS for the
+Linux run; what is measured is that the case now passes on both platforms with a stronger oracle.
+
+**The fix, and what did NOT change.** The peer now drains what comes back, records every event it can
+produce (`data` bytes, `end`, `error`, `close`) and reports that record in the wait's failure message, so a
+future failure of this case says whether the daemon refused, the peer reset, or neither happened. It also
+asserts the CONTENT of the refusal (`OVERSIZE`) instead of only that the socket closed — "it closed" and "it
+closed for this reason" are not the same claim — and a close delivered as a reset is accepted only if the
+recorded code is `ECONNRESET` or `EPIPE`. The test's own socket is destroyed in its `finally`.
+
+The 20 s bound was NOT raised, the bound under test was NOT weakened, and no production code changed: the
+wait was never too short, it was waiting on an event the test itself was preventing. Raising it would have
+converted a real observability defect into a slower one.

@@ -51,22 +51,67 @@ export default {
 
   'a hostile IPC line is refused without taking the daemon down': async () => {
     const { daemon, teardown } = await rig('sec-line');
+    /** @type {import('node:net').Socket|null} */
+    let socket = null;
+    /** @type {{refusal: string, chunks: Buffer[]}} */
+    const events = { refusal: '', chunks: [] };
     try {
       const { createConnection } = await import('node:net');
       // Oversized line: the daemon must close the connection, not buffer unboundedly.
-      const socket = createConnection(daemon.socketPath);
-      await new Promise((resolve, reject) => { socket.once('connect', resolve); socket.once('error', reject); });
+      // One local binding for the event wiring (a mutable outer handle cannot stay narrowed across an
+      // `await`), and the outer handle is what `finally` destroys.
+      const conn = createConnection(daemon.socketPath);
+      socket = conn;
+      await new Promise((resolve, reject) => { conn.once('connect', resolve); conn.once('error', reject); });
       const huge = `{"op":"health","pad":"${'x'.repeat(5 * 1024 * 1024)}"}\n`;
       let closed = false;
-      socket.on('close', () => { closed = true; });
-      socket.write(huge);
+      // Every event this socket can produce is RECORDED rather than assumed, and the record is what a
+      // failure reports. That is not decoration: this case failed on Linux CI at exactly this wait, with
+      // nothing in the log to say whether the daemon had refused, the peer had reset, or neither had
+      // happened — and the three have different causes.
+      const seen = { data: 0, end: 0, error: /** @type {NodeJS.ErrnoException|null} */ (null) };
+      conn.on('data', (chunk) => {
+        seen.data += chunk.length;
+        events.chunks.push(chunk);
+        events.refusal = Buffer.concat(events.chunks).toString('utf8');
+      });
+      conn.on('end', () => { seen.end += 1; });
+      // A reset is an EXPECTED outcome here and still a closed socket: the daemon refuses a peer that is
+      // mid-write, so ECONNRESET/EPIPE is the refusal being delivered, not a defect. Anything else is
+      // kept on the record and fails below.
+      conn.on('error', (error) => { seen.error = error; });
+      conn.on('close', () => { closed = true; });
+      conn.write(huge);
+      // And the peer has to DRAIN what comes back, which is the actual defect this case had on Linux.
+      //
+      // The daemon refuses by writing a short refusal and closing. This socket had no 'data' listener and
+      // never resumed, so its readable side stayed paused with those bytes and the FIN sitting unread —
+      // and a paused stream emits neither 'end' nor, in turn, 'close', because Node only ends the writable
+      // side automatically once 'end' has been delivered. On macOS the refusal surfaced as a reset and the
+      // close arrived anyway; on Linux it did neither, so this wait sat out its full 20s while a perfectly
+      // correct daemon was being reported as a hang. Draining is what makes the oracle observe the refusal
+      // it was always about, and it is why the timeout is NOT being raised: the wait was never too short,
+      // it was waiting on an event the test itself was preventing.
+      conn.resume();
       // The bound is deliberately looser than it looks like it needs to be, and the reason is measured
       // rather than hypothetical: at 5 s this wait timed out once during a full-suite run and passed in
       // isolation immediately afterwards, twice over. The condition is real (the socket must close) and
       // the refusal itself is not in question — what the extra headroom covers is the daemon process
       // being scheduled alongside the rest of the suite. A bound that fails under load reports a
       // property about the machine as if it were a property about the bridge.
-      await waitFor(() => closed, { timeoutMs: 20_000, what: 'the daemon to drop an oversized IPC line' });
+      await waitFor(() => closed, {
+        timeoutMs: 20_000,
+        what: `the daemon to drop an oversized IPC line (bytes received=${seen.data} end=${seen.end} `
+          + `error=${seen.error ? `${seen.error.code ?? seen.error.message}` : 'none'} closed=${closed})`,
+      });
+      // A closed socket must not be a killed daemon: the refusal itself is asserted, so "it closed" and
+      // "it closed FOR THIS REASON" cannot be confused. The daemon writes the refusal before closing.
+      assert.match(events.refusal, /OVERSIZE/,
+        `the peer must be told why it was dropped, not just dropped; got ${JSON.stringify(events.refusal.slice(0, 120))}`);
+      if (seen.error !== null) {
+        assert.equal(['ECONNRESET', 'EPIPE'].includes(seen.error.code ?? ''), true,
+          `a close in this case may be a reset, but only a reset: got ${seen.error.code ?? seen.error.message}`);
+      }
       // The daemon is still alive and serving.
       const client = await ipcClient(daemon.socketPath);
       try {
@@ -76,6 +121,9 @@ export default {
         client.close();
       }
     } finally {
+      // This exact socket, closed by this test: a hostile-peer case must not leave its own hostile peer
+      // behind for the next case, and the daemon's refusal is not a reason to skip the cleanup.
+      if (socket) socket.destroy();
       await teardown();
     }
   },
