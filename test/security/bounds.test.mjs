@@ -102,15 +102,36 @@ export default {
       await waitFor(() => closed, {
         timeoutMs: 20_000,
         what: `the daemon to drop an oversized IPC line (bytes received=${seen.data} end=${seen.end} `
-          + `error=${seen.error ? `${seen.error.code ?? seen.error.message}` : 'none'} closed=${closed})`,
+          + `error=${seen.error ? `${seen.error.code ?? seen.error.message}` : 'none'} closed=${closed}; `
+          + 'the close is the promise, a delivered refusal frame is best-effort)',
       });
-      // A closed socket must not be a killed daemon: the refusal itself is asserted, so "it closed" and
-      // "it closed FOR THIS REASON" cannot be confused. The daemon writes the refusal before closing.
-      assert.match(events.refusal, /OVERSIZE/,
-        `the peer must be told why it was dropped, not just dropped; got ${JSON.stringify(events.refusal.slice(0, 120))}`);
+      // Whether the refusal FRAME reaches this peer is best-effort, and asserting delivery was wrong.
+      //
+      // What this bridge documents is that an over-budget frame is "refused, not buffered" (MAX_IPC_LINE_BYTES):
+      // the bound and the close are the promise. It does NOT promise that a peer which is still mid-write of
+      // 5 MiB will read a response — the daemon destroys that socket, and a reset discards whatever was in
+      // flight. Measured both ways: the same case received a complete OVERSIZE frame on one run and zero
+      // bytes on another. Requiring the text therefore tested the kernel's buffer state, not the bridge.
+      //
+      // What is asserted instead is conditional and exact, which keeps the reason in the oracle without
+      // inventing a guarantee: IF a complete refusal frame arrived, it must name OVERSIZE — a complete frame
+      // saying anything else fails. The code itself is asserted DETERMINISTICALLY where it can be:
+      // `network/ipc-bounds` runs the daemon with a small `maxRequestBytes`, so its peer reads the refusal
+      // reliably and asserts OVERSIZE (two cases there). This case's subject is the real 4 MiB bound under a
+      // flooding peer.
+      const complete = events.refusal.endsWith('\n') ? events.refusal.trim() : null;
+      if (complete !== null) {
+        assert.match(complete, /OVERSIZE/,
+          `a complete refusal frame must name the reason the peer was dropped; got ${JSON.stringify(complete.slice(0, 120))}`);
+      }
+      // And the outcome is checked to be one of the two shapes that ARE allowed here: a refused socket that
+      // delivered nothing (or a partial frame) because it was reset, or the refusal frame above. Anything
+      // else — in particular a HEALTH REPLY arriving on this connection — is not an allowed outcome.
+      assert.equal(/\{"status"/.test(events.refusal), false,
+        'the oversized connection must not be served: no response to the request it never legally sent');
       if (seen.error !== null) {
         assert.equal(['ECONNRESET', 'EPIPE'].includes(seen.error.code ?? ''), true,
-          `a close in this case may be a reset, but only a reset: got ${seen.error.code ?? seen.error.message}`);
+          `a close in this case may be a reset, but only a reset for THIS oversized socket: got ${seen.error.code ?? seen.error.message}`);
       }
       // The daemon is still alive and serving.
       const client = await ipcClient(daemon.socketPath);

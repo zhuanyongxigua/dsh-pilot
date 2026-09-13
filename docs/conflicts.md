@@ -508,10 +508,22 @@ Linux run; what is measured is that the case now passes on both platforms with a
 
 **The fix, and what did NOT change.** The peer now drains what comes back, records every event it can
 produce (`data` bytes, `end`, `error`, `close`) and reports that record in the wait's failure message, so a
-future failure of this case says whether the daemon refused, the peer reset, or neither happened. It also
-asserts the CONTENT of the refusal (`OVERSIZE`) instead of only that the socket closed — "it closed" and "it
-closed for this reason" are not the same claim — and a close delivered as a reset is accepted only if the
-recorded code is `ECONNRESET` or `EPIPE`. The test's own socket is destroyed in its `finally`.
+future failure of this case says whether the daemon refused, the peer reset, or neither happened. The test's
+own socket is destroyed in its `finally`.
+
+**A second correction, on this project's own evidence.** The first version of that fix also REQUIRED the
+refusal frame to arrive, and the next CI run failed on macOS with `got ""` — a close with nothing delivered.
+That assertion was an overconstraint, and the code says why: what this bridge documents is that an
+over-budget frame is "refused, not buffered" (`MAX_IPC_LINE_BYTES`). The BOUND and the CLOSE are the promise;
+the daemon destroys a socket whose peer is still mid-write of 5 MiB, and a reset discards the response in
+flight. Measured both ways on the same case: a complete `OVERSIZE` frame once, zero bytes another time.
+Requiring the text tested the kernel's buffer state, not the bridge, so the assertion is now conditional and
+exact — IF a complete refusal frame arrived it must name `OVERSIZE`, and a complete frame saying anything
+else fails — while the mandatory facts are the bounded close, that this connection was never served (no
+accepted reply to the request it never legally sent), and that a FRESH connection is healthy. The OVERSIZE
+code is still asserted deterministically, in `network/ipc-bounds`, where the daemon runs with a small
+`maxRequestBytes` and its peer can read the refusal reliably. A close delivered as a reset is accepted only
+for `ECONNRESET` or `EPIPE`, and only for this oversized socket: no blanket error swallowing was added.
 
 The 20 s bound was NOT raised, the bound under test was NOT weakened, and no production code changed: the
 wait was never too short, it was waiting on an event the test itself was preventing. Raising it would have
