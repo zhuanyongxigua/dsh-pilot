@@ -194,3 +194,81 @@ jobs:
         run: |
           npm run build
           npm pack --dry-run 2>&1 | tail -30
+
+  # The opt-in half of the original gate: a REAL DSH Host with the model route closed to a loopback mock
+  # provider, where a tool call really executes and the file it writes is the oracle. That case fails on the
+  # macOS development host (sandbox-exec: sandbox_apply: Operation not permitted) and the whole layer is
+  # skipped by the matrix jobs above, because it is opt-in — so this job exists to give that one piece of
+  # evidence a place to run on Linux.
+  #
+  # A separate job on purpose. `isolated-host` (the job id) is not one of the three required checks, so the
+  # required names and their content are untouched and a sandbox limitation on one platform cannot look like
+  # a broken deterministic suite. `name:` is display text; the id above is what Actions keys on.
+  #
+  # The Host is installed HERE, ephemerally and pinned, and is NOT a dependency of this package: the bridge
+  # keeps zero runtime dependencies, and `npm i --no-save` leaves the manifest and the lockfile untouched.
+  # The version is asserted rather than assumed, because testing against a different Host than the one under
+  # study would silently change the subject.
+  #
+  # No credential is read, referenced or needed: the mock provider is a local fixture and the value it uses
+  # is synthetic, assembled at runtime. Nothing here contacts port 3080; the rig boots its own Host in its
+  # own DSH_HOME on an OS-assigned port.
+  isolated-host:
+    name: isolated host (ubuntu-latest, real Host + mock provider)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: install dev tooling (types only; the runtime keeps zero dependencies)
+        run: npm ci
+
+      - name: build (TypeScript sources -> dist)
+        run: npm run build
+
+      - name: install the pinned Host, ephemerally (test-only; not a runtime dependency)
+        run: |
+          npm i --no-save --no-audit --no-fund @deepseek-ai/dsh@0.1.1-rc.2
+          node -e "
+            const p = require('@deepseek-ai/dsh/package.json');
+            if (p.version !== '0.1.1-rc.2') {
+              console.error('refusing to test against Host ' + p.version + ': the pin is 0.1.1-rc.2');
+              process.exit(1);
+            }
+            console.log('pinned host: ' + p.name + '@' + p.version);
+          "
+          HOST_BIN="$(node -p "require('node:path').join(require('node:path').dirname(require.resolve('@deepseek-ai/dsh/package.json')),'lib','bin.js')")"
+          test -f "$HOST_BIN" || { echo "the pinned Host binary was not found at $HOST_BIN"; exit 1; }
+          echo "DSH_PILOT_DSH_BIN=$HOST_BIN" >> "$GITHUB_ENV"
+
+      - name: report the Linux sandbox capability (read-only; NO policy is changed)
+        run: |
+          {
+            echo '## Linux sandbox capability and the pinned Host'
+            echo "- runner: $(uname -s) $(uname -r), $(uname -m), node $(node --version)"
+            if command -v bwrap >/dev/null 2>&1; then echo "- bwrap: $(bwrap --version)"; else echo '- bwrap: NOT found (the provider probes it and falls through to the Landlock launcher)'; fi
+            echo "- securityfs: $(ls /sys/kernel/security/ 2>/dev/null || echo 'not mounted')"
+            echo "- landlock platform package: $(ls -d node_modules/@deepseek-ai/node-addon-landlock-run* node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/node-addon-landlock-run* 2>/dev/null | tr '\n' ' ' || echo 'not seen at the usual install paths')"
+            echo "- pinned host: $(node -p "require('@deepseek-ai/dsh/package.json').name + '@' + require('@deepseek-ai/dsh/package.json').version")"
+            echo
+            echo 'Whether a Linux backend can actually confine here is DETERMINED BY THE RUN, not claimed in'
+            echo 'advance. This step only records what the runner looks like; it changes no sysctl, no AppArmor'
+            echo 'profile, no seccomp policy, adds no capability and uses no unconfined fallback. If neither'
+            echo 'backend is usable, the layer reports the Host own SANDBOX_UNAVAILABLE message and the case'
+            echo 'FAILS rather than passing quietly.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: isolated official Host, mock provider (confined tool effect is the oracle)
+        run: node test/run.mjs test/isolated-host --isolated
+
+      - name: report that the live suite was NOT run
+        if: always()
+        run: |
+          {
+            echo ''
+            echo 'The live layer was NOT selected and no paid model quota was spent by this job: it runs the'
+            echo 'isolated layer only, with the provider route closed to a loopback fixture.'
+          } >> "$GITHUB_STEP_SUMMARY"
