@@ -46,7 +46,7 @@ import type {
 import { OwnerLock } from './owner-lock.ts';
 import { DshHostAdapter, boundText } from './adapter.ts';
 import { redactInbound } from './redact.ts';
-import { startIpcServer, ensureAuthorityToken, readAuthorityToken } from './ipc.ts';
+import { startIpcServer, ensureAuthorityToken, readAuthorityToken, MAX_IPC_REPLY_BYTES } from './ipc.ts';
 import type { IpcServer } from './ipc.ts';
 
 /**
@@ -87,6 +87,8 @@ export const DEFAULT_LIMITS = Object.freeze({
    * unit tests do), and every other overridable bound is in both places for the same reason.
    */
   hostTimeoutMs: 15_000,
+  hostResponseMaxBytes: 8 * 1024 * 1024,
+  ipcReplyMaxBytes: MAX_IPC_REPLY_BYTES,
   waitDefaultMs: 30_000,
   waitMaxMs: 120_000,
 });
@@ -131,10 +133,20 @@ export class Daemon {
     historyTruncations: 0,
   };
   /**
-   * The element is the shape the only reader of this map projects; the daemon never appends to the
-   * queue, so the original left its element type unstated.
+   * The daemon's own pending-prompt queue, which holds NOTHING and is reported as such.
+   *
+   * The map is kept rather than deleted because the reply still carries a `local` array and the two
+   * cancellation scopes are a requirement (FR-CANCEL-1): what a caller must be able to see is that the
+   * daemon-local scope is EMPTY, which is a different statement from it being absent. It is genuinely
+   * empty — nothing in this bridge appends to it, because a prompt is dispatched to the Host whose inbox
+   * is the only queue that holds work — and the note on the reply says so, so an operator does not read
+   * an empty array as "nothing queued right now".
+   *
+   * The `#localQueueMax` field that stood next to it is GONE: a limit that is never compared to anything
+   * bounds nothing, and a reader who found it would reasonably conclude that local queueing is a
+   * capability of this daemon. It is not one, and the honest way to say so is to not have the number.
    */
-  #queue = new Map<string, Array<{ operationId: string; state: string }>>(); // sessionId -> local queue of pending prompts (daemon-owned)
+  #queue = new Map<string, Array<{ operationId: string; state: string }>>(); // sessionId -> daemon-local queue, always empty (see above)
   /**
    * The Host's pending inbox per session, as last OBSERVED from an authoritative `session/queue`
    * frame. Deliberately a clearly-named NEIGHBOUR of `#queue` rather than a second use of it:
@@ -156,7 +168,6 @@ export class Daemon {
    */
   #observedQueue = new Map<string, Array<{ itemId: string; placement: string }>>(); // sessionId -> last observed Host inbox snapshot
   #dispatchHolds = new Map<string, boolean>(); // sessionId -> boolean (hold next dispatch while cancelling)
-  #localQueueMax = 64;
   #stopped = false;
   /**
    * Result of the restart sweep, reported through health so a crash is inspectable.
@@ -187,7 +198,11 @@ export class Daemon {
     this.#limits = { ...DEFAULT_LIMITS, ...limits };
     this.#lock = new OwnerLock({ lockPath: `${stateDir}/owner.lock.sqlite` });
     this.#store = new Store({ stateDir });
-    this.#adapter = new DshHostAdapter({ baseUrl: hostBase, timeoutMs: this.#limits.hostTimeoutMs });
+    this.#adapter = new DshHostAdapter({
+      baseUrl: hostBase,
+      timeoutMs: this.#limits.hostTimeoutMs,
+      maxResponseBytes: this.#limits.hostResponseMaxBytes,
+    });
     this.hostBase = hostBase;
     this.hostScope = hostScope;
   }
@@ -236,6 +251,7 @@ export class Daemon {
     this.#ipc = await startIpcServer({
       stateDir: this.#stateDir,
       handle: (request) => this.handleIpc(request),
+      maxReplyBytes: this.#limits.ipcReplyMaxBytes,
     });
 
     this.#store.audit({ kind: 'daemon-started', actor: 'daemon', detail: { hostBase: this.hostBase } });
@@ -421,7 +437,26 @@ export class Daemon {
     created: boolean;
   } {
     const key = clientKey ?? 'default';
+    // The caller's label, checked rather than dropped. It was accepted from the MCP tool's own schema
+    // ("Optional human label", at most 120 characters) and then ignored, so a client that set one got a
+    // task named `task:default` back — an argument that appears in the tool's schema and does nothing is
+    // the "silently ignored" failure this bridge is not supposed to have.
+    //
+    // A value that cannot be a label is refused rather than coerced or truncated: this frame is parsed
+    // JSON, and silently cutting a long label or stringifying a number would be inventing an answer the
+    // caller did not give.
+    if (label !== null && typeof label !== 'string') {
+      throw new BridgeError(ERROR_CODES.BAD_REQUEST, 'label must be a string', { kind: typeof label });
+    }
+    if (typeof label === 'string' && label.length > MAX_TASK_LABEL) {
+      throw new BridgeError(ERROR_CODES.BAD_REQUEST, `label must be at most ${MAX_TASK_LABEL} characters`, { length: label.length });
+    }
+    const displayLabel: string | null = typeof label === 'string' && label.trim() !== '' ? label : null;
     const existing = this.#store.get<TaskRow>(`select * from tasks where label = ?`, `task:${key}`);
+    // Found by the INTERNAL key, not by the label: the client key is what makes this call idempotent, and
+    // matching on the caller's label would have made two calls with the same key and different labels
+    // create two tasks. The stored label is not updated on the second call, which is stated rather than
+    // implied: `task.ensure` is an idempotent ensure, and a rename would be a different operation.
     if (existing) return { task: shapeTask(existing), created: false };
     // `assertIdKind` is the narrowing: it throws unless the value is a well-formed task id and
     // returns that same id, so the checked value is what goes to the store.
@@ -429,6 +464,7 @@ export class Daemon {
     const task = this.#store.createTask({
       taskId: newTaskId,
       label: `task:${key}`,
+      displayLabel,
       hostBase: this.hostBase,
       hostScope: this.hostScope,
     });
@@ -446,7 +482,10 @@ export class Daemon {
    * inventing a bridge error code or continuing with `undefined`.
    */
   #requireRow<T>(row: T | null, field: string): asserts row is T {
-    if (row === null) throw new TypeError(`Cannot read properties of null (reading '${field}')`);
+    // The same typed failure `#presentRow` gives, for the same reason and through the same code path: a
+    // TypeError used to reach the caller as the daemon's error text, which names an internal property read
+    // rather than the fact that a row this operation requires is missing.
+    this.#presentRow(row, field);
   }
 
   /**
@@ -502,20 +541,23 @@ export class Daemon {
       operation: this.#store.getOperation(operation.operation_id),
       method: 'session.create',
       payload: requestBody,
-      retryable: true,
       allowedStates: ['pending', 'uncertain'],
     });
     if (result.status !== 'ok') {
       return { session: null, operation: shapeOperation(this.#store.getOperation(operation.operation_id)), result };
     }
-    // `result.value` is the adapter's own ok envelope (`{value, rpcId}`) and the Host's
-    // `session.create` value is one level inside it, so the envelope is narrowed before the read
-    // rather than asserted. An ok result always carries that envelope object, and a Host value that
-    // is not an object is handed on as `undefined` — which reads exactly like the absent field the
-    // original's `result.value.value` produced — so the preallocated host id stays the fallback.
-    // The Host value itself is handed on as `unknown`: the original never inspected it either.
-    const envelope: unknown = result.value;
-    const hostValue: unknown = this.#isParsedObject(envelope) ? envelope.value : undefined;
+    // `result.value` IS the Host's value. `call()` returns `ok({ value: result.value, rpcId })` and
+    // `AdapterCallResult` promotes those fields to the top level, so the Host's `session.create` value
+    // sits exactly here. This used to read one level further in (`result.value['value']`), which is a
+    // key that never exists — the same over-deep read that was already corrected in `#dispatch` and in
+    // the event page, and the reason those two sites carry the same note.
+    //
+    // It was MEASURED, and the consequence is not cosmetic: with the read one level too deep, a Host
+    // that answers `{sessionId: "session-abc"}` had its id thrown away and the reply's `hostSessionId`
+    // was always the UUID this bridge minted for the request. Every downstream use of a Host session id
+    // — the `sessionId` in a `/api/respond` answer, for one — then named a session the Host had never
+    // heard of, and nothing here could tell, because a locally minted id looks exactly like a Host's.
+    const hostValue: unknown = result.value;
     return this.#recordSessionFromCreate(task.task_id, hostValue, hostSessionId, cwd, operation.operation_id);
   }
 
@@ -651,6 +693,24 @@ export class Daemon {
     // Keeping the newest rows that fit leaves a contiguous run, so paging backwards sees every
     // event exactly once.
     const { rows, bytes, oversize } = this.#fitEventPage(window);
+    // The oversize-event policy meets the socket's hard limit HERE, and it is stated rather than left to
+    // whichever of the two bounds happens to fire first.
+    //
+    // `#fitEventPage` deliberately keeps a single event that exceeds the page budget, because silently
+    // dropping the only event in a page would lose it: the caller would ask again with the same cursor
+    // forever. That exemption is a policy about the PAGE budget, and it must not be read as an exemption
+    // from the IPC reply bound, which is the size of a frame this socket can carry at all. When one
+    // event's own JSON crosses that bound the page is undeliverable, and the honest outcomes are a typed
+    // refusal or a silent truncation. It is a typed refusal, and it names the seq, so the caller can
+    // advance past that one event deliberately instead of being unable to make progress.
+    if (rows.length === 1 && bytes > this.#limits.ipcReplyMaxBytes) {
+      throw new BridgeError(ERROR_CODES.RESULT_TOO_LARGE, 'one event is too large to deliver over ipc', {
+        seq: Number(rows[0].seq),
+        bytes,
+        maxReplyBytes: this.#limits.ipcReplyMaxBytes,
+        pageMaxBytes: this.#limits.eventPageMaxBytes,
+      });
+    }
     const cursor = this.#store.getCursor(session.task_id, session.session_id);
     const firstSeq = rows.length ? Number(rows[0].seq) : null;
     return {
@@ -738,7 +798,10 @@ export class Daemon {
    * Bounded, event-driven wait. Register-then-recheck: the state is read once after
    * registration, so a change landing between the two cannot be missed.
    */
-  async sessionWait({ taskId, sessionId, timeoutMs = null, sinceSeq = null }: Record<string, unknown>) {
+  // `sinceSeq` used to be destructured here and never read: nothing in this bridge sends it, nothing
+  // documents it, and a field that is accepted and ignored is a capability a caller can believe in. The
+  // wait is driven by the session's event count and the open turn, which is what its reply describes.
+  async sessionWait({ taskId, sessionId, timeoutMs = null }: Record<string, unknown>) {
     const session = this.#requireSession(taskId, sessionId);
     const bounded = Math.max(50, Math.min(Number(timeoutMs) || this.#limits.waitDefaultMs, this.#limits.waitMaxMs));
     const deadline = Date.now() + bounded;
@@ -856,9 +919,11 @@ export class Daemon {
    */
   async queueClear({ taskId, sessionId, itemIds }: Record<string, unknown>) {
     const session = this.#requireSession(taskId, sessionId);
-    // Local scope first, and unchanged: the daemon's own prompt queue for this session. Nothing in
-    // this daemon appends to it, so `localRemoved` is normally 0 — reported as measured, not as
-    // proof that any other queue is empty.
+    // Local scope first, and unchanged: the daemon's own prompt queue for this session, which nothing
+    // appends to, so `localRemoved` is ALWAYS 0 — reported as measured, not as proof that any other queue
+    // is empty. There is no local queueing in this bridge: a prompt goes to the Host, and the Host's inbox
+    // is the only queue holding work. The reply keeps the field so a caller can see the scope is empty,
+    // and the note below says why it is.
     const localItems = this.#queue.get(session.session_id) ?? [];
     this.#queue.set(session.session_id, []);
     const localRemoved = localItems.length;
@@ -907,7 +972,8 @@ export class Daemon {
           observed: { state: openTurn ? 'running' : 'idle', currentTurnId: openTurn?.turn_id ?? null },
           note: 'a queue removal never stops the active turn; session.cancel is the separate operation that does',
         },
-        note: 'only the daemon-local queue scope was touched; nothing was observed for the Host queue scope',
+        note: 'nothing was removed: this bridge has no daemon-local prompt queue to clear, and no Host '
+          + 'queue item was named, so nothing was observed for the Host queue scope',
       };
     }
 
@@ -1492,7 +1558,19 @@ export class Daemon {
    */
   #presentRow<T>(row: T | null, field: string): T {
     if (row === null) {
-      throw new TypeError(`Cannot read properties of null (reading '${field}')`);
+      // A typed failure rather than the TypeError this used to throw in the name of ported fidelity.
+      // The message `Cannot read properties of null (reading 'session_id')` reached the CALLER as the
+      // daemon's error text — measured on the `session.create` conflict path, before that path was fixed
+      // to resolve the row the conflict kept — and it tells an operator nothing they can act on: it reads
+      // like a bug in the bridge with no state attached. A row that must exist and does not, immediately
+      // after a write reported success, means the durable state and the operation disagree, which is what
+      // this code says.
+      //
+      // No test forces this branch directly, and that is stated rather than implied: the flow that
+      // produced it is gone, because `Store.recordSession` now returns the row the conflict kept instead
+      // of the id it minted. Forcing it from here would mean corrupting a state file mid-operation, which
+      // would test the fixture rather than this line. What IS tested is the removal of its only trigger.
+      throw new BridgeError(ERROR_CODES.STORAGE_CORRUPT, `a row this operation requires is missing (${field})`, { field });
     }
     return row;
   }
@@ -1530,24 +1608,24 @@ export class Daemon {
 
   /**
    * Send one operation's request after committing `dispatching`, then record the outcome.
-   * Never retries unless the caller passes `retryable` AND the contract makes it idempotent.
+   *
+   * There is no retry HERE, and no parameter that suggests one. A caller used to pass `retryable: true`
+   * for `session.create`; the field was never read, so the signature advertised a control that did not
+   * exist and the call site read as though a retry were configured. Retrying is decided by the caller from
+   * the CONTRACT and the operation's durable state — `session.create` is retried because it accepts a
+   * caller-preallocated id, and nothing else is retried at all — so the decision belongs where that
+   * knowledge is, and the flag that only looked like it was made is gone.
    *
    * The input arrives as a field bag because that is what `handleIpc` holds: an IPC frame is the
    * peer's already-parsed JSON, so every field is `unknown` until it is narrowed here. `operation`
    * may legitimately be absent (the caller passes the nullable result of `#store.getOperation`),
    * which is why the null arm below is a real branch rather than an assertion.
    */
-  async #dispatch({ operation, method, payload, allowedStates, retryable }: {
+  async #dispatch({ operation, method, payload, allowedStates }: {
     operation: OperationRow | null;
     method: string;
     payload: object;
     allowedStates: readonly string[];
-    /**
-     * Part of the caller's declared contract and deliberately unread: the original never branched
-     * on it either. It is named here so the shape is honest about what callers pass rather than
-     * pretending the field does not exist.
-     */
-    retryable?: boolean;
   }): Promise<AdapterCallResult> {
     const fresh = this.#store.getOperation(
       this.#presentRow(operation, 'operation_id').operation_id,
@@ -2200,10 +2278,15 @@ interface ShapedTask {
  * @param row a `tasks` row. The row is read unconditionally, so a null row fails as a `TypeError`
  * on the property read — which is what the original did, rather than a new error code.
  */
+/** The longest label the `dsh_task_ensure` tool schema advertises. Longer labels are refused, not cut. */
+const MAX_TASK_LABEL = 120;
+
 function shapeTask(row: TaskRow): ShapedTask {
   return {
     taskId: row.task_id,
-    label: row.label,
+    // The caller's own label when it supplied one, and the internal key otherwise. A client shows this to
+    // a human, and the internal key is not something a human asked for.
+    label: row.display_label ?? row.label,
     hostBase: row.host_base,
     hostScope: row.host_scope,
     createdAt: Number(row.created_at),

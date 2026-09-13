@@ -22,7 +22,7 @@ import { BridgeError, ERROR_CODES, toBridgeError } from './errors.ts';
 import { createDigest, mintId } from './ids.ts';
 
 /** On-disk state schema version. An unknown *future* version is refused, not guessed. */
-export const STATE_SCHEMA_VERSION = 1;
+export const STATE_SCHEMA_VERSION = 2;
 
 /** Operation lifecycle. `uncertain` is terminal-but-unresolved, by design. */
 export const OP_STATES = Object.freeze([
@@ -84,12 +84,13 @@ create table if not exists meta (
 );
 
 create table if not exists tasks (
-  task_id     text primary key,
-  label       text,
-  host_base   text not null,
-  host_scope  text not null,
-  created_at  integer not null,
-  updated_at  integer not null
+  task_id       text primary key,
+  label         text,
+  display_label text,
+  host_base     text not null,
+  host_scope    text not null,
+  created_at    integer not null,
+  updated_at    integer not null
 );
 
 create table if not exists sessions (
@@ -252,6 +253,8 @@ export interface MetaValueRow {
 export interface TaskRow {
   readonly task_id: string;
   readonly label: string | null;
+  /** The caller's label, or null when it supplied none. See {@link CreateTaskInput.displayLabel}. */
+  readonly display_label: string | null;
   readonly host_base: string;
   readonly host_scope: string;
   readonly created_at: number;
@@ -501,7 +504,18 @@ export interface HostErrorLike {
 /** Input of `createTask`. */
 export interface CreateTaskInput {
   readonly taskId: string;
+  /** The internal key this task is looked up by. NOT the label a caller sees. */
   readonly label?: string | null;
+  /**
+   * The human label the caller supplied, shown back to the caller.
+   *
+   * A separate column from `label` because the two are different things and only one of them is a
+   * lookup key: `label` holds the idempotency key derived from the client key, which `taskEnsure` matches
+   * on, while this holds whatever the caller asked the task to be called. Storing the caller's label in
+   * `label` would have made a task unfindable by its own client key — the second `task.ensure` with the
+   * same key would have created a SECOND task instead of returning the first.
+   */
+  readonly displayLabel?: string | null;
   readonly hostBase: string;
   readonly hostScope: string;
 }
@@ -680,6 +694,27 @@ export function mapSqliteError(error: unknown, context: string): BridgeError {
 const MAX_BUSY_RETRY = 5;
 
 /** Durable store. One instance per daemon process; never shared across processes. */
+/**
+ * Bring an existing state file up to the shape THIS BUILD expects.
+ *
+ * `create table if not exists` does nothing at all to a table that already exists, so a column added
+ * after the first release is simply absent from a state file written by an earlier build — and every read
+ * of it then fails at runtime, in the middle of an operation, instead of at open time. The column's
+ * presence is CHECKED and the ALTER applied once. The alternative is assuming that a table on disk has
+ * whatever shape this build declares, which is how a schema and the code that reads it drift apart in the
+ * quiet direction: the new code works on every fresh database and on none of the existing ones.
+ *
+ * The recorded version is updated to match the shape that is actually on disk, so a later build reads the
+ * number that describes this file rather than the one it had when the file was first created.
+ * @param db the connection, before it is adopted by the store
+ */
+function applyMigrations(db: DatabaseSync): void {
+  const columns = db.prepare('select name from pragma_table_info(?)').all('tasks') as { name: string }[];
+  if (columns.some((column) => column.name === 'display_label')) return;
+  db.exec('alter table tasks add column display_label text');
+  db.prepare('update meta set value = ? where key = ?').run(String(STATE_SCHEMA_VERSION), 'schema_version');
+}
+
 export class Store {
   #db: DatabaseSync;
   #stateDir: string;
@@ -703,6 +738,7 @@ export class Store {
       // Refuse a *newer* schema rather than misreading it. Written after DDL for a fresh DB.
       db.exec(DDL);
       this.#checkSchemaVersion(db);
+      applyMigrations(db);
     } catch (error) {
       // A typed refusal from our own validation (for example a newer schema) must survive
       // as-is; only raw driver errors are mapped.
@@ -715,6 +751,18 @@ export class Store {
 
   get stateDir(): string { return this.#stateDir; }
   get generation(): number { return this.#generation; }
+
+  /**
+   * The schema version this state file records.
+   *
+   * Read rather than assumed, because a migration updates it: the number in the file describes the shape
+   * that is actually on disk, and a build that has just added a column must not leave the file claiming
+   * the older shape.
+   */
+  get schemaVersion(): number {
+    const row = this.#db.prepare('select value from meta where key = ?').get('schema_version') as MetaValueRow | undefined;
+    return row ? Number(row.value) : 0;
+  }
 
   /** @returns durable store generation, used to bind cursors. */
   #readGeneration(): number {
@@ -857,12 +905,13 @@ export class Store {
   // ---- tasks ------------------------------------------------------------------------
 
   /** @param input the task to record */
-  createTask({ taskId, label = null, hostBase, hostScope }: CreateTaskInput): TaskRow | null {
+  createTask({ taskId, label = null, displayLabel = null, hostBase, hostScope }: CreateTaskInput): TaskRow | null {
     const now = Date.now();
     this.write(() => {
       this.run(
-        'insert into tasks(task_id, label, host_base, host_scope, created_at, updated_at) values (?,?,?,?,?,?)',
-        taskId, label, hostBase, hostScope, now, now,
+        `insert into tasks(task_id, label, display_label, host_base, host_scope, created_at, updated_at)
+         values (?,?,?,?,?,?,?)`,
+        taskId, label, displayLabel, hostBase, hostScope, now, now,
       );
     });
     return this.getTask(taskId);
@@ -904,7 +953,19 @@ export class Store {
         sessionId, taskId, hostSessionId, cwd, now, now,
       );
     });
-    return this.getSession(sessionId);
+    const byMintedId = this.getSession(sessionId);
+    if (byMintedId) return byMintedId;
+    // The insert took the CONFLICT arm, which means this (task, host session) pair already had a row
+    // under a different bridge session id — the update above deliberately keeps the original id, since a
+    // Host session is identified by the pair and not by our own id for it. Returning only
+    // `getSession(sessionId)` therefore handed the caller `null` for a row that exists, and `null` for
+    // an id this very call minted: the caller reported "no session" immediately after a session had been
+    // created, and the durable row was left unreachable through the reply. The row that exists is the
+    // answer, so it is looked up by the pair the conflict was declared on.
+    return this.get<SessionRow>(
+      'select * from sessions where task_id = ? and host_session_id = ?',
+      taskId, hostSessionId,
+    ) ?? null;
   }
 
   /** @param sessionId */

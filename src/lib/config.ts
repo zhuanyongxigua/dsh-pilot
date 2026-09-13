@@ -13,6 +13,9 @@
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { BridgeError, ERROR_CODES } from './errors.ts';
+// The one number both ends of the IPC socket use, so the daemon cannot emit a frame its own gateway
+// would refuse to buffer. Imported rather than duplicated: two literals is how the two ends drift.
+import { MAX_IPC_REPLY_BYTES } from './ipc.ts';
 
 /** The environment surface this module reads: `process.env` by default, or a test's own map. */
 export type EnvSource = Readonly<Record<string, string | undefined>>;
@@ -41,6 +44,23 @@ export interface ConfigLimits {
    * 15-second deadline is only reachable in a test by waiting 15 seconds.
    */
   readonly hostTimeoutMs: number;
+  /**
+   * The most response body the adapter will hold, for both the unary path and `/api/respond`.
+   *
+   * Configurable for the reason the deadline is: a cap that cannot be set cannot be tested at the size
+   * the test needs. Proving that the cap counts BYTES rather than characters means sending a body whose
+   * character count is small and whose byte count is over the line, which is only cheap if the line is
+   * a few kilobytes instead of eight megabytes.
+   */
+  readonly hostResponseMaxBytes: number;
+  /**
+   * The most one IPC reply frame may be, in received bytes, enforced on BOTH ends of the socket.
+   *
+   * Settable because the two ends must agree and a test has to be able to prove they do at a size it can
+   * actually produce: the end-to-end case drives a real oversized event through a real daemon and reads
+   * the typed refusal back, which is only cheap if the limit is a few kilobytes.
+   */
+  readonly ipcReplyMaxBytes: number;
 }
 
 /** Resolved configuration. Every field has an environment variable and an explicit default. */
@@ -80,6 +100,8 @@ export function resolveConfig(env: EnvSource = process.env): ResolvedConfig {
       waitMaxMs: numberOr(env.DSH_PILOT_WAIT_MAX_MS, 120_000),
       compactResultBytes: numberOr(env.DSH_PILOT_RESULT_MAX_BYTES, 64 * 1024),
       hostTimeoutMs: numberOr(env.DSH_PILOT_HOST_TIMEOUT_MS, 15_000),
+      hostResponseMaxBytes: numberOr(env.DSH_PILOT_HOST_RESPONSE_MAX_BYTES, 8 * 1024 * 1024),
+      ipcReplyMaxBytes: numberOr(env.DSH_PILOT_IPC_REPLY_MAX_BYTES, MAX_IPC_REPLY_BYTES),
     },
   };
 }

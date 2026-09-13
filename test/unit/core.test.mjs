@@ -211,6 +211,60 @@ export default {
     scratch.cleanup();
   },
 
+  'a state file written before a column existed is brought up to shape instead of failing mid-operation': async () => {
+    // A migration case, and the reason one is needed at all: `create table if not exists` does nothing to
+    // a table that already exists, so a column added to the DDL is simply absent from every state file
+    // written by an earlier build. The code then reads a column that is not there and fails in the middle
+    // of an operation — on exactly the databases that have been in use, and on none of the fresh ones a
+    // test would naturally create.
+    //
+    // The old shape is reproduced by hand rather than by checking out an older build: the table without
+    // the column, and the version that described it.
+    const { Store } = await import('../../dist/lib/store.js');
+    const scratch = scratchDir('store-migration');
+    const stateDir = join(scratch.dir, 'state');
+    mkdirSync(stateDir, { recursive: true });
+    const sqlite = process.getBuiltinModule('node:sqlite');
+    const old = new sqlite.DatabaseSync(join(stateDir, 'state.sqlite'));
+    old.exec(`
+      create table meta(key text primary key, value text);
+      create table tasks (
+        task_id     text primary key,
+        label       text,
+        host_base   text not null,
+        host_scope  text not null,
+        created_at  integer not null,
+        updated_at  integer not null
+      );`);
+    old.prepare('insert into meta(key, value) values (?, ?)').run('schema_version', '1');
+    old.prepare('insert into meta(key, value) values (?, ?)').run('generation', '1');
+    // A row that predates the column, so the migration runs against a table with data in it rather than
+    // against an empty one.
+    old.prepare(`insert into tasks(task_id, label, host_base, host_scope, created_at, updated_at)
+                 values (?,?,?,?,?,?)`).run('task_old', 'task:legacy', 'http://127.0.0.1:1', 'scope', 1, 1);
+    old.close();
+
+    const store = new Store({ stateDir });
+    try {
+      // The old row still reads, and its label is still the internal key: a migration must not invent a
+      // caller label for a task that never had one.
+      const legacy = store.getTask('task_old');
+      assert.equal(legacy?.label, 'task:legacy', 'the pre-existing row must survive the migration');
+      assert.equal(legacy?.display_label, null, 'and must not be given a label it never had');
+      // And the new column is usable.
+      const created = store.createTask({
+        taskId: 'task_new', label: 'task:fresh', displayLabel: 'a caller label',
+        hostBase: 'http://127.0.0.1:1', hostScope: 'scope',
+      });
+      assert.equal(created?.display_label, 'a caller label', 'a task created after the migration keeps its label');
+      // The recorded version follows the shape that is now on disk.
+      assert.equal(store.schemaVersion, 2, 'the state file must record the shape it now has');
+    } finally {
+      store.close();
+      scratch.cleanup();
+    }
+  },
+
   'corrupt storage is reported with evidence preserved': async () => {
     const { Store } = await import('../../dist/lib/store.js');
     const scratch = scratchDir('store-corrupt');

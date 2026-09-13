@@ -9,7 +9,8 @@
  * Usage: node dist/bin/dsh-pilot-daemon.js [--state-dir DIR] [--host URL] [--ready-file FILE]
  */
 
-import { writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { resolveConfig, assertScratchStateDir } from '../lib/config.ts';
 import { Daemon } from '../lib/daemon.ts';
 import { BridgeError, toBridgeError } from '../lib/errors.ts';
@@ -29,12 +30,28 @@ interface DaemonArgs {
  */
 function parseArgs(argv: string[]): DaemonArgs {
   const out: DaemonArgs = { json: false };
-  for (let i = 0; i < argv.length; i += 1) {
+  // A flag that takes a value takes the NEXT argument, and the previous form read it with `argv[++i]`
+  // without checking that there was one. `--state-dir` as the last argument therefore assigned
+  // `undefined` and the daemon came up on the default state directory, and `--host --json` consumed
+  // `--json` as the URL: both are a flag silently not doing what it says, which is the class of
+  // failure this project refuses everywhere else. A missing value is now a usage error, and so is a
+  // value that is itself another flag — a URL never begins with `--`.
+  let i = 0;
+  const value = (flag: string): string => {
+    const next = argv[i + 1];
+    if (next === undefined || next.startsWith('--')) {
+      process.stderr.write(`${flag} requires a value\n`);
+      process.exit(2);
+    }
+    i += 1;
+    return next;
+  };
+  for (; i < argv.length; i += 1) {
     const arg = argv[i];
-    if (arg === '--state-dir') out.stateDir = argv[++i];
-    else if (arg === '--host') out.hostBase = argv[++i];
-    else if (arg === '--host-scope') out.hostScope = argv[++i];
-    else if (arg === '--ready-file') out.readyFile = argv[++i];
+    if (arg === '--state-dir') out.stateDir = value(arg);
+    else if (arg === '--host') out.hostBase = value(arg);
+    else if (arg === '--host-scope') out.hostScope = value(arg);
+    else if (arg === '--ready-file') out.readyFile = value(arg);
     else if (arg === '--json') out.json = true;
     else if (arg === '--help' || arg === '-h') {
       process.stdout.write('usage: dsh-pilot-daemon [--state-dir DIR] [--host URL] [--ready-file FILE] [--json]\n');
@@ -114,6 +131,11 @@ const ready = {
   hostBase,
 };
 if (args.readyFile) {
+  // The parent directory is created first. The previous form wrote the file directly, so naming a
+  // path in a directory that did not exist yet — which is exactly what a supervisor does when it
+  // asks for a readiness file in its own run directory — threw ENOENT and the daemon exited as if it
+  // had failed to start, after it had already bound its socket and taken ownership.
+  mkdirSync(dirname(args.readyFile), { recursive: true, mode: 0o700 });
   writeFileSync(args.readyFile, `${JSON.stringify(ready)}\n`, { mode: 0o600 });
 }
 process.stdout.write(`${JSON.stringify(ready)}\n`);

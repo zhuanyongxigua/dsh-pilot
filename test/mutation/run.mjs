@@ -315,6 +315,140 @@ const MUTATIONS = [
     target: 'test/mcp-e2e',
     expectFailure: 'invalid arguments',
   },
+  {
+    name: 'ipc-client-receive-bound-removed',
+    kind: 'production',
+    protects: 'bounded input: the IPC client bounds the bytes it holds for one reply',
+    why: ('A bound on one end of a socket is not a bound on the connection: the server capped what it '
+      + 'ACCEPTED while the client capped nothing, so a peer that never sent a newline grew a gateway '
+      + 'buffer without limit.'),
+    file: 'src/lib/ipc.ts',
+    find: '      if (this.#received > this.#maxReplyBytes) {',
+    replace: '      if (this.#received > Number.MAX_SAFE_INTEGER) { // MUTATION: no receive bound',
+    target: 'test/network',
+    expectFailure: 'never sends a newline',
+  },
+  {
+    name: 'ipc-server-per-chunk-decode',
+    kind: 'production',
+    protects: 'framing: a request split inside a multi-byte character arrives as it was sent',
+    why: ('A chunk boundary is not a character boundary. `chunk.toString(\'utf8\')` on a chunk that ends '
+      + 'mid-sequence produces a replacement character that concatenating the next chunk cannot repair, so a '
+      + 'prompt containing multi-byte text could be stored corrupted.'),
+    file: 'src/lib/ipc.ts',
+    find: '      buffer += decoder.write(chunk);',
+    replace: "      buffer += chunk.toString('utf8'); // MUTATION: per-chunk decode",
+    target: 'test/network',
+    expectFailure: 'split mid-character',
+  },
+  {
+    name: 'ipc-reply-cap-removed',
+    kind: 'production',
+    protects: 'bounded output: the daemon does not emit a reply its own gateway would refuse',
+    why: ('Without this the daemon can write a frame above the bound its own client applies, and the caller '
+      + 'sees a dropped connection instead of a typed refusal telling it the answer was too large.'),
+    file: 'src/lib/ipc.ts',
+    find: "          if (Buffer.byteLength(replyLine, 'utf8') > maxReplyBytes) {",
+    replace: "          if (Buffer.byteLength(replyLine, 'utf8') > Number.MAX_SAFE_INTEGER) { // MUTATION",
+    target: 'test/network',
+    expectFailure: 'refuses to WRITE',
+  },
+  {
+    name: 'session-create-value-read-too-deep',
+    kind: 'production',
+    protects: "host truth: the session id the Host returned is the one this bridge records",
+    why: ('`call()` returns `ok({value: result.value, rpcId})` and the adapter promotes those fields, so the '
+      + "Host's value is AT `result.value`. Reading `result.value['value']` is a key that never exists, so "
+      + 'the Host id was discarded on every create and a locally minted UUID took its place — in every '
+      + 'answer that names a session.'),
+    file: 'src/lib/daemon.ts',
+    find: '    const hostValue: unknown = result.value;',
+    replace: '    const hostValue: unknown = this.#isParsedObject(result.value) ? result.value.value : undefined; // MUTATION',
+    target: 'test/fake-host',
+    expectFailure: 'Host session id from session.create',
+  },
+  {
+    name: 'record-session-returns-minted-id',
+    kind: 'production',
+    protects: 'session identity: a (task, host session) pair resolves to the row that exists',
+    why: ('The insert is `on conflict(task_id, host_session_id) do update`, which keeps the ORIGINAL bridge '
+      + 'session id, and the method then returned `getSession(sessionId)` — the id it had just minted and '
+      + 'the conflict had just declined to use. Two client keys resolving to one Host session made the '
+      + 'daemon read a null row and report a TypeError as its error text.'),
+    file: 'src/lib/store.ts',
+    find: `    const byMintedId = this.getSession(sessionId);
+    if (byMintedId) return byMintedId;`,
+    replace: `    const byMintedId = this.getSession(sessionId); // MUTATION
+    if (byMintedId) return byMintedId;
+    if (sessionId) return null;`,
+    target: 'test/fake-host',
+    expectFailure: 'two client keys',
+  },
+  {
+    name: 'adapter-counts-characters-not-bytes',
+    kind: 'production',
+    protects: 'bounded input: the response cap counts received BYTES',
+    why: ('`text.length` after `setEncoding(\'utf8\')` counts UTF-16 code units, so a body of 3-byte '
+      + 'characters could be three times the promised cap before anything refused it, and the reported '
+      + 'number described a quantity nothing measured.'),
+    file: 'src/lib/adapter.ts',
+    find: '      receivedBytes += chunk.length;',
+    replace: "      receivedBytes += chunk.toString('utf8').length; // MUTATION: characters, not bytes",
+    target: 'test/fake-host',
+    expectFailure: 'over the cap in bytes',
+  },
+  {
+    name: 'oversize-event-policy-removed',
+    kind: 'production',
+    protects: 'cursor progress: an event too large to deliver is refused BY SEQ, not silently lost',
+    why: ('The page budget exempts one oversized event so the cursor can advance. When that one event '
+      + 'crosses the IPC reply bound the page cannot be delivered, and without this refusal the caller '
+      + 'learns only that something failed, with no way to say which event to page past.'),
+    file: 'src/lib/daemon.ts',
+    find: '    if (rows.length === 1 && bytes > this.#limits.ipcReplyMaxBytes) {',
+    replace: '    if (false) { // MUTATION: the page is built even when it cannot be delivered',
+    target: 'test/persistence',
+    expectFailure: 'its seq named',
+  },
+  {
+    name: 'websocket-control-frame-length-rule-removed',
+    kind: 'production',
+    protects: 'websocket conformance: a control frame above 125 bytes is refused, not answered',
+    why: ('Answering it wrote `payload.length` into the 7-bit length field, where 126/127 mean "read the '
+      + 'length from the following bytes" — so our own reply was a malformed frame that would '
+      + 'desynchronise a conforming peer.'),
+    file: 'src/lib/ws-client.ts',
+    find: '      if (isControlOpcode(opcode) && length > 125) {',
+    replace: '      if (isControlOpcode(opcode) && length > 125 && false) { // MUTATION',
+    target: 'test/network',
+    expectFailure: 'more than 125',
+  },
+  {
+    name: 'task-label-dropped',
+    kind: 'production',
+    protects: 'tool contract: an argument the tool schema advertises is not ignored',
+    why: ("`label` is advertised by the `dsh_task_ensure` schema, forwarded by the handler, and was ignored: "
+      + 'a client that set one got the INTERNAL lookup key back as the task label.'),
+    file: 'src/lib/daemon.ts',
+    find: "    const displayLabel: string | null = typeof label === 'string' && label.trim() !== '' ? label : null;",
+    replace: `    const displayLabel: string | null = null; // MUTATION: the caller label is dropped
+    void label;`,
+    target: 'test/fake-host',
+    expectFailure: 'comes back on the task',
+  },
+  {
+    name: 'store-migration-removed',
+    kind: 'production',
+    protects: 'state evolution: a state file from an older bridge is brought up to shape',
+    why: ('`create table if not exists` does nothing to a table that already exists, so a column added to '
+      + 'the DDL is absent from every database already in use and the code reading it fails in the middle '
+      + 'of an operation, on exactly the machines that have been running the bridge.'),
+    file: 'src/lib/store.ts',
+    find: '      applyMigrations(db);',
+    replace: '      void applyMigrations; // MUTATION: no migration on open',
+    target: 'test/unit',
+    expectFailure: 'brought up to shape',
+  },
 ];
 
 /**

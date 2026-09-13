@@ -23,21 +23,119 @@
  *                bytes were handed to the socket. Never auto-retried.
  */
 
-import { request as httpRequest } from 'node:http';
+import { request as httpRequest, type IncomingMessage } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { BridgeError, ERROR_CODES, refused, ok, uncertain, type Result } from './errors.ts';
 import { connectWebSocket, type WebSocketConnection } from './ws-client.ts';
 
 /**
- * The most response body this client will hold, for both unary paths.
+ * The DEFAULT cap on a response body, in received bytes, for both unary paths. Overridable through
+ * `DshHostAdapterOptions.maxResponseBytes`, which the daemon wires to
+ * `DSH_PILOT_HOST_RESPONSE_MAX_BYTES`.
  *
- * One constant rather than a number per call site: `call()` had this bound and `respond()` did not,
+ * One quantity rather than a number per call site: `call()` had this bound and `respond()` did not,
  * and two owners for one quantity is how a bound stops being a bound — the stricter one gets edited
  * and the other keeps a value nobody reads. A Host that streams more than this is refused as a
  * protocol error while the body is still being read, so the limit is about what this process holds
- * and not about what the peer sends.
+ * and not about what the peer sends. It is measured in RECEIVED BYTES: see `collectBoundedBody`.
  */
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Read a response body under a byte cap, counting the bytes that actually ARRIVE.
+ *
+ * Three defects lived in the two copies of this loop, and they are the reason it is one function now:
+ *
+ *   - the cap was compared against `text.length` AFTER `res.setEncoding('utf8')`, which is a count of
+ *     UTF-16 code units and not of bytes. A body of 3-byte characters was therefore allowed to be three
+ *     times the promised cap; the number in the message was about a quantity nobody measured. The cap
+ *     is now compared against the raw chunk lengths, so it means received bytes on the wire whatever
+ *     the text decodes to.
+ *   - decoding was done by the stream, per chunk, which is only safe because Node's `setEncoding`
+ *     keeps a `StringDecoder` — a fact nothing in this file stated. The buffers are now collected and
+ *     decoded ONCE, so a UTF-8 sequence split across two chunks cannot be mangled by construction.
+ *   - the lifecycle listened for failure on the REQUEST only (`req.on('error')`), and a body that stops
+ *     early need not fail the request at all. MEASURED, with the delays that decide which failure it is:
+ *
+ *       - a peer that destroys the socket in the same tick as a partial write (the truncated body's
+ *         headers may not have reached the client) fails the REQUEST with `socket hang up`, which the old
+ *         code already handled;
+ *       - a peer that flushes headers and part of the body FIRST and only then destroys the socket fails
+ *         the RESPONSE — events `error` (message `aborted`), then `close` — and emits nothing on the
+ *         request, so nothing settled the call and it hung until its deadline with the truncation it had
+ *         already observed sitting unread.
+ *
+ *     The second shape is the one that matters and the one the truncation case drives. Both exits are now
+ *     installed and either alone settles it: the response's `error` fires first in practice and `close`
+ *     without `end` is the second, independent one. Removing BOTH reproduces the hang (that control was
+ *     run); removing only one of them does not, which is why "the response lifecycle is now an exit" is
+ *     the claim made here rather than "the close handler fixed it".
+ *
+ * Settlement is guarded rather than assumed: exactly one outcome wins, so a late `error` after an
+ * oversize refusal cannot turn a decided answer into a different one.
+ * @param res the response whose body is being read
+ * @param options the cap, the method name for the message, and how to tear the request down
+ * @returns the outcome, or a rejection carrying the transport failure
+ */
+function collectBoundedBody(res: IncomingMessage, options: {
+  limit: number;
+  method: string;
+  onOversize: () => void;
+}): Promise<UnaryOutcome> {
+  const { limit, method, onOversize } = options;
+  return new Promise<UnaryOutcome>((resolve, reject) => {
+    /** @type {Buffer[]} */
+    const chunks: Buffer[] = [];
+    let receivedBytes = 0;
+    let ended = false;
+    let settled = false;
+    const settle = (outcome: UnaryOutcome): void => {
+      if (settled) return;
+      settled = true;
+      resolve(outcome);
+    };
+    const fail = (error: unknown): void => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+    res.on('data', (chunk: Buffer) => {
+      // `chunk.length` on a Buffer is its byte count, which is the quantity the cap names.
+      receivedBytes += chunk.length;
+      if (receivedBytes > limit) {
+        settle({
+          kind: 'protocol',
+          error: new BridgeError(ERROR_CODES.OVERSIZE, `response body exceeds ${limit} bytes`, {
+            method,
+            maxResponseBytes: limit,
+            receivedBytes,
+          }),
+        });
+        onOversize();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    res.on('end', () => {
+      ended = true;
+      // Decoded once, over the whole body, so a multi-byte sequence split across chunks is correct by
+      // construction rather than by relying on the stream's internal decoder.
+      settle({ kind: 'http', status: res.statusCode, text: Buffer.concat(chunks).toString('utf8') });
+    });
+    res.on('error', (error: Error) => fail(error));
+    res.on('close', () => {
+      if (ended) return;
+      // A close without an end is a body that stopped early: the peer went away, or cut the response
+      // short. It is reported as a transport failure so the caller applies the same post-send
+      // classification it applies to any other carrier failure, and it settles NOW rather than at the
+      // deadline.
+      fail(new BridgeError(ERROR_CODES.HOST_UNREACHABLE, 'the response body ended before it was complete', {
+        method,
+        receivedBytes,
+      }));
+    });
+  });
+}
 
 /** Method map at the pin. Presence here is what capability negotiation starts from. */
 export const PINNED_METHODS = Object.freeze([
@@ -104,6 +202,8 @@ export interface DshHostAdapterOptions {
   readonly hostHeader?: string | null;
   /** unary deadline for bounded calls */
   readonly timeoutMs?: number;
+  /** Cap on the response body this adapter will hold, in RECEIVED BYTES. Shared by both unary paths. */
+  readonly maxResponseBytes?: number;
 }
 
 /** Per-call options for {@link DshHostAdapter.call}. */
@@ -202,6 +302,7 @@ export class DshHostAdapter {
   #baseUrl: string;
   #hostHeader: string;
   #timeoutMs: number;
+  #maxResponseBytes: number;
   /**
    * Methods the host has actually answered for; `null` until the first confirmed response.
    */
@@ -214,11 +315,13 @@ export class DshHostAdapter {
    * @param options.baseUrl e.g. http://127.0.0.1:3080
    * @param options.hostHeader Host header authority (`null` = the URL authority)
    * @param options.timeoutMs unary deadline for bounded calls
+   * @param options.maxResponseBytes cap on the response body, in received bytes
    */
-  constructor({ baseUrl, hostHeader = null, timeoutMs = 15_000 }: DshHostAdapterOptions) {
+  constructor({ baseUrl, hostHeader = null, timeoutMs = 15_000, maxResponseBytes = MAX_RESPONSE_BYTES }: DshHostAdapterOptions) {
     this.#baseUrl = baseUrl.replace(/\/+$/, '');
     this.#hostHeader = hostHeader ?? new URL(this.#baseUrl).host;
     this.#timeoutMs = timeoutMs;
+    this.#maxResponseBytes = maxResponseBytes;
   }
 
   get baseUrl(): string { return this.#baseUrl; }
@@ -291,24 +394,11 @@ export class DshHostAdapter {
           agent: false,
           signal: controller.signal,
         }, (res) => {
-          let text = '';
-          res.setEncoding('utf8');
-          res.on('data', (chunk: string) => {
-            // `setEncoding('utf8')` above makes every chunk a decoded string, which is why the
-            // listener is annotated as a string: Node's own `data` signature says Buffer
-            // regardless of the encoding.
-            text += chunk;
-            if (text.length > MAX_RESPONSE_BYTES) {
-              // Named and numbered: the constant exists so there is one owner for the quantity, and a
-              // message that only named the constant would make the reader open this file to learn a
-              // number that used to be in the message itself.
-              resolve({ kind: 'protocol', error: new BridgeError(ERROR_CODES.OVERSIZE, `response body exceeds ${MAX_RESPONSE_BYTES} bytes`, { method, maxResponseBytes: MAX_RESPONSE_BYTES }) });
-              req.destroy();
-            }
-          });
-          res.on('end', () => {
-            resolve({ kind: 'http', status: res.statusCode, text });
-          });
+          collectBoundedBody(res, {
+            limit: this.#maxResponseBytes,
+            method,
+            onOversize: () => req.destroy(),
+          }).then(resolve, reject);
         });
         req.on('socket', (socket) => {
           socket.once('connect', () => { bytesWritten = true; });
@@ -450,8 +540,8 @@ export class DshHostAdapter {
      * This path had no deadline and no body bound, and both absences are the same defect: a Host that
      * accepts the request and then answers slowly, endlessly, or never would hold this call — and the
      * memory of its body — for as long as it liked. The deadline is the adapter's existing unary one
-     * rather than a new constant, and the body bound is the shared `MAX_RESPONSE_BYTES`, so there is
-     * one owner per quantity instead of a second, quieter limit that disagrees.
+     * rather than a new constant, and the body bound is the same `#maxResponseBytes` the unary path
+     * uses, so there is one owner per quantity instead of a second, quieter limit that disagrees.
      */
     const controller = new AbortController();
     let timedOut = false;
@@ -473,22 +563,24 @@ export class DshHostAdapter {
           agent: false,
           signal: controller.signal,
         }, (res) => {
-          let text = '';
-          res.setEncoding('utf8');
-          res.on('data', (chunk: string) => {
-            text += chunk;
-            if (text.length > MAX_RESPONSE_BYTES) {
-              // Refused while reading, not after: the point of the bound is the memory this process
-              // holds, so it is enforced on the way in. The receipt is unreadable either way, so this
-              // is an unproven outcome and the caller must not treat it as "not sent".
-              // Flagged before the promise settles: the reader below tests this flag, and leaving the
-              // order the other way round would make correctness depend on microtask ordering.
+          collectBoundedBody(res, {
+            limit: this.#maxResponseBytes,
+            method: 'respond',
+            // Refused while reading, not after: the point of the bound is the memory this process
+            // holds, so it is enforced on the way in. The receipt is unreadable either way, so this is
+            // an unproven outcome and the caller must not treat it as "not sent".
+            onOversize: () => { oversize = true; req.destroy(); },
+          }).then((outcome) => {
+            if (outcome.kind === 'protocol') {
+              // The reader decided the body was unusable. It cannot be a refusal: bytes were already
+              // on the wire. `oversize` is set by the callback above so the branch below reports the
+              // reason it actually was.
               oversize = true;
               resolve({ status: undefined, text: '' });
-              req.destroy();
+              return;
             }
-          });
-          res.on('end', () => resolve({ status: res.statusCode, text }));
+            resolve({ status: outcome.status, text: outcome.text });
+          }, reject);
         });
         req.on('socket', (socket) => socket.once('connect', () => { bytesWritten = true; }));
         req.on('error', reject);
@@ -498,7 +590,7 @@ export class DshHostAdapter {
         this.#stats.protocolErrors += 1;
         return uncertain('respond-receipt-oversize', {
           rpcId,
-          maxResponseBytes: MAX_RESPONSE_BYTES,
+          maxResponseBytes: this.#maxResponseBytes,
           note: 'the answer may have been applied; the receipt could not be read, so the outcome is unproven',
         });
       }

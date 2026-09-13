@@ -23,11 +23,32 @@ import {
   openSync, readFileSync, unlinkSync, writeSync,
 } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
+import { StringDecoder } from 'node:string_decoder';
 import { join } from 'node:path';
 import { BridgeError, ERROR_CODES, toBridgeError } from './errors.ts';
 
 /** Maximum bytes in one IPC line. Larger frames are refused, not buffered. */
 export const MAX_IPC_LINE_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Maximum bytes in one IPC REPLY. Enforced on BOTH ends of the socket, from this one number.
+ *
+ * Why it needs to exist: the server bounded what it ACCEPTED and the client bounded nothing at all, so
+ * a peer that never sent a newline made the client's buffer grow without limit — a gateway held an
+ * unbounded amount of memory on behalf of the daemon it was talking to. The comment in the client even
+ * claimed it bounded what it buffers. A bound that only one side applies is not a bound on the
+ * connection.
+ *
+ * Why both ends use the SAME number: if the client's limit were lower than the largest reply the daemon
+ * can legitimately produce, the daemon would emit frames its own gateway rejects, and the failure would
+ * appear as a mysterious disconnect on a call that should have worked. So the daemon REFUSES to emit a
+ * reply above this size, with a typed error the caller can read, and the client refuses to buffer one.
+ * The value is chosen above the largest reply the daemon can construct from its own configured limits —
+ * an event page, or a single event delivered alone because it exceeded the page budget — with room for
+ * JSON escaping, so the cap is a backstop against a peer that misbehaves rather than a limit on normal
+ * traffic. It is configurable (`DSH_PILOT_IPC_REPLY_MAX_BYTES`) and asserted in the tests.
+ */
+export const MAX_IPC_REPLY_BYTES = 16 * 1024 * 1024;
 /** Maximum simultaneous gateway connections. */
 export const MAX_IPC_CONNECTIONS = 32;
 
@@ -59,6 +80,8 @@ export interface IpcServer {
 export interface StartIpcServerOptions {
   readonly stateDir: string;
   readonly handle: IpcRequestHandler;
+  /** Cap on one reply frame, in bytes. Defaults to the shared {@link MAX_IPC_REPLY_BYTES}. */
+  readonly maxReplyBytes?: number;
 }
 
 /**
@@ -137,6 +160,15 @@ export function ensureAuthorityToken(stateDir: string): AuthorityToken {
   return { path, created: true };
 }
 
+/**
+ * Is this value an object whose fields can be read? Used only to name the op in a too-large-reply
+ * refusal, where the value came from our own handler and may be anything.
+ * @param {unknown} value
+ */
+function isRecordLike(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 /** `lstatSync` that answers null for "nothing there", and follows nothing. @param {string} path */
 function lstatOrNull(path: string): ReturnType<typeof lstatSync> | null {
   try {
@@ -195,7 +227,7 @@ export function readAuthorityToken(stateDir: string): string | null {
 }
 
 /** Start the daemon's IPC endpoint. */
-export async function startIpcServer({ stateDir, handle }: StartIpcServerOptions): Promise<IpcServer> {
+export async function startIpcServer({ stateDir, handle, maxReplyBytes = MAX_IPC_REPLY_BYTES }: StartIpcServerOptions): Promise<IpcServer> {
   const path = socketPathFor(stateDir);
   if (existsSync(path)) {
     // Reaching here means the owner lock is already held, so the endpoint is an orphan from a
@@ -213,6 +245,14 @@ export async function startIpcServer({ stateDir, handle }: StartIpcServerOptions
     }
     let buffer = '';
     let received = 0;
+    // A STREAMING decoder, not `chunk.toString('utf8')`. The per-chunk form this replaced was wrong in
+    // the same way the byte count had been wrong, and the mistake is the same shape: a chunk boundary is
+    // not a character boundary. `toString` on a chunk that ends in the middle of a multi-byte sequence
+    // produces a replacement character, and concatenating the next chunk does not repair it, so a
+    // request whose text was split at that byte arrived here with U+FFFD where the peer sent a
+    // character. `StringDecoder` holds an incomplete trailing sequence back until its continuation
+    // arrives, which is the only correct way to turn a byte stream into text.
+    const decoder = new StringDecoder('utf8');
     let chain: Promise<void> = Promise.resolve();
     // No `setEncoding` here, on purpose, and this is a FIX rather than a port.
     //
@@ -237,7 +277,7 @@ export async function startIpcServer({ stateDir, handle }: StartIpcServerOptions
         buffer = '';
         return;
       }
-      buffer += chunk.toString('utf8');
+      buffer += decoder.write(chunk);
       if (buffer.length > MAX_IPC_LINE_BYTES) {
         socket.end(`${JSON.stringify({ ok: false, error: { code: ERROR_CODES.OVERSIZE, message: 'ipc line too large' } })}\n`, () => socket.destroy());
         setTimeout(() => socket.destroy(), 250).unref?.();
@@ -269,7 +309,26 @@ export async function startIpcServer({ stateDir, handle }: StartIpcServerOptions
           } catch (error) {
             response = { ok: false, error: toBridgeError(error).toJSON() };
           }
-          socket.write(`${JSON.stringify(response)}\n`);
+          // The reply is measured before it is written, so the daemon cannot emit a frame its own
+          // gateway would refuse to buffer. Measured on the SERIALISED LINE including the envelope and
+          // the newline, because that is what the client is asked to hold.
+          const replyLine = `${JSON.stringify(response)}\n`;
+          if (Buffer.byteLength(replyLine, 'utf8') > maxReplyBytes) {
+            // A typed refusal rather than a truncated or dropped frame: the caller must learn that the
+            // answer was too large to deliver, not see a broken connection and guess.
+            const bare = response.ok === true ? (response.value ?? null) : null;
+            const op = isRecordLike(bare) && typeof bare.op === 'string' ? bare.op : null;
+            socket.write(`${JSON.stringify({
+              ok: false,
+              error: {
+                code: ERROR_CODES.RESULT_TOO_LARGE,
+                message: 'the reply exceeds the IPC reply limit',
+                details: { maxReplyBytes, op },
+              },
+            })}\n`);
+            return;
+          }
+          socket.write(replyLine);
         }).catch(() => { /* a failed write means the socket is gone; the close handler cleans up */ });
       }
     });
@@ -323,30 +382,90 @@ interface IpcWaiter {
   readonly reject: (reason: unknown) => void;
 }
 
-/** One gateway-side connection to the daemon. */
+/**
+ * One gateway-side connection to the daemon.
+ *
+ * Two things this class says about itself were not true, and both are the kind that only show up under a
+ * peer that misbehaves:
+ *
+ *   - it claimed to bound what it buffers and bounded nothing. The server capped the frames it ACCEPTED;
+ *     the client capped the frames it RECEIVED at no number at all, so a daemon — or anything that got
+ *     the socket — could make a gateway hold an unbounded buffer by never sending a newline. The bound
+ *     is now real, measured in bytes, and shared with the server through {@link MAX_IPC_REPLY_BYTES} so
+ *     the two ends cannot disagree about what is deliverable.
+ *   - it decoded per chunk with `chunk.toString('utf8')`, which is wrong whenever a chunk boundary falls
+ *     inside a character: the partial sequence becomes a replacement character that concatenation cannot
+ *     repair. A reply containing multi-byte text was therefore corrupted in proportion to how the
+ *     kernel happened to split it. The decoder below holds an incomplete trailing sequence back until
+ *     its continuation arrives.
+ *
+ * A peer over the bound is a failure of THIS connection and nothing else: the socket is destroyed, the
+ * pending waiters are settled with a typed error so no caller is left waiting, the buffer is released,
+ * and the daemon keeps serving everyone else.
+ */
 export class IpcClient {
   #socket: Socket;
   #buffer = '';
+  #received = 0;
   #pending: IpcWaiter[] = [];
   #closed = false;
+  #maxReplyBytes: number;
 
-  constructor({ socketPath }: { readonly socketPath: string }) {
+  constructor({ socketPath, maxReplyBytes = MAX_IPC_REPLY_BYTES }: {
+    readonly socketPath: string;
+    /** Cap on one reply frame, in received bytes. Defaults to the shared IPC reply bound. */
+    readonly maxReplyBytes?: number;
+  }) {
+    this.#maxReplyBytes = maxReplyBytes;
     this.#socket = netConnect(socketPath);
-    // Raw Buffers, as on the server side: the client bounds what it buffers too, and a bound in bytes
-    // must be measured in bytes. Decoding happens explicitly at the same point the server does it.
+    // Raw Buffers and an explicit decoder, as on the server side: a byte count must be measured in
+    // bytes, and text must be assembled across chunk boundaries rather than per chunk.
+    const decoder = new StringDecoder('utf8');
     this.#socket.on('data', (chunk: Buffer) => {
-      this.#buffer += chunk.toString('utf8');
+      this.#received += chunk.length;
+      if (this.#received > this.#maxReplyBytes) {
+        // Destroy rather than end: a peer that is flooding is not going to honour a half-close, and the
+        // pending callers must not be left waiting for a frame that can never arrive within the bound.
+        this.#buffer = '';
+        const refusal = new BridgeError(ERROR_CODES.OVERSIZE, 'reply exceeds the IPC reply limit', {
+          maxReplyBytes: this.#maxReplyBytes,
+          receivedBytes: this.#received,
+        });
+        this.#socket.destroy();
+        this.#failAll(refusal);
+        return;
+      }
+      this.#buffer += decoder.write(chunk);
       let index = this.#buffer.indexOf('\n');
       while (index >= 0) {
         const line = this.#buffer.slice(0, index);
         this.#buffer = this.#buffer.slice(index + 1);
+        // A completed frame resets the budget: the bound is per reply, not per connection lifetime, and
+        // the remainder is counted in bytes rather than in characters.
+        this.#received = Buffer.byteLength(this.#buffer, 'utf8');
         index = this.#buffer.indexOf('\n');
         if (line.trim() === '') continue;
         const waiter = this.#pending.shift();
-        if (!waiter) continue;
+        if (!waiter) {
+          // A reply with no waiter. Previously discarded in silence, which is the right thing to do with
+          // it and the wrong thing to do silently: this connection is strictly one reply per request and
+          // the daemon serialises its replies per connection, so an unmatched frame means one of the two
+          // ends has lost track. The connection is failed rather than continuing with a desynchronised
+          // pairing, where every later reply would be handed to the wrong caller.
+          //
+          // NOT a demonstrated production failure: `request()` has no per-request deadline, so the "late
+          // reply to a timed-out waiter" that this guard also protects against cannot happen from this
+          // code today. It is here because that deadline is the obvious next change and this is the
+          // hazard it would introduce. Stated as a hazard guarded against, not as a bug that occurred.
+          this.#socket.destroy();
+          this.#failAll(new BridgeError(ERROR_CODES.HOST_PROTOCOL, 'daemon sent a reply this client has no request for', {
+            pendingRequests: this.#pending.length,
+          }));
+          return;
+        }
         try {
           waiter.resolve(JSON.parse(line));
-        } catch (error) {
+        } catch {
           waiter.reject(new BridgeError(ERROR_CODES.HOST_PROTOCOL, 'daemon sent malformed json', {}));
         }
       }
@@ -386,6 +505,23 @@ export class IpcClient {
     if (reply?.ok) return reply.value;
     const error: IpcWireError = reply?.error ?? { code: ERROR_CODES.INTERNAL, message: 'malformed daemon reply' };
     throw new BridgeError(error.code ?? ERROR_CODES.INTERNAL, error.message ?? 'daemon error', error.details ?? {});
+  }
+
+  /**
+   * How many requests are waiting for a reply.
+   *
+   * A read-only view, here because the reliability claim is "a failed connection settles its pending
+   * callers rather than leaving them waiting", and a claim needs an observable oracle. The alternative
+   * would be a test that reaches into a private field, which would then be testing the field rather than
+   * the behaviour.
+   */
+  get pendingRequests(): number {
+    return this.#pending.length;
+  }
+
+  /** The receive bound this client applies, in bytes. Read by the test that asserts the two ends agree. */
+  get maxReplyBytes(): number {
+    return this.#maxReplyBytes;
   }
 
   /** Close the connection. */

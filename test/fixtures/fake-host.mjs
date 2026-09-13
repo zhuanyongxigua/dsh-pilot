@@ -32,6 +32,9 @@ export class FakeHost {
   #respondBodyBytes = 0;
   /** @type {{status: number, body: string}|null} */
   #respondRaw = null;
+  /** @type {Map<string, {status: number, body: string, splitEvery: number|null, truncateTo: number|null}>} */
+  /** @type {Map<string, {status: number, body: string, splitEvery: number|null, truncateTo: number|null, truncateDelayMs: number}>} */
+  #rawReplies = new Map();
   #delayed = new Map();
   /** @type {Map<string, Promise<void>>} responses applied but held */
   #barriers = new Map();
@@ -213,6 +216,36 @@ export class FakeHost {
    * @param {number} status @param {string} body
    */
   respondWithRaw(status, body) { this.#respondRaw = { status, body }; }
+  /**
+   * Answer a unary method with a body this fixture controls byte for byte.
+   *
+   * `call()`'s response cap is about RECEIVED BYTES, and the only way to show that is a body whose
+   * character count and byte count disagree — so the body has to be chosen by the test, not by the
+   * fixture's own serialization. `splitEvery` writes it in fixed-size chunks so the peer's chunking is
+   * deterministic rather than whatever the kernel happened to do, which is what lets a test put a
+   * multi-byte character across a chunk boundary on purpose. `truncateTo` sends fewer bytes than the
+   * declared length and then destroys the socket: a response that stops early.
+   * @param {string} method
+   * @param {{status?: number, body: string, splitEvery?: number|null, truncateTo?: number|null, truncateDelayMs?: number|null}} options
+   */
+  answerRawFor(method, options) {
+    this.#rawReplies.set(method, {
+      status: options.status ?? 200,
+      body: options.body,
+      splitEvery: options.splitEvery ?? null,
+      truncateTo: options.truncateTo ?? null,
+      // How long to wait after writing the partial body before destroying the socket.
+      //
+      // It decides WHICH failure the client observes, and that difference is the whole point of the
+      // delay: destroying immediately means the client is still waiting for the response to start, so
+      // Node fails the REQUEST with `socket hang up` and the response is never parsed at all. Waiting
+      // first means the client has read the headers and part of the body and THEN loses the connection,
+      // which is a TRUNCATED BODY — a different failure, with a different event order on the response
+      // (`aborted`, `error`, `close`) and nothing at all on the request. A test that means to exercise a
+      // truncated body has to say so; without this the case would quietly exercise a dead connection.
+      truncateDelayMs: options.truncateDelayMs ?? 0,
+    });
+  }
   /** @param {string} method @param {number} ms */
   delayFor(method, ms) { this.#delayed.set(method, ms); }
 
@@ -512,6 +545,33 @@ export class FakeHost {
       if (this.#dropped.has(method)) {
         // Applied, but the caller never learns: the response is discarded and the socket closed.
         req.socket.destroy();
+        return;
+      }
+      const raw = this.#rawReplies.get(method);
+      if (raw) {
+        this.#rawReplies.delete(method);
+        // `__RPCID__` in the caller-supplied body becomes THIS request's rpcId. Without it a raw body
+        // cannot be a valid envelope at all — the adapter refuses a reply whose echo does not match —
+        // and the test would be measuring the mismatch instead of the cap.
+        const bytes = Buffer.from(raw.body.replace('__RPCID__', rpcId), 'utf8');
+        // Declared as the FULL length even when the body is cut short, so the client is told how much
+        // to expect and then does not get it. That is the truncation this fixture exists to produce.
+        res.writeHead(raw.status, { 'content-type': 'application/json', 'content-length': String(bytes.length) });
+        if (raw.truncateTo !== null) {
+          res.write(bytes.subarray(0, raw.truncateTo));
+          if (raw.truncateDelayMs > 0) await new Promise((resolvePromise) => setTimeout(resolvePromise, raw.truncateDelayMs));
+          req.socket.destroy();
+          return;
+        }
+        if (raw.splitEvery === null) {
+          res.end(bytes);
+          return;
+        }
+        // Chunk boundaries chosen by the test, so a test can split a multi-byte character in half.
+        for (let offset = 0; offset < bytes.length; offset += raw.splitEvery) {
+          res.write(bytes.subarray(offset, Math.min(offset + raw.splitEvery, bytes.length)));
+        }
+        res.end();
         return;
       }
       res.writeHead(200, { 'content-type': 'application/json' });

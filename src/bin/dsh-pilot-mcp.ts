@@ -26,10 +26,25 @@ interface McpArgs {
  */
 function parseArgs(argv: string[]): McpArgs {
   const out: McpArgs = {};
-  for (let i = 0; i < argv.length; i += 1) {
+  // A flag's value is checked for existence, exactly as the daemon's command line now does. The
+  // unchecked form read `argv[++i]` and assigned `undefined`, which for `--state-dir` silently sent the
+  // gateway at the DEFAULT state directory — a different daemon — and for `--socket` fell through to
+  // whatever the configuration resolved to. A gateway that connects to the wrong daemon is worse than
+  // one that refuses to start.
+  let i = 0;
+  const value = (flag: string): string => {
+    const next = argv[i + 1];
+    if (next === undefined || next.startsWith('--')) {
+      process.stderr.write(`${flag} requires a value\n`);
+      process.exit(2);
+    }
+    i += 1;
+    return next;
+  };
+  for (; i < argv.length; i += 1) {
     const arg = argv[i];
-    if (arg === '--state-dir') out.stateDir = argv[++i];
-    else if (arg === '--socket') out.socketPath = argv[++i];
+    if (arg === '--state-dir') out.stateDir = value(arg);
+    else if (arg === '--socket') out.socketPath = value(arg);
     else if (arg === '--help' || arg === '-h') {
       process.stderr.write('usage: dsh-pilot-mcp [--state-dir DIR] [--socket PATH]\n');
       process.exit(0);
@@ -63,7 +78,10 @@ const io: GatewayIo = {
 };
 
 try {
-  const outcome = await runMcpGateway({ socketPath, io });
+  // The SAME reply bound the daemon enforces, read from the same environment: a gateway that applied a
+  // different number would refuse frames the daemon considers deliverable, and the symptom would be a
+  // dropped connection rather than a bound.
+  const outcome = await runMcpGateway({ socketPath, io, maxReplyBytes: config.limits.ipcReplyMaxBytes });
   process.stderr.write(`dsh-pilot-mcp: exiting (${outcome.reason}) after ${outcome.requests} requests\n`);
   process.exit(0);
 } catch (error) {

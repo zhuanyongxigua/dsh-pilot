@@ -71,6 +71,8 @@ export interface GatewayIo {
 export interface RunMcpGatewayOptions {
   readonly socketPath: string;
   readonly io: GatewayIo;
+  /** Cap on one reply frame, in bytes. The daemon enforces the same number; defaults to the shared one. */
+  readonly maxReplyBytes?: number;
 }
 
 /** What the loop reports when it ends: why it stopped, and what it served. */
@@ -118,14 +120,14 @@ interface JsonRpcParams {
  * @param options.io process facilities, supplied by the entry point
  * @returns resolves when the loop ends
  */
-export async function runMcpGateway({ socketPath, io }: RunMcpGatewayOptions): Promise<GatewayOutcome> {
+export async function runMcpGateway({ socketPath, io, maxReplyBytes }: RunMcpGatewayOptions): Promise<GatewayOutcome> {
   if (!io || !io.input || !io.output) {
     throw new BridgeError(ERROR_CODES.BAD_REQUEST, 'runMcpGateway requires {io:{input,output,pid}}', { socketPath });
   }
   const { input, output } = io;
   let ipc: IpcClient;
   try {
-    ipc = new IpcClient({ socketPath });
+    ipc = new IpcClient({ socketPath, ...(maxReplyBytes === undefined ? {} : { maxReplyBytes }) });
     await ipc.ready();
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);

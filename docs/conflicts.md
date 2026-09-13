@@ -296,3 +296,77 @@ it back, reuses it without rotating it, and tightens a drifted mode.
 **The limit, stated rather than implied.** This covers the authority-token path. The `cwd`/workspace
 half of FR-SEC-4 is NOT implemented: a dispatch whose `cwd` escapes the workspace through a link is
 neither refused nor resolved safely, and no test attempts one. FR-SEC-4 is `partial` for that reason.
+
+## C-7: the daemon-local queue scope — kept as an empty scope, not deleted and not faked
+
+**The tension.** FR-CANCEL-1 requires two nested cancellation scopes, and the reply reports them
+separately: `queue.local` (the `daemon` scope this bridge owns) and `queue.remote` (the Host's inbox, as
+last observed). The daemon has a `#queue` map for the local scope — and NOTHING in this bridge ever
+appends to it, because a prompt is dispatched to the Host and the Host's inbox is the only queue that
+holds work. So the field is always an empty array, and a reader can reasonably ask whether an empty
+array means "nothing is queued" or "this capability does not exist".
+
+**Decision: keep the scope, and say in the reply why it is empty.** Deleting the field would remove a
+distinction the requirement exists to preserve — a caller must be able to tell the two scopes apart —
+while leaving it unexplained is the failure the review found: `queueClear`'s note said "only the
+daemon-local queue scope was touched", which reads as though a local queue COULD have held something.
+The note now says there is no daemon-local prompt queue to clear, and `docs/test-matrix.md`'s
+cancellation row carries the same wording.
+
+**What was removed rather than explained away.** `#localQueueMax = 64` stood beside the map and was
+never compared to anything: a limit that bounds nothing invites the reader to conclude that local
+queueing is a capability of this daemon. It is gone. So is the `#dispatch` parameter `retryable`, which
+`session.create` passed as `true` and nothing read — retrying is decided from the contract and the
+operation's durable state, not from a flag — and `sessionWait`'s `sinceSeq`, which was destructured,
+never read, never sent, and never documented. All three are recorded in
+`docs/test-matrix.md` §10 as withdrawn claims rather than as quiet deletions.
+
+## C-8: two ends of one socket, one bound — and which end owns it
+
+**The tension.** The IPC socket has a client (each gateway) and a server (the daemon). A bound on one
+end is not a bound on the connection: the server capped the frames it ACCEPTED while the client capped
+nothing it RECEIVED, and the client's own comment claimed it "bounds what it buffers too". A peer that
+never sent a newline therefore grew a gateway's buffer without limit.
+
+**Decision: one number, enforced on both ends, and the server refuses to emit what the client would
+reject.** `MAX_IPC_REPLY_BYTES` (default 16 MiB, `DSH_PILOT_IPC_REPLY_MAX_BYTES`) is used by the client
+as its receive bound and by the daemon as the cap on any reply it writes; a reply above it becomes a
+typed `RESULT_TOO_LARGE` carrying the op, so the caller reads an answer instead of watching a
+connection die. The value sits above every reply the daemon can construct from its own configured
+limits — an event page, or one event delivered alone because it exceeded the page budget — with room for
+JSON escaping, so it is a backstop against a misbehaving peer rather than a limit on normal traffic.
+
+**Why the daemon also refuses to write one.** If the client's limit were lower than the largest reply
+the daemon could legitimately produce, the daemon would emit frames its own gateway refuses, and the
+symptom — a dropped connection on a call that should have worked — would look like anything but a
+bound. Both ends take the number from the same module, and both are asserted to agree.
+
+**The framing half of the same problem.** A chunk boundary is not a character boundary, and both ends
+decoded per chunk: `chunk.toString('utf8')` turns a UTF-8 sequence split across two chunks into a
+replacement character that concatenating the next chunk cannot repair. Both ends now use a streaming
+decoder, tested by writing one byte at a time — including the daemon's request path, where a prompt
+containing multi-byte text could be stored and forwarded corrupted.
+
+## C-9: a control frame's own rules, which are not a size limit
+
+**The tension.** "Accept what a peer sends and answer it" conflicts with RFC 6455 §5.5 as soon as a
+peer is wrong: a control frame's payload MUST be 125 bytes or less, and a control frame MUST NOT be
+fragmented. This client accepted a 126-byte ping and answered it — and the answer was itself invalid,
+because the pong's length byte held `payload.length` and in the 7-bit length field 126 and 127 are not
+lengths but the markers that mean "read the length from the following bytes". The peer would then read
+a frame length out of bytes that were never written, so a client's malformed REPLY would desynchronise
+a conforming peer.
+
+**Decision: refuse the frame and fail the connection (a `1002`-class protocol error).** There is no
+middle path: a frame that violates the section cannot be both rejected and acted on. A fragmented ping
+is refused for the same reason and a worse consequence — it was read as the START of a fragmented
+message, so the ping was never answered AND the peer's next legal data frame was then reported as the
+peer's violation, blaming the wrong side. The positive control is a 125-byte ping, which must still be
+answered with the connection left open: the rule is a bound, not a ban on keepalives.
+
+**Fixture fidelity is part of this.** Our own fake Host's WebSocket peer (`acceptWebSocket`, used only
+by `test/fixtures/fake-host.mjs`) had the same defect and answered an illegal ping with a malformed
+pong. A fixture that produces frames a correct client must reject hides parser bugs instead of finding
+them, so it now refuses the same frames. It remains a TEST helper: nothing in this section is evidence
+about the official Host, and the production parser's rules are asserted against a raw peer, not against
+this fixture.

@@ -48,6 +48,13 @@ const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
  * different errors, and only one of them is a statement about the peer's protocol version.
  * @param opcode
  */
+/** The three control opcodes of RFC 6455, which carry their own length and fragmentation rules.
+ * @param {number} opcode
+ */
+function isControlOpcode(opcode: number): boolean {
+  return opcode === OPCODE.close || opcode === OPCODE.ping || opcode === OPCODE.pong;
+}
+
 function isKnownOpcode(opcode: number): boolean {
   return opcode === OPCODE.continuation || opcode === OPCODE.text || opcode === OPCODE.binary
     || opcode === OPCODE.close || opcode === OPCODE.ping || opcode === OPCODE.pong;
@@ -278,6 +285,26 @@ export async function connectWebSocket({
         return;
       }
       // Legality, before the payload is buffered: these are protocol violations, not sizes.
+      //
+      // CONTROL FRAMES HAVE THEIR OWN RULES, and they are the two this parser used to skip. RFC 6455
+      // section 5.5: a control frame's payload MUST be 125 bytes or less, and it MUST NOT be fragmented.
+      // Both matter here rather than being pedantry about a peer we do not control: a 126-byte ping was
+      // accepted and answered with a pong whose length byte was written as `payload.length` — a value
+      // above 125 in the 7-bit field is not a length, it is the EXTENDED-LENGTH marker, so the reply was
+      // a frame header that says `read two more bytes` with none to read. The peer would desynchronise on
+      // our reply, which is a worse outcome than refusing, and it is a `1002`-class protocol error in
+      // both directions. A fragmented control frame is worse still: the ping would be treated as the
+      // start of a fragmented message, and the next data frame would look like a violation of the peer's.
+      if (isControlOpcode(opcode) && length > 125) {
+        fail(new BridgeError(ERROR_CODES.HOST_PROTOCOL, 'websocket control frame payload exceeds 125 bytes', {
+          opcode, length, limit: 125,
+        }));
+        return;
+      }
+      if (isControlOpcode(opcode) && !fin) {
+        fail(new BridgeError(ERROR_CODES.HOST_PROTOCOL, 'websocket control frame must not be fragmented', { opcode }));
+        return;
+      }
       if (opcode === OPCODE.continuation && fragmentOpcode === null) {
         fail(new BridgeError(ERROR_CODES.HOST_PROTOCOL, 'websocket continuation frame with no message in progress', {
           opcode,
@@ -600,6 +627,16 @@ export function acceptWebSocket(request: IncomingMessage, socket: Duplex, onMess
       buffer = buffer.subarray(offset + length);
       if (opcode === OPCODE.close) { socket.end(); return; }
       if (opcode === OPCODE.ping) {
+        // A ping with more than 125 bytes of payload is invalid (RFC 6455 section 5.5), and this used to
+        // answer it anyway: `pong[1] = payload.length` writes a number above 125 into the 7-bit length
+        // field, where 126 and 127 mean "read more bytes for the length" rather than being a length. The
+        // reply was therefore a frame a correct client MUST reject, produced by our own test fixture —
+        // which is exactly the kind of fixture that hides a parser bug instead of finding one. The peer
+        // is torn down instead.
+        if (payload.length > 125 || (buffer[0] & 0x80) === 0) {
+          socket.destroy();
+          return;
+        }
         const pong = Buffer.alloc(2);
         pong[0] = 0x80 | OPCODE.pong;
         pong[1] = payload.length;

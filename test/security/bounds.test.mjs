@@ -238,7 +238,16 @@ export default {
       const sqlite = process.getBuiltinModule('node:sqlite');
       const db = new sqlite.DatabaseSync(join(stateDir, 'state.sqlite'), { readOnly: true });
       const dump = db.prepare('select cast(group_concat(sql) as blob) as text from sqlite_master').get();
-      const rows = db.prepare('select * from tasks union all select * from sessions').all();
+      // Both tables dumped as their own queries rather than as one UNION ALL. The union form requires
+      // the two tables to have the same number of columns, which was a coincidence rather than a
+      // property of the schema: adding a column to ONE of them made this case fail with a SQL error
+      // instead of a credential finding, which is a test failing about its own query and not about
+      // secrets. Concatenating the two result sets keeps the coverage the union was reaching for — every
+      // row of both tables — without the accidental schema coupling.
+      const rows = [
+        ...db.prepare('select * from tasks').all(),
+        ...db.prepare('select * from sessions').all(),
+      ];
       db.close();
       const haystack = `${JSON.stringify(dump)}${JSON.stringify(rows)}`;
       for (const marker of ['ANTHROPIC_AUTH_TOKEN', 'sk-', 'Bearer ', 'apiKey=', 'authToken']) {

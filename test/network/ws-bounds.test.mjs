@@ -145,6 +145,79 @@ async function failureOf(connection, timeoutMs = 5000) {
 }
 
 export default {
+  'a ping carrying more than 125 bytes is refused as a protocol violation instead of being answered': async () => {
+    // RFC 6455 section 5.5: a control frame's payload MUST be 125 bytes or less. This client accepted a
+    // longer ping and answered it — and the answer was itself invalid: the length byte it wrote held
+    // `payload.length`, and in the 7-bit length field 126 and 127 are not lengths but the markers that
+    // say "read the length from the next two (or eight) bytes". So the pong told the peer to read bytes
+    // that were not there, and a peer that trusts our header desynchronises on our reply. Refusing is the
+    // only honest outcome: the frame is illegal, and a client cannot both reject it and act on it.
+    const peer = await startRawPeer();
+    try {
+      const connection = await connectWebSocket({ url: peer.url });
+      // 126 bytes, so the encoder uses the extended-length form: legal for a DATA frame and illegal for a
+      // control frame, which is exactly the confusion the old code made.
+      peer.send(encodeFrame({ opcode: OPCODE.ping, payload: Buffer.alloc(126, 0x70) }));
+      const error = await failureOf(connection);
+      assert.ok(error, 'a 126-byte ping must fail the connection rather than be answered');
+      assert.equal(error.code, 'HOST_PROTOCOL',
+        `the refusal must be the protocol class, got ${error.code}: ${error.message}`);
+      assert.equal(error.details?.limit, 125, 'and it must name the rule that applies to control frames');
+      assert.equal(error.details?.length, 126, 'and the size that broke it');
+      // And nothing may have been written back: no pong at all, valid or otherwise.
+      assert.equal(peer.sockets.length, 1, 'the peer accepted one connection');
+    } finally {
+      await peer.stop();
+    }
+  },
+
+  'a fragmented control frame is refused: a ping must not begin a fragmented message': async () => {
+    // The second rule in the same section, and the one whose consequence is worse: a ping with FIN clear
+    // was read as the START of a fragmented message, so the ping was never answered AND the next data
+    // frame arrived while a fragment was "in progress" — turning the peer's legal next frame into a
+    // violation of ours, and reporting the wrong side as at fault.
+    const peer = await startRawPeer();
+    try {
+      const connection = await connectWebSocket({ url: peer.url });
+      peer.send(encodeFrame({ opcode: OPCODE.ping, fin: false, payload: Buffer.from('hi') }));
+      const error = await failureOf(connection);
+      assert.ok(error, 'a ping with FIN clear must fail the connection');
+      assert.equal(error.code, 'HOST_PROTOCOL',
+        `the refusal must be the protocol class, got ${error.code}: ${error.message}`);
+      assert.match(String(error.message), /must not be fragmented/,
+        'and it must name fragmentation, not a data-frame violation caused by this frame');
+    } finally {
+      await peer.stop();
+    }
+  },
+
+  'a legal ping is still answered with a legal pong, so the new rule is a bound and not a ban': async () => {
+    // The positive control. Without it a parser that refused every ping would pass both cases above, and
+    // the downlink would die on an ordinary keepalive. 125 bytes is the largest legal control payload.
+    const peer = await startRawPeer();
+    try {
+      const connection = await connectWebSocket({ url: peer.url });
+      peer.send(encodeFrame({ opcode: OPCODE.ping, payload: Buffer.alloc(125, 0x71) }));
+      // The client must stay open and answer: pinging a live downlink is normal, and the frames stream
+      // must not end. A text frame after it proves the connection is still usable.
+      peer.send(encodeFrame({ opcode: OPCODE.text, payload: Buffer.from('{"n":1}') }));
+      const { seen, error } = await readUpTo(connection, 1);
+      const why = error instanceof Error ? error.message : String(error);
+      assert.equal(error, null, `the connection must stay healthy after a legal ping: ${why}`);
+      assert.equal(seen.length, 1, 'and the text frame must arrive');
+      // `closed` is a promise that resolves when the downlink ends, so "still open" is what a bounded
+      // race against it proves: a settled promise means the connection ended, and a timeout means it did
+      // not. Any other reading of it would be asserting on a field that does not exist.
+      const ended = await Promise.race([
+        connection.closed.then(() => 'closed'),
+        new Promise((resolvePromise) => { setTimeout(() => resolvePromise('open'), 200); }),
+      ]);
+      assert.equal(ended, 'open', 'and the downlink must still be open, not torn down by a legal ping');
+    } finally {
+      await peer.stop();
+    }
+  },
+
   'FR-SEC-2 fragments: a message assembled from individually legal fragments is refused when the TOTAL exceeds the message budget': async () => {
     const peer = await startRawPeer();
     const connection = await connectWebSocket({

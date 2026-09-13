@@ -65,7 +65,7 @@ describes the build gate that enforces the Node-free part of it.
 | `src/lib/gateway.ts` | MCP face (stdio transport) | framing, `initialize`/`tools/list`/`tools/call`, `notifications/cancelled` bookkeeping, mapping a daemon refusal to a JSON-RPC error, `isError` on non-success | build HTTP requests, mint an `rpcId`, decide anything |
 | `src/lib/mcp-tools.ts` | MCP face (contract) | the 11 tool schemas and the JSON-Schema-subset validator (`additionalProperties: false` everywhere) | import anything Node-only |
 | `src/lib/mcp-protocol.ts` | MCP face (contract) | `MCP_PROTOCOL_VERSION`, `SERVER_INFO`, and the bridge-code → JSON-RPC-code mapping | import anything Node-only |
-| `src/lib/ipc.ts` | transport | the local socket server/client, line framing, the authority-token file and the two rights that go with it | decide business meaning |
+| `src/lib/ipc.ts` | transport | the local socket server/client, line framing, the shared reply bound, the authority-token file and the two rights that go with it | decide business meaning |
 | `src/bin/dsh-pilot-daemon.ts` | entry point | starting the owner: scratch-root guard, `Daemon.start()`, `startEventIngest()`, ready file, signal shutdown | expose a network listener |
 | `src/lib/daemon.ts` | domain | mutation scheduling (per-session FIFO, cross-session concurrent), the durable-intent protocol, event ingest and completeness, interaction authority, restart recovery, the IPC op surface | speak MCP, or read the Host's wire format itself |
 | `src/lib/store.ts` | durable state | SQLite schema and every state transition, idempotency keys, the outbox, the event log and cursors, interactions, audit rows, integrity/version checks | wrap a network call in a transaction |
@@ -184,7 +184,16 @@ methods enforce:
 - one native `(task, session, seq)` becomes exactly one event row, and the writer returns whether
   it inserted;
 - an unknown **future** schema version is refused (`STATE_VERSION_UNSUPPORTED`), and corruption is
-  reported with the database and WAL left in place.
+  reported with the database and WAL left in place;
+- a state file from an **older** bridge is migrated at open time rather than misread. `create table if
+  not exists` does nothing to a table that already exists, so a column added to the schema is absent
+  from every database already in use, and the code reading it would fail in the middle of an operation
+  on exactly the machines that have been running the bridge. `applyMigrations` checks for the column,
+  adds it, and updates the recorded version to the shape now on disk. The task table's `display_label`
+  is the first column to arrive this way: it holds the label `dsh_task_ensure` advertises, kept in its
+  own column because `label` is the idempotency key derived from the client key — storing the caller's
+  label there would have made the second `task.ensure` create a second task instead of finding the
+  first.
 
 It never holds credentials or secrets.
 
@@ -203,7 +212,26 @@ is only declared is a claim, not a bound. `src/lib/config.ts` reads these from t
 `eventBufferMaxBytes` 32 MiB, `frameMaxBytes` 1 MiB, `waitDefaultMs` 30 s, `waitMaxMs` 120 s,
 `compactResultBytes` 64 KiB. `DEFAULT_LIMITS` in `src/lib/daemon.ts` carries the same defaults plus
 `logMaxBytes` 100 MiB, and `src/lib/ipc.ts` fixes `MAX_IPC_LINE_BYTES` 4 MiB and
-`MAX_IPC_CONNECTIONS` 32.
+`MAX_IPC_CONNECTIONS` 32. `maxResponseBytes` (8 MiB, `DSH_PILOT_HOST_RESPONSE_MAX_BYTES`) caps a Host
+response body on BOTH unary paths, counted in **received bytes** while the body streams, and
+`ipcReplyMaxBytes` (16 MiB, `DSH_PILOT_IPC_REPLY_MAX_BYTES`) caps one IPC reply frame on both ends of
+the socket — see C-8 in [`conflicts.md`](conflicts.md) for why one end cannot own that number.
+
+One more bound is deliberately NOT here: the daemon-local queue scope has no limit because it holds
+nothing. `queue.local` is always empty — a prompt goes to the Host, whose inbox is the only queue with
+work in it — and the reply's note says so, because an unexplained empty array reads as "nothing queued
+right now" (C-7).
+
+**Framing is a streaming decode on both ends, and the daemon will not write a frame its own gateway
+would refuse.** A chunk boundary is not a character boundary: decoding each chunk on its own turns a
+UTF-8 sequence split across two chunks into a replacement character that no later concatenation
+repairs, so a reply containing multi-byte text was corrupted in proportion to how the kernel happened to
+split it, and a request containing multi-byte text could be stored corrupted. Both ends now hold a
+streaming decoder, and both measure their budgets in the bytes that actually arrive or are about to be
+written. The reply bound is the same number on both ends: the client refuses to buffer more, and the
+daemon refuses to emit a reply above it, answering with a typed `RESULT_TOO_LARGE` instead — because a
+client limit below the daemon's legitimate maximum would surface as a dropped connection on a call that
+should have worked.
 
 The four event bounds are distinct quantities, and the reason they are not one number is that each
 answers a different question. A page is capped by **count** (`eventPageMax`) and by **serialised
