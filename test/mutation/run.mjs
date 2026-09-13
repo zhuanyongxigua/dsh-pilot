@@ -74,6 +74,74 @@ const MUTATIONS = [
     expectFailure: 'crash',
   },
   {
+    name: 'scope-status-not-read-as-failure',
+    kind: 'production',
+    protects: 'uncertainty-not-success: a per-scope outcome is read before a tool call is called a success',
+    why: ('`queue.clear` reports its outcome only at `remoteScope.status`. A success test that reads only a '
+      + 'top-level result/operation wrapper marks an unconfirmed removal as a successful tool call.'),
+    file: 'src/lib/gateway.ts',
+    find: `  for (const scope of ['remoteScope', 'turnScope']) {`,
+    replace: `  for (const scope of [] as string[]) { // MUTATION: the per-scope outcome is not read`,
+    target: 'test/mcp-e2e',
+    expectFailure: 'queue removal',
+  },
+  {
+    name: 'websocket-message-budget-removed',
+    kind: 'production',
+    protects: 'bounded output: a message assembled from individually legal frames is still bounded',
+    why: ('A per-frame bound cannot bound an assembled message: every fragment may be legal while the total is '
+      + 'unbounded, so a peer that sends legal frames forever makes this process hold an unbounded message.'),
+    file: 'src/lib/ws-client.ts',
+    find: '      if (messageBytes > maxMessageBytes) {',
+    replace: '      if (false && messageBytes > maxMessageBytes) { // MUTATION: no message budget',
+    target: 'test/network',
+    expectFailure: 'assembled',
+  },
+  {
+    name: 'authority-token-path-followed',
+    kind: 'production',
+    protects: 'filesystem scope: a non-regular file at a path this process owns is refused, not followed',
+    why: ('Following a link at the authority-token path redirects chmod, creation and reading outside the 0700 '
+      + 'state directory that is the only protection the approval authority has.'),
+    file: 'src/lib/ipc.ts',
+    find: `  const existing = lstatOrNull(path);
+  if (!existing) return null;
+  if (!existing.isFile()) {
+    throw new BridgeError(ERROR_CODES.UNSAFE_STATE_PATH, 'refusing to read an authority token through a non-regular file', {
+      path,
+      kind: existing.isSymbolicLink() ? 'symlink' : 'other',
+    });
+  }
+  const fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    assertRegularDescriptor(fd, path);
+    return readFileSync(fd, 'utf8').trim();
+  } finally {
+    closeSync(fd);
+  }`,
+    replace: `  const existing = lstatOrNull(path);
+  void existing;
+  // MUTATION: the pre-fix read, which follows links and returns whatever is there.
+  if (!existsSync(path)) return null;
+  return readFileSync(path, 'utf8').trim();`,
+    target: 'test/security',
+    expectFailure: 'token',
+  },
+  {
+    name: 'removal-crash-recovery-removed',
+    kind: 'production',
+    protects: 'removal once: a removal attempt that could have reached the Host is never sent again after a crash',
+    why: ('The once-only guarantee is enforced by the removal ledger, but the ledger row is written only AFTER the '
+      + 'Host answers. Without the startup reconciliation of orphaned attempts, a process killed in that window '
+      + 'leaves no record, and a re-reported queue snapshot makes the same occurrence removable a second time.'),
+    file: 'src/lib/daemon.ts',
+    find: '    const removals = this.#reconcileRemovalAttempts();',
+    replace: '    // MUTATION: the orphaned removal attempts are never reconciled into the ledger.\n'
+      + '    const removals = { settled: 0, blocked: 0, confirmed: 0, retryable: 0, items: [] as string[] };',
+    target: 'test/persistence',
+    expectFailure: 'removal-crash-window',
+  },
+  {
     name: 'ack-loss-reported-as-success',
     kind: 'production',
     protects: 'uncertainty: an unprovable outcome is never reported as success',
@@ -420,6 +488,9 @@ const OBLIGATIONS = [
   { id: 'stream-completeness', phrase: 'stream completeness' },
   { id: 'session-identity', phrase: 'session identity' },
   { id: 'tool-schema-strictness', phrase: 'tool schema' },
+  { id: 'removal-once-across-crash', phrase: 'removal once' },
+  { id: 'owned-path-not-followed', phrase: 'filesystem scope' },
+  { id: 'uncertainty-not-success', phrase: 'uncertainty-not-success' },
 ];
 const obligationTable = OBLIGATIONS.map((obligation) => ({
   id: obligation.id,

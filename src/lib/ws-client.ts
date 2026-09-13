@@ -8,8 +8,22 @@
  * parser and the writers below are real, and the fake host exercises them over a real socket.
  *
  * Scope: client role only, text frames plus ping/pong/close, no extensions, no compression.
- * Frames larger than maxFrameBytes are refused as a typed error rather than buffered — the
- * design requires bounds to be enforced, not hoped for.
+ *
+ * Three bounds, because one was not enough. `maxFrameBytes` caps a single frame, which is the
+ * wrong unit for a peer that sends a legal-sized frame forever: a fragmented message is assembled
+ * across many frames, so a per-frame cap alone lets an unbounded message accumulate in `fragments`
+ * and then hands `Buffer.concat` an unbounded total. `maxMessageBytes` therefore caps the
+ * ASSEMBLED message cumulatively, checked against the declared length as soon as a frame header is
+ * parsed — before the payload is buffered, so a peer cannot make this process hold the bytes it is
+ * trying to make us hold. `maxQueueBytes` caps the frames parsed but not yet consumed, which is the
+ * other way to grow without limit: a fast peer and a slow consumer. Exceeding any of them is a
+ * typed error, the connection is torn down, and the parser's buffers are released.
+ *
+ * A frame that is illegal rather than merely large (a continuation with no message started, a new
+ * data frame inside a fragmented message, a reserved opcode) is a protocol error too, not something
+ * to skip. Silently ignoring such a frame while still reporting the stream as complete is the one
+ * outcome this file refuses: a dropped frame is a gap in a session's history, and a caller reading
+ * `complete` would have no way to learn about it.
  */
 
 import { connect as netConnect } from 'node:net';
@@ -28,12 +42,30 @@ const OPCODE = {
 } satisfies Record<string, number>;
 const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
+/**
+ * The opcodes this client understands. `binary` is in the set so that a binary frame is a KNOWN
+ * frame that this client deliberately refuses, rather than an unknown one — the two produce
+ * different errors, and only one of them is a statement about the peer's protocol version.
+ * @param opcode
+ */
+function isKnownOpcode(opcode: number): boolean {
+  return opcode === OPCODE.continuation || opcode === OPCODE.text || opcode === OPCODE.binary
+    || opcode === OPCODE.close || opcode === OPCODE.ping || opcode === OPCODE.pong;
+}
+
 /** Connection parameters for `connectWebSocket`. */
 export interface ConnectWebSocketOptions {
   /** like `ws://127.0.0.1:3080/api/events.mux` */
   readonly url: string;
   /** refuse frames beyond this size */
   readonly maxFrameBytes?: number;
+  /**
+   * Refuse a message whose assembled size exceeds this. A message is one frame, or every frame
+   * between an initial data frame and its FIN — so this is the bound the per-frame one cannot be.
+   */
+  readonly maxMessageBytes?: number;
+  /** Refuse to hold more than this many parsed-but-unconsumed bytes for a slow reader. */
+  readonly maxQueueBytes?: number;
   readonly connectTimeoutMs?: number;
   /** close the socket when aborted */
   readonly signal?: AbortSignal;
@@ -55,6 +87,32 @@ export interface WebSocketConnection {
   readonly closed: Promise<void>;
   readonly handshakeDone: boolean;
   readonly upgradeState: UpgradeState | null;
+  /**
+   * Live bound observability. A test can assert that a budget held by reading these instead of by
+   * measuring the process's memory, which would be measuring the machine.
+   */
+  readonly stats: WebSocketStats;
+}
+
+/** The observable bounds of one connection, current at read time. */
+export interface WebSocketStats {
+  /** Bytes parsed and handed to the consumer but not consumed yet. */
+  readonly queueBytes: number;
+  /** Bytes buffered for the message currently being assembled. */
+  readonly pendingMessageBytes: number;
+  /** Bytes of a partially received frame header/payload still in the parse buffer. */
+  readonly parseBufferBytes: number;
+  /** Frames accepted and delivered as text. */
+  readonly messagesDelivered: number;
+  /** The configured bounds, echoed so an assertion can name what it checked. */
+  readonly maxFrameBytes: number;
+  readonly maxMessageBytes: number;
+  readonly maxQueueBytes: number;
+  /**
+   * Set once a bound was exceeded or the peer broke the protocol: the connection is finished and
+   * the consumer will observe this error. Null while the connection is usable.
+   */
+  readonly failed: { code: string; message: string } | null;
 }
 
 /** The server-side peer `acceptWebSocket` returns. */
@@ -81,7 +139,14 @@ interface QueueItem {
  * @param options url, frame bound, handshake timeout and abort signal
  * @returns the frame stream, the writers, and the handshake result
  */
-export async function connectWebSocket({ url, maxFrameBytes = 1024 * 1024, connectTimeoutMs = 10_000, signal }: ConnectWebSocketOptions): Promise<WebSocketConnection> {
+export async function connectWebSocket({
+  url,
+  maxFrameBytes = 1024 * 1024,
+  maxMessageBytes = 4 * 1024 * 1024,
+  maxQueueBytes = 8 * 1024 * 1024,
+  connectTimeoutMs = 10_000,
+  signal,
+}: ConnectWebSocketOptions): Promise<WebSocketConnection> {
   const parsed = new URL(url);
   if (parsed.protocol !== 'ws:') {
     throw new BridgeError(ERROR_CODES.BAD_REQUEST, `unsupported websocket scheme: ${parsed.protocol}`, {});
@@ -111,19 +176,60 @@ export async function connectWebSocket({ url, maxFrameBytes = 1024 * 1024, conne
 
   /** Frames and errors are delivered through this queue. */
   const queue: QueueItem[] = [];
+  let queueBytes = 0;
   let notify: (() => void) | null = null;
   let finished = false;
   let finishReason: UpgradeState | null = null;
+  let messagesDelivered = 0;
+  /**
+   * The first bound violation or protocol error, kept so a later frame cannot overwrite the reason
+   * the connection actually died, and so `stats.failed` reports the real cause.
+   */
+  let failed: BridgeError | null = null;
+
+  /** Wake a waiting consumer. */
+  const wake = (): void => { if (notify) { const n = notify; notify = null; n(); } };
 
   const push = (item: QueueItem): void => {
+    // Once the connection has failed, no further text is admitted: the error the consumer will see
+    // must be the FIRST one, and a peer streaming after a violation must not keep growing the queue.
+    if (failed && item.text !== undefined) return;
     queue.push(item);
-    if (notify) { const n = notify; notify = null; n(); }
+    if (item.text !== undefined) queueBytes += Buffer.byteLength(item.text, 'utf8');
+    wake();
+  };
+
+  /**
+   * Fail the connection: record the cause once, stop the peer, release the parser's buffers, and
+   * make the error the consumer's next observation. `releaseParserBuffers` is separate because the
+   * close path needs it too — a half-assembled message must not outlive the socket that carried it.
+   */
+  const fail = (error: BridgeError): void => {
+    if (failed) return;
+    failed = error;
+    push({ error });
+    releaseParserBuffers();
+    if (!socket.destroyed) socket.destroy();
+  };
+
+  const releaseParserBuffers = (): void => {
+    frameBuffer = Buffer.alloc(0);
+    fragments = [];
+    fragmentBytes = 0;
+    fragmentOpcode = null;
   };
 
   // ---- frame parser (server->client frames are never masked) -------------------------
   let frameBuffer = Buffer.alloc(0);
+  /**
+   * The message being assembled: `fragmentOpcode` is null when no message is in progress, and
+   * `fragmentBytes` is the running total of the fragments taken so far. The total is what the
+   * per-frame check cannot see, and it is tracked rather than derived from `fragments` because the
+   * decision to refuse must be made from the declared length BEFORE the bytes are held.
+   */
   let fragmentOpcode: number | null = null;
   let fragments: Buffer[] = [];
+  let fragmentBytes = 0;
 
   /** @param chunk */
   const consumeFrames = (chunk: Buffer): void => {
@@ -145,16 +251,56 @@ export async function connectWebSocket({ url, maxFrameBytes = 1024 * 1024, conne
         if (frameBuffer.length < offset + 8) return;
         const big = frameBuffer.readBigUInt64BE(offset);
         if (big > BigInt(maxFrameBytes)) {
-          push({ error: new BridgeError(ERROR_CODES.OVERSIZE, 'websocket frame exceeds maxFrameBytes', { size: Number(big), maxFrameBytes }) });
-          socket.destroy();
+          fail(new BridgeError(ERROR_CODES.OVERSIZE, 'websocket frame exceeds maxFrameBytes', { size: Number(big), maxFrameBytes }));
           return;
         }
         length = Number(big);
         offset += 8;
       }
       if (length > maxFrameBytes) {
-        push({ error: new BridgeError(ERROR_CODES.OVERSIZE, 'websocket frame exceeds maxFrameBytes', { size: length, maxFrameBytes }) });
-        socket.destroy();
+        fail(new BridgeError(ERROR_CODES.OVERSIZE, 'websocket frame exceeds maxFrameBytes', { size: length, maxFrameBytes }));
+        return;
+      }
+      // The MESSAGE budget, decided from the declared length before a byte of it is buffered. For a
+      // continuation this is the running total of the message, which is the quantity a per-frame
+      // limit cannot bound: every fragment here may be individually legal.
+      const messageBytes = opcode === OPCODE.continuation ? fragmentBytes + length : length;
+      if (messageBytes > maxMessageBytes) {
+        fail(new BridgeError(ERROR_CODES.OVERSIZE, 'websocket message exceeds maxMessageBytes', {
+          size: messageBytes,
+          fragmentBytes,
+          frameLength: length,
+          maxMessageBytes,
+          maxFrameBytes,
+          // Named so a reader cannot mistake this for the per-frame bound being too small.
+          exceeded: opcode === OPCODE.continuation ? 'assembled message' : 'single frame message',
+        }));
+        return;
+      }
+      // Legality, before the payload is buffered: these are protocol violations, not sizes.
+      if (opcode === OPCODE.continuation && fragmentOpcode === null) {
+        fail(new BridgeError(ERROR_CODES.HOST_PROTOCOL, 'websocket continuation frame with no message in progress', {
+          opcode,
+        }));
+        return;
+      }
+      if (opcode !== OPCODE.continuation && fragmentOpcode !== null) {
+        fail(new BridgeError(ERROR_CODES.HOST_PROTOCOL, 'websocket data frame received inside a fragmented message', {
+          opcode,
+          inProgressOpcode: fragmentOpcode,
+        }));
+        return;
+      }
+      if (!isKnownOpcode(opcode)) {
+        fail(new BridgeError(ERROR_CODES.HOST_PROTOCOL, 'websocket frame uses a reserved or unknown opcode', { opcode }));
+        return;
+      }
+      // Both DSH downlinks are JSON text. A binary frame is refused rather than skipped: skipping it
+      // would drop data while the stream still reported itself complete, which is a gap a caller
+      // could not detect. Refusing it here also means a fragmented message can never be binary, so
+      // the assembly path has one kind of payload to deliver.
+      if (opcode === OPCODE.binary) {
+        fail(new BridgeError(ERROR_CODES.HOST_PROTOCOL, 'websocket binary frame on a text-only downlink', { opcode }));
         return;
       }
       let maskKey: Buffer | null = null;
@@ -181,21 +327,47 @@ export async function connectWebSocket({ url, maxFrameBytes = 1024 * 1024, conne
       }
       if (opcode === OPCODE.continuation) {
         fragments.push(payload);
+        fragmentBytes += payload.length;
         if (!fin) continue;
         const full = Buffer.concat(fragments);
         fragments = [];
-        const op = fragmentOpcode;
+        fragmentBytes = 0;
         fragmentOpcode = null;
-        if (op === OPCODE.text) push({ text: full.toString('utf8') });
+        deliver(full);
         continue;
       }
       if (fin) {
-        if (opcode === OPCODE.text) push({ text: payload.toString('utf8') });
+        deliver(payload);
       } else {
         fragmentOpcode = opcode;
         fragments = [payload];
+        fragmentBytes = payload.length;
       }
     }
+  };
+
+  /**
+   * Hand one complete message to the consumer, under the queue budget.
+   *
+   * The budget is checked here rather than before the send, because dropping a frame to stay inside
+   * it would be the silent loss this file exists to avoid: a caller would keep reading a stream it
+   * believes is complete while an event is missing. So an over-budget frame is a typed error and the
+   * connection ends, which the consumer cannot miss.
+   * @param full the assembled message payload
+   */
+  const deliver = (full: Buffer): void => {
+    const size = full.length;
+    if (queueBytes + size > maxQueueBytes) {
+      fail(new BridgeError(ERROR_CODES.OVERSIZE, 'websocket consumer is too far behind: queued frames exceed maxQueueBytes', {
+        queuedBytes: queueBytes,
+        incomingBytes: size,
+        maxQueueBytes,
+        deliveredMessages: messagesDelivered,
+      }));
+      return;
+    }
+    messagesDelivered += 1;
+    push({ text: full.toString('utf8') });
   };
 
   // ---- writers -----------------------------------------------------------------------
@@ -229,6 +401,11 @@ export async function connectWebSocket({ url, maxFrameBytes = 1024 * 1024, conne
   const closedPromise = new Promise<void>((resolve) => {
     socket.on('close', () => {
       finished = true;
+      // A half-assembled message cannot outlive the socket that was carrying it. The already-parsed
+      // frames are kept, deliberately: they are bounded by maxQueueBytes, and dropping them would
+      // lose events the peer had already delivered, which is the silent gap this file refuses.
+      releaseParserBuffers();
+      handshakeBuffer = Buffer.alloc(0);
       push({ done: true });
       resolve(undefined);
     });
@@ -331,6 +508,9 @@ export async function connectWebSocket({ url, maxFrameBytes = 1024 * 1024, conne
         }
         // The queue length was just checked, so this shift cannot come back empty.
         const item = queue.shift() as QueueItem;
+        // Released as the consumer takes it: the budget is about bytes HELD, so a reader that keeps
+        // up frees the budget for the frames behind it.
+        if (item.text !== undefined) queueBytes -= Buffer.byteLength(item.text, 'utf8');
         if (item.error) throw item.error;
         if (item.done) return;
         if (item.text !== undefined) yield item.text;
@@ -345,6 +525,18 @@ export async function connectWebSocket({ url, maxFrameBytes = 1024 * 1024, conne
     closed: closedPromise,
     get handshakeDone() { return headerDone; },
     get upgradeState() { return finishReason; },
+    get stats(): WebSocketStats {
+      return {
+        queueBytes,
+        pendingMessageBytes: fragmentBytes,
+        parseBufferBytes: frameBuffer.length,
+        messagesDelivered,
+        maxFrameBytes,
+        maxMessageBytes,
+        maxQueueBytes,
+        failed: failed === null ? null : { code: failed.code, message: failed.message },
+      };
+    },
   };
 }
 

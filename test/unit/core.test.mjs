@@ -45,6 +45,10 @@ export default {
     const { ERROR_CODES, assertKnownCode, BridgeError, toBridgeError } = await import('../../dist/lib/errors.js');
     assert.ok(Object.keys(ERROR_CODES).length >= 30);
     assert.equal(assertKnownCode(ERROR_CODES.UNCERTAIN), 'UNCERTAIN');
+    // The code a refusal to touch a state path through a link reports. It exists so that "the token
+    // path is not the file we own" is a distinguishable outcome rather than a generic bad request:
+    // an operator needs to know the difference between a missing token and a tampered path.
+    assert.equal(assertKnownCode(ERROR_CODES.UNSAFE_STATE_PATH), 'UNSAFE_STATE_PATH');
     assert.throws(() => assertKnownCode('NOT_A_REAL_CODE'), /unknown error code/);
     const wrapped = toBridgeError(new BridgeError(ERROR_CODES.HOST_REFUSED, 'nope', { method: 'x' }));
     assert.equal(wrapped.code, 'HOST_REFUSED');

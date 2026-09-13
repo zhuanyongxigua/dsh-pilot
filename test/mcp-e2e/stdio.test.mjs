@@ -288,6 +288,57 @@ export default {
     }
   },
 
+  'a queue removal the Host never confirmed is not reported to the model as a successful tool call': async () => {
+    const { client, host, teardown } = await rig('mcp-remove-uncertain');
+    try {
+      await client.request('initialize', {
+        protocolVersion: PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'c', version: '0' },
+      });
+      const task = toolPayload(await client.callTool('dsh_task_start', { clientKey: 'remove-task' }));
+      const session = toolPayload(await client.callTool('dsh_session_start', {
+        taskId: task.task.taskId, clientKey: 'remove-session',
+      }));
+      const hostSessionId = session.session.hostSessionId ?? session.session.sessionId;
+      const item = host.enqueue(hostSessionId, { text: 'an occurrence whose removal is never confirmed' });
+      // The bridge only ever removes an item id it has OBSERVED, so the snapshot has to arrive first.
+      host.emitQueueSnapshot(hostSessionId);
+      const state = await client.callTool('dsh_session_state', {
+        taskId: task.task.taskId, sessionId: session.session.sessionId,
+      });
+      const observed = JSON.stringify(toolPayload(state));
+      assert.match(observed, new RegExp(item.id), `the item must be observable before it can be removed: ${observed.slice(0, 300)}`);
+
+      // The Host takes the removal and never answers it, so the outcome is unproven.
+      host.dropResponseFor('session.updateQueue');
+      const cleared = await client.callTool('dsh_queue_clear', {
+        taskId: task.task.taskId, sessionId: session.session.sessionId, itemIds: [item.id],
+      });
+      const payload = cleared.error ?? toolPayload(cleared);
+      const shaped = /** @type {{remoteScope?: {status?: string}}} */ (payload);
+      assert.equal(shaped.remoteScope?.status, 'uncertain',
+        `this test is only meaningful if the removal really is unproven, got ${JSON.stringify(shaped.remoteScope?.status)}`);
+      // THE assertion. `queue.clear` reports its per-scope outcome NESTED, at `remoteScope.status`,
+      // and there is no top-level `result`/`operation`/`outcome` wrapper on this reply. A check that
+      // looked only at those wrappers answered `isError: false` for `status: 'uncertain'`, so an MCP
+      // caller was told the tool call succeeded while the Host may or may not have removed the item —
+      // and a caller that reads "succeeded" has no reason to look at the queue again.
+      assert.equal(cleared.result?.isError ?? true, true,
+        `an unconfirmed removal must be marked isError, got ${JSON.stringify(cleared.result?.isError)} for status `
+        + `${JSON.stringify(shaped.remoteScope?.status)}`);
+      assert.match(JSON.stringify(payload), /uncertain/i, 'and the words must say the outcome is unproven');
+      // One removal reached the Host and nothing was re-sent. The fixture APPLIES a dropped request and
+      // simply never replies, which is the worst case and the reason this must not be a refusal: the
+      // removal really happened, the bridge cannot prove it, and `uncertain` is the only honest word —
+      // the item is gone from the Host's queue while the report still says the outcome is unknown.
+      assert.equal(host.requestsFor('session.updateQueue').length, 1,
+        'exactly one removal must have been sent; an unproven outcome is never grounds for a second attempt');
+      assert.deepEqual(host.queueItems(hostSessionId), [],
+        'the Host applied the removal it never confirmed, so the item is gone from its queue');
+    } finally {
+      await teardown();
+    }
+  },
+
   'cancelling a wait does not cancel the turn, and the server keeps serving': async () => {
     const { client, host, daemon, teardown } = await rig('mcp-cancel-wait');
     try {

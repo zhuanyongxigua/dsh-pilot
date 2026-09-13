@@ -18,7 +18,10 @@
  */
 
 import { createServer, connect as netConnect, type Socket } from 'node:net';
-import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync, closeSync, constants as fsConstants, existsSync, fchmodSync, fstatSync, lstatSync, mkdirSync,
+  openSync, readFileSync, unlinkSync, writeSync,
+} from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { BridgeError, ERROR_CODES, toBridgeError } from './errors.ts';
@@ -82,22 +85,113 @@ export function authorityTokenPath(stateDir: string): string {
 export function ensureAuthorityToken(stateDir: string): AuthorityToken {
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   const path = authorityTokenPath(stateDir);
-  if (existsSync(path)) {
-    chmodSync(path, 0o600);
+  // Every step below is deliberately concerned with WHAT the path is, not merely that it exists.
+  //
+  // The previous form was `existsSync(path)` → `chmodSync(path, 0o600)`, with `writeFileSync(path, …)`
+  // when it did not exist. Both of those FOLLOW SYMBOLIC LINKS, so a link planted at the token path
+  // made this process chmod a file outside the state directory, and a DANGLING link made it create
+  // and write the authority token at whatever the link pointed at — outside the directory whose mode
+  // is the actual access control here. `readAuthorityToken` followed links too, so the value could be
+  // read from anywhere. A symlink is therefore refused outright rather than resolved: this process
+  // owns exactly one file at this path, and it authorises approvals.
+  const existing = lstatOrNull(path);
+  if (existing) {
+    if (!existing.isFile()) {
+      throw new BridgeError(ERROR_CODES.UNSAFE_STATE_PATH, 'authority token path exists but is not a regular file', {
+        path,
+        kind: existing.isSymbolicLink() ? 'symlink' : 'other',
+      });
+    }
+    // Opened WITHOUT following links, and the mode is set on the OPEN DESCRIPTOR: `fchmodSync` cannot
+    // be redirected by a link swapped in between the check and the change, which is the race the
+    // path-based call could not close.
+    const fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    try {
+      assertRegularDescriptor(fd, path);
+      fchmodSync(fd, 0o600);
+    } finally {
+      closeSync(fd);
+    }
     return { path, created: false };
   }
-  writeFileSync(path, `${randomBytes(32).toString('hex')}\n`, { mode: 0o600 });
+  // `O_CREAT | O_EXCL` refuses an existing path — INCLUDING a dangling symlink, which is precisely the
+  // case `existsSync` reports as absent and `writeFileSync` would happily create the target for.
+  // `O_NOFOLLOW` is belt and braces for the same race.
+  let fd: number;
+  try {
+    fd = openSync(path, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW, 0o600);
+  } catch (error) {
+    const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : '';
+    if (code === 'EEXIST') {
+      // Something appeared between the stat above and this call, possibly a link. Re-running the
+      // refuse-a-link branch is the point: the answer must not depend on winning a race.
+      return ensureAuthorityToken(stateDir);
+    }
+    throw error;
+  }
+  try {
+    writeSync(fd, `${randomBytes(32).toString('hex')}\n`);
+  } finally {
+    closeSync(fd);
+  }
   return { path, created: true };
+}
+
+/** `lstatSync` that answers null for "nothing there", and follows nothing. @param {string} path */
+function lstatOrNull(path: string): ReturnType<typeof lstatSync> | null {
+  try {
+    return lstatSync(path);
+  } catch (error) {
+    const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : '';
+    if (code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+/**
+ * Confirm an open descriptor is a regular file.
+ *
+ * `O_NOFOLLOW` already refused a link at the path, but it says nothing about what the descriptor
+ * actually is: a FIFO or a device node at this path would be opened successfully and would then make
+ * `readFileSync(fd)` block forever or read something that is not a file. `fstat` on the descriptor is
+ * the only check that cannot be redirected by a later rename.
+ * @param {number} fd @param {string} path
+ */
+function assertRegularDescriptor(fd: number, path: string): void {
+  const stats = fstatSync(fd);
+  if (!stats.isFile()) {
+    throw new BridgeError(ERROR_CODES.UNSAFE_STATE_PATH, 'authority token is not a regular file', { path, kind: 'not-regular' });
+  }
 }
 
 /**
  * Read the authority token for comparison. Only the daemon and the operator CLI call this;
  * the gateway never does.
+ *
+ * Refuses a link rather than following it, and returns null only when there is genuinely nothing at
+ * the path. The distinction matters to the caller: `null` means "this state directory has no token",
+ * which is a missing setup step, while a refusal means the path is not the file this process owns,
+ * which is not something an operator should be able to satisfy by presenting a link and a file.
+ * @param stateDir
+ * @returns the token, or null when none has been created
  */
 export function readAuthorityToken(stateDir: string): string | null {
   const path = authorityTokenPath(stateDir);
-  if (!existsSync(path)) return null;
-  return readFileSync(path, 'utf8').trim();
+  const existing = lstatOrNull(path);
+  if (!existing) return null;
+  if (!existing.isFile()) {
+    throw new BridgeError(ERROR_CODES.UNSAFE_STATE_PATH, 'refusing to read an authority token through a non-regular file', {
+      path,
+      kind: existing.isSymbolicLink() ? 'symlink' : 'other',
+    });
+  }
+  const fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    assertRegularDescriptor(fd, path);
+    return readFileSync(fd, 'utf8').trim();
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /** Start the daemon's IPC endpoint. */

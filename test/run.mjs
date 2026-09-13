@@ -21,6 +21,11 @@ const DEFAULT_LAYERS = [
   'test/unit',
   'test/property',
   'test/fake-host',
+  // Real-socket frame-level bounds: the WS client's own limits, driven by a peer that sends frame
+  // sequences a well-behaved Host never would. It sits beside fake-host because both speak the real
+  // protocol over a real socket, and it is in the default set because its bounds are the ones the
+  // daemon runs with — a bound nobody runs in CI is a bound nobody has.
+  'test/network',
   'test/persistence',
   'test/mcp-e2e',
   'test/isolated-host',

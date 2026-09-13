@@ -28,6 +28,10 @@ export class FakeHost {
   #muxSockets = []; 
   #hostSockets = [];
   #dropped = new Set();
+  #held = new Set();
+  #respondBodyBytes = 0;
+  /** @type {{status: number, body: string}|null} */
+  #respondRaw = null;
   #delayed = new Map();
   /** @type {Map<string, Promise<void>>} responses applied but held */
   #barriers = new Map();
@@ -186,6 +190,29 @@ export class FakeHost {
   /** Make the next N responses for a method disappear after being applied. */
   dropResponseFor(method) { this.#dropped.add(method); }
   stopDropping(method) { this.#dropped.delete(method); }
+  /**
+   * Accept and APPLY the request, then never write a reply — the socket stays open and silent.
+   * This is the fault a client with no deadline cannot survive: not a refusal, not a drop, but a peer
+   * that simply never finishes answering. The Host has already taken the answer, so the client's
+   * outcome is unproven, which is exactly why "no reply" must not be read as "not sent".
+   * @param {string} method
+   */
+  holdResponseFor(method) { this.#held.add(method); }
+  /** @param {string} method */
+  releaseHeldResponses(method) { this.#held.delete(method); }
+  /**
+   * Answer with `bytes` bytes of body instead of a receipt. A body bound can only be shown to work by
+   * a peer that exceeds it, and a receipt that never ends is the one shape the parser cannot classify.
+   * @param {number} bytes
+   */
+  respondBodyBytes(bytes) { this.#respondBodyBytes = bytes; }
+  /**
+   * Answer with an exact status and a literal body. `respondBodyBytes` covers "too big to read" and
+   * this covers "readable but not a receipt", which is a different thing to classify: the peer did
+   * answer, so the outcome is unproven rather than a refusal.
+   * @param {number} status @param {string} body
+   */
+  respondWithRaw(status, body) { this.#respondRaw = { status, body }; }
   /** @param {string} method @param {number} ms */
   delayFor(method, ms) { this.#delayed.set(method, ms); }
 
@@ -419,6 +446,31 @@ export class FakeHost {
         // be exercised at all and a test had to document that as an evidenced limitation.
         if (this.#dropped.has('respond')) {
           req.socket.destroy();
+          return;
+        }
+        // A silent peer: headers are not even written. The request was accepted and applied above, and
+        // no reply ever comes. Kept open deliberately — `res.end()` would be a short body rather than a
+        // hang, and the deadline is what this case is about.
+        if (this.#held.has('respond')) return;
+        if (this.#respondRaw) {
+          const raw = this.#respondRaw;
+          this.#respondRaw = null;
+          res.writeHead(raw.status, { 'content-type': 'application/json' });
+          res.end(raw.body);
+          return;
+        }
+        if (this.#respondBodyBytes > 0) {
+          const size = this.#respondBodyBytes;
+          res.writeHead(200, { 'content-type': 'application/json' });
+          // Streamed in chunks rather than one big buffer, so the fixture does not have to hold the
+          // oversized body in memory to prove the client refuses to.
+          const chunk = 'x'.repeat(64 * 1024);
+          let written = 0;
+          while (written < size) {
+            res.write(chunk.slice(0, Math.min(chunk.length, size - written)));
+            written += chunk.length;
+          }
+          res.end();
           return;
         }
         res.writeHead(200, { 'content-type': 'application/json' });

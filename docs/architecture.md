@@ -197,11 +197,48 @@ means **reopen the stream and refetch history**, then converge. Completeness is 
 on the cursor and on every page: a page with a hole says `completeness: 'incomplete'` and carries
 the gap range.
 
-Bounds are configured, not hoped for. `src/lib/config.ts` reads these from the environment:
-`eventPageMax` 200, `frameMaxBytes` 1 MiB, `waitDefaultMs` 30 s, `waitMaxMs` 120 s,
-`compactResultBytes` 64 KiB. `DEFAULT_LIMITS` in `src/lib/daemon.ts` adds `eventPageMaxBytes` 256 KiB,
-`eventBufferMaxBytes` 32 MiB and `logMaxBytes` 100 MiB, and `src/lib/ipc.ts` fixes
-`MAX_IPC_LINE_BYTES` 4 MiB and `MAX_IPC_CONNECTIONS` 32.
+Bounds are configured, not hoped for, and each bound is enforced on a path that runs — a limit that
+is only declared is a claim, not a bound. `src/lib/config.ts` reads these from the environment:
+`eventPageMax` 200, `eventPageMaxBytes` 256 KiB, `eventMessageMaxBytes` 4 MiB,
+`eventBufferMaxBytes` 32 MiB, `frameMaxBytes` 1 MiB, `waitDefaultMs` 30 s, `waitMaxMs` 120 s,
+`compactResultBytes` 64 KiB. `DEFAULT_LIMITS` in `src/lib/daemon.ts` carries the same defaults plus
+`logMaxBytes` 100 MiB, and `src/lib/ipc.ts` fixes `MAX_IPC_LINE_BYTES` 4 MiB and
+`MAX_IPC_CONNECTIONS` 32.
+
+The four event bounds are distinct quantities, and the reason they are not one number is that each
+answers a different question. A page is capped by **count** (`eventPageMax`) and by **serialised
+UTF-8 bytes** (`eventPageMaxBytes`): the byte cap is applied walking the window newest-first, so the
+returned page stays a contiguous run and a paging loop sees every event exactly once. A single event
+larger than the whole page budget is delivered anyway and named in the page's `oversize` list —
+skipping it would lose an event silently, and returning an empty page would make the caller loop on
+the same cursor forever. `hasMore` is answered by the database ("is there an event older than the
+oldest one returned"), not inferred from the page length, because a byte-limited page is short while
+older events remain and a full page may be the entire history.
+
+A single downlink **message** is capped by `eventMessageMaxBytes` and the parsed-but-unconsumed
+**queue** by `eventBufferMaxBytes`, both enforced by the WebSocket connection itself
+(`src/lib/ws-client.ts`) and both passed in from this configuration rather than duplicated as
+constants there. `frameMaxBytes` alone is not enough for either: a fragmented message is assembled
+from frames that are each individually legal, so a per-frame cap cannot bound the assembled total;
+and a fast peer with a slow reader grows the queue without any frame being large. A frame that is
+illegal rather than large — a continuation that starts no message, a data frame inside an open
+fragmented message, a reserved opcode, a binary frame on a text-only downlink — is a typed protocol
+error and ends the connection rather than being skipped, because skipping it would drop data while
+the stream still reported itself complete.
+
+### 3.5a `/api/respond`, and why it has a deadline of its own
+
+Answering an approval is the one path where this bridge asks a Host to do something consequential, and
+it is bounded the same way the unary method calls are: the adapter's deadline (`hostTimeoutMs`,
+configured) aborts the request, and `MAX_RESPONSE_BYTES` refuses the receipt while it is still being
+read. Both existed on `call()` and neither existed here, so a Host that accepted the answer and then
+answered slowly, endlessly, or never could hold the call and the memory of its body indefinitely.
+
+The classification after a failure is the part that matters. Once bytes have been written the answer may
+have been applied, so a timeout, a dropped connection, an oversized receipt and an unparseable receipt
+are all `uncertain` — never "not reached", which is what a caller would act on by delivering the answer
+again. Only a failure BEFORE any byte is written is a `refused`. Nothing on this path retries by itself
+and nothing approves by itself; both are the caller's explicit decision.
 
 ### 3.6 Operator channel — `src/bin/dsh-pilot-ops.ts`
 
@@ -209,6 +246,15 @@ The human authority path: `status`, `interactions`, `operations`, `events`, and 
 the authority token from the daemon's private state directory (mode `0600`) and presents it over
 IPC. Running it is an explicit human act, which is exactly what an approval is. The token is never
 returned by any IPC op, so it cannot reach a model through a tool result.
+
+The token path is handled without following symbolic links, and a path that is not a regular file is
+refused with `UNSAFE_STATE_PATH` rather than resolved. The protection this file depends on is that it
+lives inside a 0700 directory, so a link planted at its path would move the authority elsewhere: the
+pre-fix code `chmod`ed the link's target, created the token AT the target of a dangling link, and read
+through on comparison. Creation uses `O_CREAT|O_EXCL|O_NOFOLLOW`, the mode is set with `fchmod` on a
+descriptor opened with `O_NOFOLLOW`, and `fstat` on that descriptor confirms a regular file — checks
+that no later rename can redirect, which a path-based check cannot promise. See C-6 in
+[`conflicts.md`](conflicts.md) for the measured pre-fix behaviour and for what remains unimplemented.
 
 ---
 

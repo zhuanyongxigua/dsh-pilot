@@ -223,3 +223,76 @@ writes as an answer. The first attempt at reading the receipt was also wrong in 
 `ok({value})` wrapper), and reading only the nested slot made every receipt look like `accepted` —
 the single most dangerous misreading on this surface. All observed shapes are now read, and a shape
 that matches none of them is reported as `unclassified` rather than defaulted to an acceptance.
+
+## C-5: two bounds that a per-frame limit cannot express, and a frame that is illegal rather than large
+
+**The tension.** "Refuse anything over the bound" and "never drop an event" look like the same rule
+until a frame is legal on its own and the message is not. A WebSocket message may be split across any
+number of frames, each of which passes a per-frame check, so a per-frame bound cannot bound the
+assembled result — and a fragmented message is exactly how a peer imposes memory on a reader that
+tries to enforce one. The same shape appears one layer up: a page of events can be legal by count and
+enormous by bytes.
+
+**Decision.** The bound is stated in the unit the risk is measured in, and it is checked from the
+declared length before the payload is buffered:
+
+- `maxFrameBytes` bounds one frame; `maxMessageBytes` bounds the message assembled from the frames
+  between an initial data frame and its FIN, cumulatively, against the DECLARED length — so a peer
+  cannot make this process hold the bytes it is trying to make it hold;
+- `maxQueueBytes` bounds frames parsed but not yet consumed. The alternative to a queue bound is
+  dropping frames to stay inside it, which is the silent loss this file refuses: a caller would keep
+  reading a stream it believes is complete while an event is missing. So an over-budget frame is a
+  typed error and the connection ends, which the consumer cannot miss;
+- `eventPageMaxBytes` bounds a reply by its serialised UTF-8 size, and a single event over the whole
+  budget is DELIVERED and named in `oversize`. Skipping it loses an event; returning an empty page for
+  that cursor makes the caller loop forever on the same `beforeSeq`. Naming it puts the fact in the
+  reply instead of in a comment.
+- `hasMore` is asked of the database ("is there an event older than the oldest one returned") rather
+  than inferred from the page length, because after a byte bound those two questions stop agreeing: a
+  byte-limited page is short while older events remain, and a page that filled the count limit exactly
+  may be the whole history.
+
+**The illegal cases are separate from the size cases, and are refused rather than skipped.** A
+continuation that starts no message, a data frame inside an open fragmented message, a reserved
+opcode, and a binary frame on a text-only downlink are protocol violations. Skipping any of them would
+drop data while the stream still reported itself complete, and a caller reading "complete" has no way
+to learn that an event is missing. Under the pre-fix code the first was stored as an orphan fragment,
+the second was delivered as its own message AND left the partial message held forever, and the third
+was ignored. The binary case is a deliberate limit on this bridge rather than a fact about DSH: both
+downlinks are JSON text, so a binary frame is refused as an unknown protocol shape instead of being
+decoded on a guess. If a future Host sends binary frames, this is the decision to revisit, and the
+error says so.
+
+**What is still not claimed.** No test drives a peer that sends a message spanning millions of frames
+to observe where the process actually runs out: the bounds are asserted through the client's own
+counters and through which frames it delivered, which is a statement about the bound rather than about
+this machine's memory. And the queue bound is enforced per connection, so N connections may each hold
+up to the budget; the aggregate across the two downlinks is bounded by the number of downlinks, not by
+a single global ceiling.
+
+## C-6: a symlink at a path this process owns — resolve it safely, or refuse it
+
+**The tension.** "Follow the path the operator configured" and "never write outside the state
+directory" conflict as soon as the path is a symlink, and the two candidate answers are "resolve it
+and check where it went" and "refuse anything that is not a regular file".
+
+**Decision: refuse, with one typed error.** Resolving and checking is racy — the target can be swapped
+between the check and the use — and the object being protected is the *approval authority*: the token
+file's protection is that it lives inside a 0700 directory. A resolved-and-checked path would also
+have to decide which targets are acceptable, which is a policy this project has no basis for. Refusing
+means: `lstat` first and a non-regular file is `UNSAFE_STATE_PATH`; creation is `O_CREAT|O_EXCL|O_NOFOLLOW`
+so a DANGLING link — the case `existsSync` reports as absent — can never be written through; the mode is
+set with `fchmod` on a descriptor opened with `O_NOFOLLOW`; and `fstat` on that descriptor confirms a
+regular file, which no path-based check can do against a later rename.
+
+**Measured, against the pre-fix code, with real links in this task's own temp directory.** A resolving
+link made `ensureAuthorityToken` chmod a file it does not own, outside the state directory (0644 →
+0600, contents unchanged); a dangling link made it CREATE the approval token at the link's target,
+outside the state directory. Both are asserted against sentinels whose bytes and mode are compared
+before and after, because "the bridge refused" is not the claim — the claim is that the file outside is
+untouched. The positive control is that an ordinary state directory still creates a 0600 token, reads
+it back, reuses it without rotating it, and tightens a drifted mode.
+
+**The limit, stated rather than implied.** This covers the authority-token path. The `cwd`/workspace
+half of FR-SEC-4 is NOT implemented: a dispatch whose `cwd` escapes the workspace through a link is
+neither refused nor resolved safely, and no test attempts one. FR-SEC-4 is `partial` for that reason.

@@ -1182,6 +1182,26 @@ export class Store {
     return rows.reverse();
   }
 
+  /**
+   * Is there any event older than `seq` for this session?
+   *
+   * `pageEvents` returns a window and the caller needs to know whether the stream continues past it.
+   * The count of returned rows was never the same question: a page limited by BYTES can return fewer
+   * rows than the count limit while older rows still exist, and a page that happens to fill exactly
+   * to the count limit may have nothing behind it. This asks the question directly, and the primary
+   * key makes it a bounded index probe rather than a scan.
+   * @param taskId
+   * @param sessionId
+   * @param seq
+   */
+  hasEventsBefore(taskId: string, sessionId: string, seq: number): boolean {
+    const row = this.get<{ one: number }>(
+      `select 1 as one from events where task_id = ? and session_id = ? and seq < ? limit 1`,
+      taskId, sessionId, seq,
+    );
+    return Boolean(row);
+  }
+
   /** Operation counts by state — the observable signal that a request is in flight. */
   operationCounts(): Record<string, number> {
     const rows = this.all<StateCountRow>('select state, count(*) as n from operations group by state');

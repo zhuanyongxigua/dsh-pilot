@@ -52,6 +52,9 @@ export const ERROR_CODES = Object.freeze({
   CANCEL_AMBIGUOUS: 'CANCEL_AMBIGUOUS',
   CANCEL_UNOBSERVED: 'CANCEL_UNOBSERVED',
 
+  // Local filesystem safety: a path this process owns turned out not to be the file it expected
+  UNSAFE_STATE_PATH: 'UNSAFE_STATE_PATH',
+
   // Resource bounds
   RESULT_TOO_LARGE: 'RESULT_TOO_LARGE',
   BUFFER_OVERFLOW: 'BUFFER_OVERFLOW',

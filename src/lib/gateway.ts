@@ -304,12 +304,30 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * Scope statuses that mean "this scope did what the call asked it for".
+ *
+ * `cleared` is a confirmed clear. `not-requested` is a scope nothing was asked of — the reply states
+ * that as a fact about what happened, and it is not a failure. `none` is what a queue removal reports
+ * for the turn scope, and it says the call did not touch the turn.
+ */
+const SUCCESSFUL_SCOPE_STATUSES: ReadonlySet<string> = new Set(['cleared', 'not-requested', 'none']);
+
+/**
  * Decide whether a daemon reply means "this did not succeed".
  *
  * The three outcomes a caller must be able to tell apart are NOT SENT, SENT AND CONFIRMED, and
  * SENT WITH UNKNOWN OUTCOME. Only the middle one may be reported as a success, so both
  * refusals and uncertainty are flagged as errors. Guessing either way would be a lie about
  * whether work may have happened.
+ *
+ * A reply is read at every depth it actually reports its outcome at, and this is where the previous
+ * form was wrong: it looked only at a top-level `outcome`, `operation.state` and `result.status`, and
+ * `queue.clear` reports its outcome NOWHERE ELSE — its per-scope result lives at `remoteScope.status`
+ * with no wrapper around it. So a queue removal whose outcome was `uncertain` came back to the MCP
+ * client as a SUCCESSFUL tool call: the model was told the removal had been handled while the Host
+ * may or may not have applied it, and a caller that reads "succeeded" has no reason to look at the
+ * queue again. Reproduced by `mcp-e2e/stdio::a queue removal the Host never confirmed is not reported
+ * to the model as a successful tool call`, which failed with `got false for status "uncertain"`.
  * @param value
  */
 function isNotSuccess(value: unknown): boolean {
@@ -319,5 +337,14 @@ function isNotSuccess(value: unknown): boolean {
   if (isRecord(operation) && (operation.state === 'uncertain' || operation.state === 'refused' || operation.state === 'failed')) return true;
   const result = value.result;
   if (isRecord(result) && (result.status === 'uncertain' || result.status === 'refused')) return true;
+  // Every scope the reply reports, at the depth it reports it. A status this code does not recognise
+  // is NOT a success: the alternative is that a status nobody wrote a meaning for inherits the most
+  // reassuring one, which is exactly the failure above in a different costume.
+  for (const scope of ['remoteScope', 'turnScope']) {
+    const nested = value[scope];
+    if (!isRecord(nested)) continue;
+    const status = nested.status ?? nested.effect;
+    if (typeof status === 'string' && !SUCCESSFUL_SCOPE_STATUSES.has(status)) return true;
+  }
   return false;
 }

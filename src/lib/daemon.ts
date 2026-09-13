@@ -72,9 +72,21 @@ export const DEFAULT_LIMITS = Object.freeze({
   compactResultBytes: 64 * 1024,
   eventPageMax: 200,
   eventPageMaxBytes: 256 * 1024,
+  /**
+   * One assembled downlink message. A message is one frame or every frame up to its FIN, so this is
+   * the bound `frameMaxBytes` cannot express: a fragmented message is assembled from frames that are
+   * each individually legal.
+   */
+  eventMessageMaxBytes: 4 * 1024 * 1024,
   frameMaxBytes: 1024 * 1024,
   eventBufferMaxBytes: 32 * 1024 * 1024,
   logMaxBytes: 100 * 1024 * 1024,
+  /**
+   * The unary deadline the adapter applies, including to `/api/respond`. It sits here as well as in
+   * `config.ts` because this object is the daemon's fallback when it is constructed directly (as the
+   * unit tests do), and every other overridable bound is in both places for the same reason.
+   */
+  hostTimeoutMs: 15_000,
   waitDefaultMs: 30_000,
   waitMaxMs: 120_000,
 });
@@ -175,7 +187,7 @@ export class Daemon {
     this.#limits = { ...DEFAULT_LIMITS, ...limits };
     this.#lock = new OwnerLock({ lockPath: `${stateDir}/owner.lock.sqlite` });
     this.#store = new Store({ stateDir });
-    this.#adapter = new DshHostAdapter({ baseUrl: hostBase, timeoutMs: 15_000 });
+    this.#adapter = new DshHostAdapter({ baseUrl: hostBase, timeoutMs: this.#limits.hostTimeoutMs });
     this.hostBase = hostBase;
     this.hostScope = hostScope;
   }
@@ -629,10 +641,18 @@ export class Daemon {
   sessionEvents({ taskId, sessionId, beforeSeq = null, limit = 50 }: Record<string, unknown>) {
     const session = this.#requireSession(taskId, sessionId);
     const bounded = Math.max(1, Math.min(Number(limit) || 50, this.#limits.eventPageMax));
-    const rows = beforeSeq === null
+    const window = beforeSeq === null
       ? this.#store.pageEvents({ taskId: session.task_id, sessionId: session.session_id, limit: bounded })
       : this.#store.pageEvents({ taskId: session.task_id, sessionId: session.session_id, beforeSeq: Number(beforeSeq), limit: bounded });
+    // Two limits, one page: `bounded` events, and `eventPageMaxBytes` of serialised JSON. The byte
+    // limit is applied by walking the window from its NEWEST row backwards, because the window is
+    // the `limit` most recent events — trimming the oldest rows inside it would drop events the
+    // caller would then never receive, since the next page asks for `seq <` the first row returned.
+    // Keeping the newest rows that fit leaves a contiguous run, so paging backwards sees every
+    // event exactly once.
+    const { rows, bytes, oversize } = this.#fitEventPage(window);
     const cursor = this.#store.getCursor(session.task_id, session.session_id);
+    const firstSeq = rows.length ? Number(rows[0].seq) : null;
     return {
       // The reply carries the ids `#requireSession` just matched, i.e. the same strings that
       // arrived; the pages above are keyed by the stored session, not by the frame's copy of it.
@@ -647,7 +667,17 @@ export class Daemon {
         at: Number(row.stored_at),
         payload: safeJson(row.payload_json),
       })),
-      hasMore: rows.length === bounded,
+      // What the page cost, and how it was bounded, so a caller can tell a byte-limited page from a
+      // short one and can see which rows were exempted from the limit.
+      bytes,
+      maxBytes: this.#limits.eventPageMaxBytes,
+      oversize,
+      // Asked of the database rather than inferred from the page length: a page limited by bytes can
+      // be short while older events remain, and a page that filled the count limit may be the whole
+      // history. `hasMore` means "there is an event older than the oldest one returned".
+      hasMore: firstSeq === null
+        ? false
+        : this.#store.hasEventsBefore(session.task_id, session.session_id, firstSeq),
       cursorStatus: cursor ? 'ok' : 'unknown',
       completeness: cursor?.completeness ?? 'unknown',
       completedThrough: cursor ? Number(cursor.completed_through ?? cursor.last_seq) : null,
@@ -656,6 +686,52 @@ export class Daemon {
       // `gap_from` yields null, any number (including 0) yields the gap range.
       gap: cursor?.gap_from != null ? { from: Number(cursor.gap_from), to: Number(cursor.gap_to) } : null,
     };
+  }
+
+  /**
+   * Fit a page of event rows inside `eventPageMaxBytes`, newest-first, without losing an event.
+   *
+   * The walk is deliberately newest-to-oldest: the reversed slice is returned oldest-first, so the
+   * caller's cursor (`beforeSeq` = the oldest row returned) stays a contiguous boundary and every
+   * event is delivered exactly once across a paging loop. Trimming the other end would leave a hole
+   * that no later page could ask for.
+   *
+   * A single event larger than the whole budget is delivered anyway, and named in `oversize`. The
+   * alternatives are both worse: skipping it loses an event silently, and returning an empty page
+   * for that cursor makes the caller loop forever on the same `beforeSeq`. Delivering it keeps the
+   * cursor moving and puts the fact in the reply instead of in a comment.
+   * @param window the page window from the store, oldest row first
+   */
+  #fitEventPage(window: { seq: bigint | number; kind: string; session_id: string; stored_at: bigint | number; payload_json: string }[]): {
+    rows: typeof window;
+    bytes: number;
+    oversize: number[];
+  } {
+    const budget = this.#limits.eventPageMaxBytes;
+    /** @type {typeof window} */
+    const kept: typeof window = [];
+    let bytes = 0;
+    /** @type {number[]} */
+    const oversize: number[] = [];
+    for (let i = window.length - 1; i >= 0; i -= 1) {
+      const row = window[i];
+      // The serialised size the caller actually receives, measured on the JSON this method is about
+      // to build, so the budget is about the reply rather than about the stored bytes. A multi-byte
+      // payload must count as its bytes, not as its characters.
+      const size = Buffer.byteLength(JSON.stringify({
+        seq: Number(row.seq),
+        kind: row.kind,
+        sessionId: row.session_id,
+        at: Number(row.stored_at),
+        payload: safeJson(row.payload_json),
+      }), 'utf8');
+      if (kept.length > 0 && bytes + size > budget) break;
+      if (kept.length === 0 && size > budget) oversize.push(Number(row.seq));
+      kept.push(row);
+      bytes += size;
+    }
+    kept.reverse();
+    return { rows: kept, bytes, oversize };
   }
 
   /**
@@ -1682,7 +1758,17 @@ export class Daemon {
       while (!signal.aborted) {
         this.#connection = this.#eventStats.frames === 0 ? 'connecting' : 'reconciling';
         try {
-          const ws = await this.#adapter.openMux({ signal, maxFrameBytes: this.#limits.frameMaxBytes });
+          const ws = await this.#adapter.openMux({
+            signal,
+            maxFrameBytes: this.#limits.frameMaxBytes,
+            // Both remaining budgets are enforced by the connection itself, and both are the
+            // configured ones rather than constants of its own: `eventMessageMaxBytes` bounds one
+            // assembled message, and `eventBufferMaxBytes` is the memory this process will hold for
+            // a reader that falls behind. One owner per quantity, so there is no second, quieter
+            // limit that disagrees with the documented one.
+            maxMessageBytes: this.#limits.eventMessageMaxBytes,
+            maxQueueBytes: this.#limits.eventBufferMaxBytes,
+          });
           this.#connection = 'ready';
           backoffMs = 50;
           for await (const text of ws.frames) {

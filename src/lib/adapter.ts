@@ -28,6 +28,17 @@ import { randomUUID } from 'node:crypto';
 import { BridgeError, ERROR_CODES, refused, ok, uncertain, type Result } from './errors.ts';
 import { connectWebSocket, type WebSocketConnection } from './ws-client.ts';
 
+/**
+ * The most response body this client will hold, for both unary paths.
+ *
+ * One constant rather than a number per call site: `call()` had this bound and `respond()` did not,
+ * and two owners for one quantity is how a bound stops being a bound — the stricter one gets edited
+ * and the other keeps a value nobody reads. A Host that streams more than this is refused as a
+ * protocol error while the body is still being read, so the limit is about what this process holds
+ * and not about what the peer sends.
+ */
+const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+
 /** Method map at the pin. Presence here is what capability negotiation starts from. */
 export const PINNED_METHODS = Object.freeze([
   'session.list', 'session.search', 'session.create', 'session.history', 'session.models',
@@ -107,6 +118,10 @@ export interface AdapterCallOptions {
 export interface DownlinkOptions {
   readonly signal?: AbortSignal;
   readonly maxFrameBytes?: number;
+  /** Cap on one assembled message; see `connectWebSocket`, whose per-frame bound is not enough. */
+  readonly maxMessageBytes?: number;
+  /** Cap on parsed-but-unconsumed frames, i.e. the memory a slow reader may cause to be held. */
+  readonly maxQueueBytes?: number;
 }
 
 /**
@@ -283,8 +298,11 @@ export class DshHostAdapter {
             // listener is annotated as a string: Node's own `data` signature says Buffer
             // regardless of the encoding.
             text += chunk;
-            if (text.length > 8 * 1024 * 1024) {
-              resolve({ kind: 'protocol', error: new BridgeError(ERROR_CODES.OVERSIZE, 'response body exceeds 8MiB', { method }) });
+            if (text.length > MAX_RESPONSE_BYTES) {
+              // Named and numbered: the constant exists so there is one owner for the quantity, and a
+              // message that only named the constant would make the reader open this file to learn a
+              // number that used to be in the message itself.
+              resolve({ kind: 'protocol', error: new BridgeError(ERROR_CODES.OVERSIZE, `response body exceeds ${MAX_RESPONSE_BYTES} bytes`, { method, maxResponseBytes: MAX_RESPONSE_BYTES }) });
               req.destroy();
             }
           });
@@ -427,6 +445,18 @@ export class DshHostAdapter {
     const body = JSON.stringify({ type: 'client-response', rpcId, result: { ok: true, value } });
     const url = new URL(`${this.#baseUrl}/api/respond`);
     let bytesWritten = false;
+    let oversize = false;
+    /**
+     * This path had no deadline and no body bound, and both absences are the same defect: a Host that
+     * accepts the request and then answers slowly, endlessly, or never would hold this call — and the
+     * memory of its body — for as long as it liked. The deadline is the adapter's existing unary one
+     * rather than a new constant, and the body bound is the shared `MAX_RESPONSE_BYTES`, so there is
+     * one owner per quantity instead of a second, quieter limit that disagrees.
+     */
+    const controller = new AbortController();
+    let timedOut = false;
+    const deadline = setTimeout(() => { timedOut = true; controller.abort(); }, this.#timeoutMs);
+    deadline.unref?.();
     try {
       const settled = await new Promise<{ readonly status: number | undefined; readonly text: string }>((resolve, reject) => {
         const req = httpRequest({
@@ -441,16 +471,37 @@ export class DshHostAdapter {
             connection: 'close',
           },
           agent: false,
+          signal: controller.signal,
         }, (res) => {
           let text = '';
           res.setEncoding('utf8');
-          res.on('data', (chunk: string) => { text += chunk; });
+          res.on('data', (chunk: string) => {
+            text += chunk;
+            if (text.length > MAX_RESPONSE_BYTES) {
+              // Refused while reading, not after: the point of the bound is the memory this process
+              // holds, so it is enforced on the way in. The receipt is unreadable either way, so this
+              // is an unproven outcome and the caller must not treat it as "not sent".
+              // Flagged before the promise settles: the reader below tests this flag, and leaving the
+              // order the other way round would make correctness depend on microtask ordering.
+              oversize = true;
+              resolve({ status: undefined, text: '' });
+              req.destroy();
+            }
+          });
           res.on('end', () => resolve({ status: res.statusCode, text }));
         });
         req.on('socket', (socket) => socket.once('connect', () => { bytesWritten = true; }));
         req.on('error', reject);
         req.end(body);
       });
+      if (oversize) {
+        this.#stats.protocolErrors += 1;
+        return uncertain('respond-receipt-oversize', {
+          rpcId,
+          maxResponseBytes: MAX_RESPONSE_BYTES,
+          note: 'the answer may have been applied; the receipt could not be read, so the outcome is unproven',
+        });
+      }
       if (settled.status !== 200) {
         return refused(new BridgeError(ERROR_CODES.HOST_REFUSED, `respond answered HTTP ${settled.status}`, { status: settled.status }));
       }
@@ -459,7 +510,18 @@ export class DshHostAdapter {
         // The same single untyped boundary as above: a receipt written by the peer.
         receipt = JSON.parse(settled.text) as RespondReceipt;
       } catch {
-        return refused(new BridgeError(ERROR_CODES.HOST_PROTOCOL, 'respond receipt is not json', {}));
+        // An unreadable receipt is an UNPROVEN outcome, not a refusal — the same rule the oversize
+        // branch above follows, and the rule the whole post-send classification rests on: bytes
+        // reached the socket, so "provably not applied" is not available. This used to be a
+        // `HOST_PROTOCOL` refusal, which the caller reports as "the host did not accept the answer" —
+        // telling an operator that an answer the Host may well have applied never arrived. The
+        // malformed-answer case is different and stays a refusal: there the Host SAID it rejected the
+        // answer (`{accepted:false, reason:'bad-response'}`), which is a readable receipt.
+        return uncertain('respond-receipt-unreadable', {
+          rpcId,
+          bytes: settled.text.length,
+          note: 'the host answered but its receipt could not be parsed, so the outcome is unproven',
+        });
       }
       if (receipt?.accepted === true) return ok({ receipt: 'accepted' });
       // `accepted: false` carries WHY, and the why is not one thing. Collapsing every refusal into
@@ -474,13 +536,21 @@ export class DshHostAdapter {
       }
       return ok({ receipt: 'unclassified', reason });
     } catch (error) {
+      // A timeout and a dropped connection are the SAME question here, and the question is whether the
+      // answer could have reached the Host. Once bytes have been written it could, so the outcome is
+      // unproven — never "not sent", which would invite a caller to deliver the answer a second time.
       if (bytesWritten) {
         return uncertain('respond-transport-after-send', {
           rpcId,
+          reason: timedOut ? 'timeout-after-send' : 'transport-error-after-send',
           message: boundText(error instanceof Error ? error.message : String(error)),
         });
       }
       return refused(new BridgeError(ERROR_CODES.HOST_UNREACHABLE, `respond failed before send: ${boundText(error instanceof Error ? error.message : String(error))}`, {}));
+    } finally {
+      // The timer is cleared on EVERY path, not only the failing one: a live timer holds the event
+      // loop open and, in a long-lived daemon, one leaked per approval would be a slow leak of them.
+      clearTimeout(deadline);
     }
   }
 
@@ -544,9 +614,9 @@ export class DshHostAdapter {
    * @param options abort signal and frame bound
    * @returns the frame stream, the writers, and the handshake result
    */
-  openMux({ signal, maxFrameBytes = 1024 * 1024 }: DownlinkOptions = {}): Promise<WebSocketConnection> {
+  openMux({ signal, maxFrameBytes = 1024 * 1024, maxMessageBytes, maxQueueBytes }: DownlinkOptions = {}): Promise<WebSocketConnection> {
     const wsUrl = this.#baseUrl.replace(/^http/, 'ws') + '/api/events.mux';
-    return connectWebSocket({ url: wsUrl, signal, maxFrameBytes });
+    return connectWebSocket({ url: wsUrl, signal, maxFrameBytes, maxMessageBytes, maxQueueBytes });
   }
 
   /**
@@ -554,9 +624,9 @@ export class DshHostAdapter {
    * @param options abort signal and frame bound
    * @returns the frame stream, the writers, and the handshake result
    */
-  openHostStream({ signal, maxFrameBytes = 1024 * 1024 }: DownlinkOptions = {}): Promise<WebSocketConnection> {
+  openHostStream({ signal, maxFrameBytes = 1024 * 1024, maxMessageBytes, maxQueueBytes }: DownlinkOptions = {}): Promise<WebSocketConnection> {
     const wsUrl = this.#baseUrl.replace(/^http/, 'ws') + '/api/events.host';
-    return connectWebSocket({ url: wsUrl, signal, maxFrameBytes });
+    return connectWebSocket({ url: wsUrl, signal, maxFrameBytes, maxMessageBytes, maxQueueBytes });
   }
 }
 

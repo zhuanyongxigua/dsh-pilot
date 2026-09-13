@@ -17,13 +17,30 @@ import { BridgeError, ERROR_CODES } from './errors.ts';
 /** The environment surface this module reads: `process.env` by default, or a test's own map. */
 export type EnvSource = Readonly<Record<string, string | undefined>>;
 
-/** Bounds the daemon applies to pages, frames and waits. */
+/**
+ * Bounds the daemon applies to pages, frames, messages and waits.
+ *
+ * The three event bounds are separate quantities, not one number in three spellings, and each has a
+ * different owner: `eventPageMax` is how many events a reply may carry, `eventPageMaxBytes` is how
+ * large that reply may be, `eventMessageMaxBytes` is the largest single downlink message the
+ * connection will assemble, and `eventBufferMaxBytes` is the most memory this process will hold for
+ * frames it has parsed but not yet consumed.
+ */
 export interface ConfigLimits {
   readonly eventPageMax: number;
+  readonly eventPageMaxBytes: number;
+  readonly eventMessageMaxBytes: number;
+  readonly eventBufferMaxBytes: number;
   readonly frameMaxBytes: number;
   readonly waitDefaultMs: number;
   readonly waitMaxMs: number;
   readonly compactResultBytes: number;
+  /**
+   * The unary deadline, including the one on `/api/respond`. It is here rather than hard-coded in the
+   * adapter because a bound that cannot be set cannot be tested at the size the test needs, and a
+   * 15-second deadline is only reachable in a test by waiting 15 seconds.
+   */
+  readonly hostTimeoutMs: number;
 }
 
 /** Resolved configuration. Every field has an environment variable and an explicit default. */
@@ -55,10 +72,14 @@ export function resolveConfig(env: EnvSource = process.env): ResolvedConfig {
     scratchRoot: env.DSH_PILOT_SCRATCH || join(tmpdir(), 'dsh-pilot'),
     limits: {
       eventPageMax: numberOr(env.DSH_PILOT_EVENT_PAGE_MAX, 200),
+      eventPageMaxBytes: numberOr(env.DSH_PILOT_EVENT_PAGE_MAX_BYTES, 256 * 1024),
+      eventMessageMaxBytes: numberOr(env.DSH_PILOT_EVENT_MESSAGE_MAX_BYTES, 4 * 1024 * 1024),
+      eventBufferMaxBytes: numberOr(env.DSH_PILOT_EVENT_BUFFER_MAX_BYTES, 32 * 1024 * 1024),
       frameMaxBytes: numberOr(env.DSH_PILOT_FRAME_MAX_BYTES, 1024 * 1024),
       waitDefaultMs: numberOr(env.DSH_PILOT_WAIT_DEFAULT_MS, 30_000),
       waitMaxMs: numberOr(env.DSH_PILOT_WAIT_MAX_MS, 120_000),
       compactResultBytes: numberOr(env.DSH_PILOT_RESULT_MAX_BYTES, 64 * 1024),
+      hostTimeoutMs: numberOr(env.DSH_PILOT_HOST_TIMEOUT_MS, 15_000),
     },
   };
 }
