@@ -595,7 +595,27 @@ export class DshHostAdapter {
         });
       }
       if (settled.status !== 200) {
-        return refused(new BridgeError(ERROR_CODES.HOST_REFUSED, `respond answered HTTP ${settled.status}`, { status: settled.status }));
+        // An HTTP status is itself proof that the request was SENT: a response cannot arrive before
+        // the request left, so "provably not applied" is unavailable here, exactly as it is for the
+        // unreadable receipt below. This used to return `HOST_REFUSED`, which a caller reports as a
+        // definite refusal — telling an operator that an answer the Host may well have applied never
+        // arrived. Classifying it as `uncertain` is the same rule the rest of this post-send path
+        // follows. The `bytesWritten` guard is kept anyway, so a status observed without an
+        // established connection still reports a pre-send refusal rather than an unproven delivery.
+        if (!bytesWritten) {
+          return refused(new BridgeError(ERROR_CODES.HOST_UNREACHABLE, `respond answered HTTP ${settled.status} before the request was sent`, { status: settled.status }));
+        }
+        return uncertain('respond-status-after-send', {
+          rpcId,
+          // Named `httpStatus`, NOT `status`: the shaper merges details onto the result, and a detail
+          // called `status` overwrote the Result's own `status` — which is the classification. The
+          // measurement that caught it: this branch, correctly written, came back as `status: 500`,
+          // `result.uncertain` was false, and the daemon reported a definite REFUSAL for an answer the
+          // Host had taken. The field is renamed so the two meanings cannot collide again, and the
+          // shaper now assigns its own status last so a future detail cannot do it either.
+          httpStatus: settled.status,
+          note: 'the answer was sent and the host answered with a non-200 status, so delivery is unproven',
+        });
       }
       let receipt: RespondReceipt;
       try {

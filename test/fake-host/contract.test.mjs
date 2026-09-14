@@ -174,6 +174,42 @@ export default {
         const state = third.operation?.state;
         assert.ok(['refused', 'uncertain'].includes(state), `unexpected non-session outcome: ${JSON.stringify(third)}`);
       }
+
+      // The retry path directly, which is what this case is named for. The answer to a create is dropped,
+      // so the operation ends `uncertain` with NO session row, and the SAME logical create is retried. The
+      // two attempts are then compared ON THE WIRE, because that is where the idempotency lives: a retry
+      // that mints a fresh id asks the Host for a SECOND session, so one logical session silently becomes
+      // two and the caller loses the original turn history.
+      //
+      // These two assertions are the negative controls for `session-create-id-not-reused-on-retry`
+      // (production) and `fake-host-ignores-preallocated-session-id` (fixture). Both mutations were
+      // previously caught here only as a side effect of the missing-session defect — a create that
+      // reported `ok` with `session: null` — so fixing that defect removed the oracle until this was
+      // added. The property needs an oracle of its own, and this is it.
+      const beforeRetry = host.requestsFor('session.create').length;
+      host.dropResponseFor('session.create');
+      const uncertainStart = await ipc.request({
+        op: 'session.start', taskId: task.task.taskId, clientKey: 'k3', cwd: workspace,
+      });
+      assert.equal(uncertainStart.operation?.state, 'uncertain',
+        `a create whose answer was dropped must be reported uncertain, never as a success: ${JSON.stringify(uncertainStart)}`);
+      assert.equal(uncertainStart.session, null, 'no session may be invented before the Host has been heard from');
+      host.stopDropping('session.create');
+      const retried = /** @type {{session?: {hostSessionId?: string}, failed?: string}} */ (
+        // Caught immediately rather than at the await: without the retry-state fix the daemon refuses its
+        // own retry, dies, and this request rejects when the socket closes.
+        await ipc.request({ op: 'session.start', taskId: task.task.taskId, clientKey: 'k3', cwd: workspace })
+          .catch((error) => ({ failed: String(error?.message ?? error) }))
+      );
+      assert.equal(retried.failed, undefined, `the retry must be answered: ${JSON.stringify(retried)}`);
+      assert.ok(retried.session, `the retry must attach to the session it created: ${JSON.stringify(retried)}`);
+      const attempts = host.requestsFor('session.create').slice(beforeRetry)
+        .map((request) => request.payload?.sessionId);
+      assert.equal(attempts.length, 2, `the retry must appear as a second attempt on the wire: ${JSON.stringify(attempts)}`);
+      assert.equal(attempts[0], attempts[1],
+        'a retry must reuse the preallocated Host session id, or one logical session becomes two Host sessions');
+      assert.equal(retried.session.hostSessionId, attempts[0],
+        'the recorded id must be the id the Host was asked for, so the next retry reuses it');
     } finally {
       await teardown();
     }

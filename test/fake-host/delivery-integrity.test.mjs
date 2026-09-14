@@ -160,6 +160,82 @@ export default {
     }
   },
 
+  'FR-EV-4 a gap wider than one history page is reconciled by following beforeSeq, so the sweep is never silently partial': async () => {
+    const { host, ipc, daemon, teardown } = await rig('history-refetch-pages');
+    try {
+      const task = await ipc.request({ op: 'task.ensure', clientKey: 'history-pages' });
+      const { taskId } = task.task;
+      const started = await ipc.request({
+        op: 'session.start', taskId, clientKey: 'history-pages-session',
+      });
+      const { sessionId, hostSessionId } = started.session;
+
+      // More events missed than ONE page holds. The daemon asks for `eventPageMax` (200) messages per
+      // request, so 250 history-only events need a second page to be recovered at all. None of them is
+      // broadcast, so the refetch is their only route into the store — and with a single-page sweep the
+      // newest 200 arrive while the OLDEST ones, the far end of the very gap the sweep exists to close,
+      // are dropped in silence: the cursor then describes the stored rows as a complete run and the
+      // omitted events are unreachable forever. Following `beforeSeq` while `hasMore` is what this case
+      // pins; it fails on the single-page form and passes on the loop.
+      const missedSeqs = [];
+      for (let index = 0; index < 250; index += 1) {
+        const recorded = host.recordSessionEvent(hostSessionId, {
+          type: 'user/message',
+          text: `recorded-while-down-${index}`,
+        });
+        missedSeqs.push(Number(recorded.seq));
+      }
+      const oldest = Math.min(...missedSeqs);
+
+      host.dropDownlinks();
+      await waitFor(async () => {
+        const state = await ipc.request({ op: 'session.state', taskId, sessionId });
+        return state.connection === 'ready';
+      }, { timeoutMs: 15000, what: 'the downlink to be re-established' });
+
+      // Read the store through the SAME cursor API a client uses, paging back with `beforeSeq`, so the
+      // assertion is about what the bridge serves rather than about an internal table.
+      /** Collect stored events from the newest page backwards until the oldest missed one is seen. */
+      const collectStored = async () => {
+        const seen = new Set();
+        let beforeSeq = null;
+        for (let page = 0; page < 8; page += 1) {
+          const reply = await ipc.request({
+            op: 'session.events', taskId, sessionId, limit: 200,
+            ...(beforeSeq === null ? {} : { beforeSeq }),
+          });
+          const events = reply.events ?? [];
+          for (const event of events) seen.add(Number(event.seq));
+          if (!events.length) break;
+          const oldestHere = Math.min(...events.map((event) => Number(event.seq)));
+          if (seen.has(oldest)) break;
+          if (beforeSeq !== null && oldestHere >= beforeSeq) break;
+          beforeSeq = oldestHere;
+        }
+        return seen;
+      };
+
+      await waitFor(async () => (await collectStored()).has(oldest), {
+        timeoutMs: 20000,
+        what: 'the oldest missed event to arrive from an older history page',
+      });
+
+      const stored = await collectStored();
+      const omitted = missedSeqs.filter((seq) => !stored.has(seq));
+      assert.deepEqual(omitted, [],
+        `every missed event must be recovered, not only the newest page: ${omitted.length} of `
+        + `${missedSeqs.length} were never stored (oldest omitted ${omitted.length ? Math.min(...omitted) : 'none'})`);
+      assert.equal(stored.has(oldest), true,
+        'the OLDEST missed event is the one a single-page refetch drops, so it must be present');
+
+      const health = await ipc.request({ op: 'health' });
+      assert.ok(health.eventStats.historyTruncations >= 1,
+        'the sweep must count the pages the Host truncated rather than reporting a silent partial sweep');
+    } finally {
+      await teardown();
+    }
+  },
+
   'the fixture records the event it broadcasts, so history and the live stream agree': async () => {
     // The fidelity property the recovery case depends on. Without it the fixture's history is a
     // mirror of the live stream and no test can distinguish a working refetch from a broken one —

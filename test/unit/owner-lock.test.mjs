@@ -17,7 +17,7 @@
  * check, or a leases table would pass question 1's neighbours and fail this one.
  */
 
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -192,6 +192,86 @@ export default {
       } finally {
         if (outcome === null) contender.kill('SIGKILL');
       }
+    } finally {
+      holder.release();
+      s.cleanup();
+    }
+  },
+
+  /**
+   * The ORDER: ownership is decided before the state store is opened.
+   *
+   * Why the order is the finding and not a detail: opening the store creates the state directory, runs
+   * the DDL and applies migrations, so a contender that opened first would have already written to a
+   * schema it does not own before being told it is not the owner — a refusal that damages the owner's
+   * state is not a refusal.
+   *
+   * The oracle is the TYPED exit the contender reports, and it discriminates because the state file
+   * planted here cannot be opened at all: if the store were opened first, the refusal would be a
+   * storage refusal (exit 5); with ownership first it is the ownership refusal (exit 4). The control
+   * below runs the SAME unopenable state file with NO owner holding the lock and asserts the storage
+   * exit, so "exit 4" cannot be produced by the file merely being unreadable. The state file's bytes
+   * are also compared before and after: a migration would have rewritten them.
+   */
+  'FR-OWN-1 the owner lock is taken before the state store is opened, so a refused contender cannot touch the schema': async () => {
+    const s = scratch('lock-before-store');
+    const stateDir = join(s.dir, 'state');
+    mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+    const statePath = join(stateDir, 'state.sqlite');
+    // Not a database at all. Any attempt to OPEN the store fails loudly, which is what turns the two
+    // possible orders into two different observable exits.
+    writeFileSync(statePath, 'this file is not a sqlite database\n');
+    const planted = readFileSync(statePath);
+    const holder = new OwnerLock({ lockPath: join(stateDir, 'owner.lock.sqlite') });
+    try {
+      assert.equal(holder.tryAcquire().acquired, true, 'the test must own the state directory first');
+      /** Spawn one contender and wait for its exit, reporting the code and everything it said. */
+      const runContender = async (dir) => {
+        const { spawn } = await import('node:child_process');
+        const child = spawn(process.execPath, ['dist/bin/dsh-pilot-daemon.js', '--state-dir', dir], {
+          cwd: ROOT,
+          env: { ...process.env, DSH_PILOT_HOST: 'http://127.0.0.1:1' },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let stderr = '';
+        child.stderr.setEncoding('utf8');
+        child.stderr.on('data', (chunk) => { stderr += chunk; });
+        let outcome = /** @type {{code: number|null, signal: string|null}|null} */ (null);
+        child.on('close', (code, signal) => { outcome = { code, signal }; });
+        const deadline = Date.now() + 20_000;
+        while (outcome === null && Date.now() < deadline) {
+          await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
+        }
+        if (outcome === null) {
+          child.kill('SIGKILL');
+          throw new Error(`the contender never exited within 20s; stderr=${stderr.slice(0, 200)}`);
+        }
+        return { outcome, stderr };
+      };
+
+      const refused = await runContender(stateDir);
+      assert.equal(refused.outcome.code, 4,
+        `a contender that does not own the directory must report the OWNERSHIP refusal (exit 4), not a `
+        + `storage refusal from having opened the state file first: got ${JSON.stringify(refused.outcome)} `
+        + `stderr=${refused.stderr.slice(0, 300)}`);
+      assert.match(refused.stderr, /OWNER_HELD/,
+        `the refusal must name ownership; stderr=${JSON.stringify(refused.stderr.slice(0, 300))}`);
+      assert.equal(readFileSync(statePath).equals(planted), true,
+        'the refused contender must leave the owner\'s state file byte-for-byte alone; a migration would '
+        + 'have rewritten it');
+
+      // The control: same unopenable file, no owner. This proves the exit code above is evidence of the
+      // ORDER rather than of the file being unopenable, and that the storage path is still reachable.
+      const controlDir = join(s.dir, 'control-state');
+      mkdirSync(controlDir, { recursive: true, mode: 0o700 });
+      writeFileSync(join(controlDir, 'state.sqlite'), 'this file is not a sqlite database\n');
+      const unowned = await runContender(controlDir);
+      assert.equal(unowned.outcome.code, 5,
+        `with no owner, the same unopenable state file must surface as the STORAGE refusal (exit 5), `
+        + `which is what makes exit 4 above meaningful: got ${JSON.stringify(unowned.outcome)} `
+        + `stderr=${unowned.stderr.slice(0, 300)}`);
+      assert.doesNotMatch(unowned.stderr, /OWNER_HELD/,
+        `the control must not report ownership; stderr=${JSON.stringify(unowned.stderr.slice(0, 300))}`);
     } finally {
       holder.release();
       s.cleanup();

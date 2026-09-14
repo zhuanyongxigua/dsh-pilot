@@ -182,6 +182,39 @@ export default {
     }
   },
 
+  'FR-APPR-4 a non-200 status after the answer was sent is an unproven delivery, not a refusal': async () => {
+    const r = await rig('status');
+    try {
+      const { interactionId, approval } = await r.raiseApproval();
+      // The status alone used to decide the classification, and a Host that takes the answer and then
+      // answers `500` — because its own downstream failed, because a proxy in front of it did — was
+      // reported to the caller as a definite REFUSAL. That is the one report this path must never
+      // invent: it says the answer never arrived, while the Host has it. A status is proof the request
+      // was SENT, so delivery is unproven, exactly as for an unreadable receipt.
+      r.host.respondWithRaw(500, '{"error":"the host failed after taking the answer"}');
+      const reply = await decide(r, interactionId);
+
+      assert.equal(r.host.respondReceipts.length, 1,
+        'the control: the Host really did take the answer before answering 500');
+      assert.equal(r.host.respondReceipts[0].rpcId, approval.rpcId,
+        'and the answer it took is this interaction\'s');
+      assert.equal(reply.error, undefined,
+        `the decision itself must still be reported, got ${JSON.stringify(reply.error)}`);
+      assert.equal(reply.receipt, 'uncertain',
+        `a non-200 after send leaves the outcome unproven, never a refusal: got ${JSON.stringify(reply.receipt)} (${reply.note})`);
+      assert.equal(reply.delivered, false, 'and an unproven delivery is not a delivery');
+      assert.notEqual(reply.receipt, 'refused',
+        'the caller must not be told the answer failed to arrive when the Host took it');
+      const row = await deliveryOf(r, interactionId);
+      assert.equal(row?.delivery?.state, 'uncertain',
+        `the durable record must say unproven rather than not-reached, got ${JSON.stringify(row?.delivery)}`);
+      // The other half of the requirement: a PROVABLE pre-send failure is still a refusal. That is the
+      // case below, which asserts the distinction this case must not erase.
+    } finally {
+      await r.teardown();
+    }
+  },
+
   'FR-APPR-4 a failure before any byte is written is still a provable refusal, and is distinguishable from the unproven case': async () => {
     const r = await rig('before-send');
     try {

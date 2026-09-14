@@ -1079,7 +1079,16 @@ export class Store {
     return this.write(() => {
       const op = this.get<OperationRow>('select * from operations where operation_id = ?', operationId);
       if (!op) throw new BridgeError(ERROR_CODES.NOT_FOUND, 'operation not found', { operationId });
-      if (op.state !== 'pending') {
+      // `pending` is a first attempt and `uncertain` is an allowed RETRY, and both mean the same thing
+      // at this boundary: bytes are about to be written again under an operation whose outcome is not
+      // yet settled. `uncertain` is admitted here because the alternative is a durable lie — the retry
+      // would send while the row still said "outcome unknown", and then `markAcknowledged`, which
+      // requires `dispatching` or `sent`, would throw ILLEGAL_TRANSITION on the very response that
+      // resolves the uncertainty. The retry itself is authorised by the CALLER, not by this method:
+      // only `session.create` is ever retried, because only it accepts a caller-preallocated id that
+      // makes a second attempt idempotent (see `#dispatch`'s `allowedStates`). States that have already
+      // been settled — `succeeded`, `refused` — or that are already mid-flight stay illegal.
+      if (op.state !== 'pending' && op.state !== 'uncertain') {
         throw new BridgeError(
           ERROR_CODES.ILLEGAL_TRANSITION,
           `cannot start dispatch from state ${op.state}`,

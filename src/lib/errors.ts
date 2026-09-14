@@ -182,8 +182,13 @@ export class Result {
    * @param fields status-specific fields
    */
   constructor(status: ResultStatus, fields: Record<string, unknown> = {}) {
-    this.status = status;
+    // Fields FIRST, then the classification, so a detail cannot rewrite `status`. That is not
+    // hypothetical: a caller passing `{status: <http status>}` as an `uncertain(...)` detail produced
+    // `status: 500`, `result.uncertain` read false, and the caller reported a definite REFUSAL for a
+    // delivery that was merely unproven — the one misreading this surface exists to prevent. The
+    // classification is what every branch tests, so it is assigned last and wins.
     Object.assign(this, fields);
+    this.status = status;
   }
   get ok(): boolean { return this.status === 'ok'; }
   get uncertain(): boolean { return this.status === 'uncertain'; }

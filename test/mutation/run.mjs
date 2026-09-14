@@ -60,7 +60,7 @@ const MUTATIONS = [
     protects: 'durable intent: the intent reaches disk before the network write',
     why: 'Persisting the intent AFTER the network write would make a crash mid-send invisible, so "sent, outcome unknown" would silently disappear.',
     file: 'src/lib/daemon.ts',
-    find: `    if (freshRow.state === 'pending') {
+    find: `    if (freshRow.state === 'pending' || freshRow.state === 'uncertain') {
       this.#store.markDispatching({
         operationId: freshRow.operation_id,
         method,
@@ -226,9 +226,17 @@ const MUTATIONS = [
     protects: 'session identity survives a retry: one logical session is one Host session',
     why: 'Generating a FRESH host session id on every attempt makes a retry ask for a second Host session, so one logical session silently becomes two and the caller loses the original turn history.',
     file: 'src/lib/daemon.ts',
-    find: `    const hostSessionId = typeof storedSessionId === 'string' ? storedSessionId : \`session-\${randomUUID()}\`;`,
-    replace: `    // MUTATION: the stored preallocated id is ignored, so every attempt mints a new Host session.
-    const hostSessionId = \`session-\${randomUUID()}\`;`,
+    // This control moved one line DOWN on purpose, and the reason is a measurement, not a preference.
+    // It used to anchor on the `hostSessionId` fallback: ignoring it made a reattach report `ok` with
+    // `session: null`, and the fake-host retry case caught it by accident. Once a create whose session
+    // row was missing could be reconstructed from its own durable acknowledgement (review-1108, P1),
+    // ignoring that fallback stopped changing any outcome — the mutation became a no-op and its control
+    // survived a full sweep (28/30). The defect it names lives on the line that decides what a retry
+    // SENDS, which is the stored request, so the anchor moved there and the case grew the two wire-level
+    // assertions that catch it (docs/test-matrix.md section 13).
+    find: `    const requestBody = storedRequest ?? { sessionId: hostSessionId, ...(resolvedCwd ? { cwd: resolvedCwd } : {}), ...(agentPreset ? { agentPreset } : {}) };`,
+    replace: `    // MUTATION: the retry does not reuse the stored request, so every attempt asks for a NEW Host session.
+    const requestBody = { sessionId: \`session-\${randomUUID()}\`, ...(resolvedCwd ? { cwd: resolvedCwd } : {}) };`,
     target: 'test/fake-host',
     expectFailure: 'idempotently',
   },

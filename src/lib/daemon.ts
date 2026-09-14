@@ -26,9 +26,10 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { mkdirSync } from 'node:fs';
 import { BridgeError, ERROR_CODES, toBridgeError, type Result } from './errors.ts';
 import { assertIdKind, createDigest, isIdempotencyKey, mintId, payloadDigest } from './ids.ts';
-import { Store } from './store.ts';
+import { Store, mapSqliteError } from './store.ts';
 import type {
   CursorRow,
   EventCoverage,
@@ -79,6 +80,17 @@ interface AdapterCallResult {
   readonly error?: { readonly code?: string; readonly message?: string; readonly details?: object };
   readonly reason?: string | null;
 }
+
+/**
+ * How many history pages one reconnect sweep will follow per session, newest page first.
+ *
+ * Deliberately NOT a tunable in `DEFAULT_LIMITS`: it bounds a reconciliation loop rather than a
+ * message, and it exists to make the loop provably finite when a peer keeps reporting `hasMore`. The
+ * strict-progress check in `refetchHistoryForKnownSessions` is the real defence; this is the ceiling
+ * behind it. Sized so a legitimate gap — far larger than any page the Host returns — is still filled
+ * in one sweep, while a pathological peer cannot turn a reconnect into unbounded traffic.
+ */
+const HISTORY_REFETCH_MAX_PAGES = 64;
 
 /** Default tunable limits (initial values from the design; all overridable). */
 export const DEFAULT_LIMITS = Object.freeze({
@@ -209,8 +221,48 @@ export class Daemon {
   }) {
     this.#stateDir = stateDir;
     this.#limits = { ...DEFAULT_LIMITS, ...limits };
+    // The DIRECTORY is created here, and only the directory: the lock file lives inside it, so a state
+    // directory that does not exist yet cannot be locked, and this is where `Store` used to create it.
+    // Creating a directory is not touching a schema — the ordering claim below is about the store's
+    // open, DDL and migrations, none of which happen here.
+    mkdirSync(stateDir, { recursive: true, mode: 0o700 });
     this.#lock = new OwnerLock({ lockPath: `${stateDir}/owner.lock.sqlite` });
-    this.#store = new Store({ stateDir });
+    // Ownership is taken BEFORE the store is opened, and the order is the whole point of this block.
+    // Constructing the store creates the state directory, runs the DDL and applies migrations, so a
+    // contender that opened first would have already mutated a schema it does not own — and a refusal
+    // has to be observable as the refusal it is (OWNER_HELD), not as collateral damage to another
+    // process's state file. The typed error still surfaces from the same startup boundary:
+    // `dsh-pilot-daemon` wraps construction and `start()` together and maps OWNER_HELD to exit 4, so a
+    // supervisor sees no change. `start()` keeps its own `acquire()` — idempotent on a held lock — as
+    // the ownership assertion for callers that construct a Daemon without starting it.
+    const ownership = this.#lock.tryAcquire();
+    if (!ownership.acquired) {
+      // `busy`/`locked` is the ONLY reason that means another process holds this state directory.
+      // Every other failure means the directory itself cannot be used — unwritable, unreadable, or a
+      // runtime with no usable SQLite — and calling THAT "another process owns this state directory"
+      // sends an operator looking for a process that does not exist. Before ownership moved ahead of
+      // the store, the store's own open produced this classification; taking the lock first must not
+      // change what a caller is told, so a non-ownership failure goes through the same SQLite
+      // classifier the store uses. Held by a test: `persistence/storage-failure::EACCES at startup`.
+      const reason = ownership.reason ?? 'unknown';
+      if (reason !== 'busy') {
+        throw mapSqliteError(
+          new Error(reason.startsWith('error:') ? reason.slice('error:'.length) : reason),
+          'opening state',
+        );
+      }
+      // The canonical ownership refusal, thrown from the one place that owns its wording.
+      this.#lock.acquire();
+    }
+    this.#lock.writeMarker();
+    try {
+      this.#store = new Store({ stateDir });
+    } catch (error) {
+      // A daemon that never came up must not keep ownership: without this, a storage refusal would
+      // leave the lock held by an object that will never run, and this process could not retry.
+      this.#lock.release();
+      throw error;
+    }
     this.#adapter = new DshHostAdapter({
       baseUrl: hostBase,
       timeoutMs: this.#limits.hostTimeoutMs,
@@ -564,8 +616,45 @@ export class Daemon {
       }
       const current = this.#store.getOperation(operation.operation_id);
       this.#requireRow(current, 'state');
-      if (current.state === 'succeeded' || current.state === 'refused') {
-        return { session: null, operation: shapeOperation(current), reused: true, result: { status: current.state === 'succeeded' ? 'ok' : 'refused' } };
+      if (current.state === 'succeeded') {
+        // THE CRASH WINDOW this recovers: `#dispatch` durably recorded the Host's valid response
+        // (`succeeded`, with the response JSON), and the process died before
+        // `#recordSessionFromCreate` wrote the session row. The session exists on the Host under the
+        // idempotent id it was created with, so reporting `ok` with NO session told the caller a
+        // session had been created while leaving the durable row — and therefore every later
+        // reattach, prompt and cancel for it — unreachable. The row is reconstructed from the
+        // acknowledgement instead, which is the only source that can do it: the response carries the
+        // Host's own id when it named one, and the stored request carries the preallocated id and the
+        // resolved cwd the create was sent with.
+        const recordedResponse: unknown = current.response_json === null ? null : safeJson(current.response_json);
+        const responseHostId = this.#isPropertyBag(recordedResponse)
+          ? this.#str(recordedResponse, 'sessionId')
+          : null;
+        // A Host that answered with a DIFFERENT id than the preallocated one is looked up under that
+        // id too, so reconstruction cannot add a second row (and a second `session-created` audit
+        // entry) for a session that is already recorded under the id the Host chose.
+        const byResponseId = responseHostId === null
+          ? null
+          : this.#store.findSessionByHostId(responseHostId);
+        if (byResponseId) {
+          return { session: shapeSession(byResponseId), operation: shapeOperation(current), reused: true };
+        }
+        const storedCwd: unknown = storedRequest === null ? null : storedRequest['cwd'];
+        return {
+          ...this.#recordSessionFromCreate(
+            task.task_id,
+            recordedResponse,
+            hostSessionId,
+            typeof storedCwd === 'string' ? storedCwd : resolvedCwd,
+            operation.operation_id,
+          ),
+          reused: true,
+        };
+      }
+      if (current.state === 'refused') {
+        // A refusal is a settled outcome and has no session to recover: the Host declined before
+        // creating anything, so there is no row to reconstruct and no state to invent.
+        return { session: null, operation: shapeOperation(current), reused: true, result: { status: 'refused' } };
       }
       // pending / dispatching / uncertain: fall through and reuse the SAME stored request,
       // which the contract makes idempotent for a preallocated sessionId with the same cwd.
@@ -1682,7 +1771,14 @@ export class Daemon {
         ).toJSON(),
       };
     }
-    if (freshRow.state === 'pending') {
+    // `pending` is a first attempt; `uncertain` is a retry the CALLER has authorised (only
+    // `session.create` reaches here with it, because only it accepts a preallocated id that makes a
+    // second attempt idempotent). Both must be durably re-marked `dispatching` BEFORE the bytes go
+    // out, for two reasons that are both about not lying in the journal: a crash during the retry has
+    // to be swept back to `uncertain` like any other interrupted send, and `markAcknowledged` accepts
+    // only `dispatching`/`sent` — so a retry that skipped this step could not record the very response
+    // that resolved the uncertainty, and would fail with ILLEGAL_TRANSITION instead.
+    if (freshRow.state === 'pending' || freshRow.state === 'uncertain') {
       this.#store.markDispatching({
         operationId: freshRow.operation_id,
         method,
@@ -2211,56 +2307,80 @@ export class Daemon {
     for (const { task_id: taskId } of tasks) {
       for (const session of this.#store.listSessions(taskId)) {
         sessions += 1;
-        // Refetch the WHOLE history page rather than "after last_seq": after a gap the
-        // missing sequences are BELOW last_seq, and asking only for newer ones would make
-        // the hole permanent while looking successful.
-        const result = await this.#adapter.history({
-          sessionId: session.host_session_id,
-          maxMessages: this.#limits.eventPageMax,
-        });
-        if (result.status !== 'ok') continue;
-        // `result.value` IS the Host's page (see the same correction in `#dispatch`). Reading
-        // `result.value['value']` here was a key that never exists, so `page` was always `undefined`,
-        // `events` was always empty and this whole refetch stored nothing — a silent no-op that
-        // looked like working code and made the mux reconnect path decorative. The reconnect test
-        // passed for the wrong reason: the daemon's backoff reconnects fast enough that the event
-        // arrives live instead of needing history.
-        const page: unknown = result.value;
-        const events: readonly unknown[] = this.#isPropertyBag(page) && Array.isArray(page['events'])
-          ? page['events']
-          : [];
-        const hasMore = this.#isPropertyBag(page) && page['hasMore'] === true;
-        const observed: number[] = [];
-        for (const entry of events) {
-          const entryFields: Record<string, unknown> = this.#isPropertyBag(entry) ? entry : {};
-          const event = entryFields['event'];
-          const eventFields: Record<string, unknown> = this.#isPropertyBag(event) ? event : {};
-          const seq = Number(eventFields['seq']);
-          if (!Number.isFinite(seq)) continue;
-          observed.push(seq);
-          // The same single boundary as the live path, for the same reason: a row written by the
-          // refetch must be indistinguishable from the same row written live, or a crash-replay of
-          // the archive would reduce differently depending on which path happened to store it.
-          const normalisedEvent: unknown = redactInbound(event ?? null);
-          const inserted = this.#store.appendEvent({
-            taskId, sessionId: session.session_id, seq,
-            kind: String(eventFields['type'] ?? 'unknown'),
-            payload: { nativeType: eventFields['type'] ?? null, raw: normalisedEvent, source: 'history-refetch' },
+        // Refetch from the newest page backwards, following EVERY page the Host says it has more of.
+        //
+        // Why the whole history rather than "after last_seq": after a gap the missing sequences are
+        // BELOW last_seq, so asking only for newer ones would make the hole permanent while looking
+        // successful. Why the LOOP rather than one page: a single page only reconciles the newest
+        // window, so anything the Host truncated away — the older part of exactly the gap this sweep
+        // exists to fill — was silently omitted while `#recomputeCursor` went on to describe the
+        // stored rows as a complete run. Following `beforeSeq` while `hasMore` is what makes "below
+        // the first stored sequence" stop being a place a real hole can hide.
+        //
+        // Bounded three ways, so a hostile or broken peer cannot spin this loop: one page is capped by
+        // `eventPageMax` (the same bound the live path uses), the number of pages per session per
+        // sweep is capped, and every step must make strict progress — the next cursor is the OLDEST
+        // sequence observed, and a page that does not offer an older one ends the sweep instead of
+        // re-requesting the same window forever.
+        let beforeSeq: number | null = null;
+        let pages = 0;
+        for (;;) {
+          const result = await this.#adapter.history({
+            sessionId: session.host_session_id,
+            maxMessages: this.#limits.eventPageMax,
+            ...(beforeSeq === null ? {} : { beforeSeq }),
           });
-          if (inserted) {
-            appended += 1;
-            this.#applyEventToState(session.session_id, normalisedEvent);
+          if (result.status !== 'ok') break;
+          // `result.value` IS the Host's page (see the same correction in `#dispatch`). Reading
+          // `result.value['value']` here was a key that never exists, so `page` was always `undefined`,
+          // `events` was always empty and this whole refetch stored nothing — a silent no-op that
+          // looked like working code and made the mux reconnect path decorative. The reconnect test
+          // passed for the wrong reason: the daemon's backoff reconnects fast enough that the event
+          // arrives live instead of needing history.
+          const page: unknown = result.value;
+          const events: readonly unknown[] = this.#isPropertyBag(page) && Array.isArray(page['events'])
+            ? page['events']
+            : [];
+          const hasMore = this.#isPropertyBag(page) && page['hasMore'] === true;
+          const observed: number[] = [];
+          for (const entry of events) {
+            const entryFields: Record<string, unknown> = this.#isPropertyBag(entry) ? entry : {};
+            const event = entryFields['event'];
+            const eventFields: Record<string, unknown> = this.#isPropertyBag(event) ? event : {};
+            const seq = Number(eventFields['seq']);
+            if (!Number.isFinite(seq)) continue;
+            observed.push(seq);
+            // The same single boundary as the live path, for the same reason: a row written by the
+            // refetch must be indistinguishable from the same row written live, or a crash-replay of
+            // the archive would reduce differently depending on which path happened to store it.
+            const normalisedEvent: unknown = redactInbound(event ?? null);
+            const inserted = this.#store.appendEvent({
+              taskId, sessionId: session.session_id, seq,
+              kind: String(eventFields['type'] ?? 'unknown'),
+              payload: { nativeType: eventFields['type'] ?? null, raw: normalisedEvent, source: 'history-refetch' },
+            });
+            if (inserted) {
+              appended += 1;
+              this.#applyEventToState(session.session_id, normalisedEvent);
+            }
           }
+          if (!observed.length) break;
+          // Completeness is a pure function of the stored rows, so recomputing is enough — and
+          // it is the honest answer: a hole the refetch filled disappears, and a hole it did
+          // not fill stays reported. Recomputed after EVERY page, so the cursor never describes a
+          // sweep that is still in progress as though it had finished.
+          this.#recomputeCursor(taskId, session.session_id);
+          // A page the host truncated proves only that it returned less than we asked for. The
+          // store keeps whatever it holds and any hole inside it stays 'incomplete'; the
+          // truncation is counted so the reason is inspectable rather than invisible.
+          if (!hasMore) break;
+          this.#eventStats.historyTruncations += 1;
+          const oldest = Math.min(...observed);
+          if (beforeSeq !== null && oldest >= beforeSeq) break;
+          if (pages >= HISTORY_REFETCH_MAX_PAGES) break;
+          beforeSeq = oldest;
+          pages += 1;
         }
-        if (!observed.length) continue;
-        // Completeness is a pure function of the stored rows, so recomputing is enough — and
-        // it is the honest answer: a hole the refetch filled disappears, and a hole it did
-        // not fill stays reported.
-        this.#recomputeCursor(taskId, session.session_id);
-        // A page the host truncated proves only that it returned less than we asked for. The
-        // store keeps whatever it holds and any hole inside it stays 'incomplete'; the
-        // truncation is counted so the reason is inspectable rather than invisible.
-        if (hasMore) this.#eventStats.historyTruncations += 1;
       }
     }
     return { sessions, appended };
