@@ -1,0 +1,274 @@
+name: ci
+
+# Why this workflow exists: the project's reliability claims are only as good as the layers that
+# actually run. This runs the deterministic layers on both supported platforms, reports failed,
+# skipped and timed-out counts DISTINCTLY (collapsing them is how a skip becomes a fake pass),
+# and refuses to run the live layer at all — the live suite is opt-in and manual, because it
+# spends real model quota and must never gate a merge.
+#
+# The unprivileged case matters: a pull request from a fork gets no secrets and no write access,
+# so nothing here reads a credential value; the bridge only ever refers to a route by the NAME of
+# an environment variable, and this job proves the deterministic layers do not depend on one
+# being present.
+
+on:
+  push:
+    branches:
+      - 'codex/**'
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deterministic:
+    name: deterministic layers (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # Node 24's built-in SQLite is the storage engine, so there is no dependency to install.
+      # This assertion is the point: a runtime dependency appearing here would be a design
+      # regression, not an inconvenience.
+      - name: assert zero runtime dependencies
+        run: |
+          node -e "
+          const pkg = require('./package.json');
+          const deps = Object.keys(pkg.dependencies ?? {});
+          if (deps.length) { console.error('unexpected runtime dependencies:', deps.join(', ')); process.exit(1); }
+          console.log('runtime dependencies: none');
+          "
+
+      # The design adopts real typechecking, so a type error fails CI. Three configs, three different
+      # jobs: the build compiles the sources, the contract one compiles the protocol surface with the
+      # Node type surface REMOVED — which is what makes "contract code stays free of Node-only APIs" a
+      # build failure instead of a convention a reviewer has to notice — and the test config checks the
+      # test layer against the declarations the build emitted, which is the only way an oracle written
+      # against a drifted API can be caught.
+      - name: install dev tooling (types only; the runtime keeps zero dependencies)
+        run: npm ci
+
+      # The implementation is TypeScript SOURCE; `dist/` is the built artifact the tests and the
+      # `bin` entry points run. So the build happens first, and the three typecheck configs then
+      # verify the sources. The mutation runner uses `npm run typecheck` as its own eligibility gate,
+      # so a mutation that does not compile is reported as INVALID rather than as a survivor.
+      - name: build (TypeScript sources -> dist)
+        run: npm run build
+
+      - name: typecheck (all modules)
+        run: npm run typecheck
+
+      - name: typecheck (contract surface is Node-free)
+        run: npm run typecheck:contract
+
+      # Runs AFTER the build on purpose: this config consumes `dist/**/*.d.ts`, so a missing or
+      # stale build would make it check the test layer against nothing.
+      - name: typecheck (test layer against the emitted declarations)
+        run: npm run typecheck:tests
+
+      - name: storage engine reachable
+        run: |
+          node -e "
+          const sqlite = require('node:sqlite');
+          const db = new sqlite.DatabaseSync(':memory:');
+          console.log('sqlite', db.prepare('select sqlite_version() as v').get().v);
+          db.close();
+          "
+
+      - name: unit, property, fake-host, persistence, mcp-e2e, security
+        run: |
+          mkdir -p test-results
+          DSH_PILOT_JSON=test-results/report.json node test/run.mjs || status=$?
+          node -e "
+          const r = require('./test-results/report.json');
+          const c = r.counts;
+          console.log('passed=' + c.passed + ' failed=' + c.failed + ' skipped=' + c.skipped + ' timedOut=' + c.timedOut);
+          console.log('live suite: ' + r.liveSuite);
+          const lines = ['## deterministic layers (' + process.env.RUNNER_OS + ')', '',
+            '- passed: ' + c.passed, '- failed: ' + c.failed, '- skipped: ' + c.skipped,
+            '- timedOut: ' + c.timedOut, '- live suite: ' + r.liveSuite, '',
+            '| layer | passed | failed | skipped | timed-out |', '| --- | --- | --- | --- | --- |'];
+          for (const [layer, v] of Object.entries(r.layers)) {
+            lines.push('| ' + layer + ' | ' + v.passed + ' | ' + v.failed + ' | ' + v.skipped + ' | ' + v['timed-out'] + ' |');
+          }
+          if (r.layerNotes.length) { lines.push('', 'Layers not present in this build: ' + r.layerNotes.join('; ')); }
+          require('fs').appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join('\n') + '\n');
+          process.exit(c.failed > 0 || c.timedOut > 0 ? 1 : 0);
+          "
+          exit ${status:-0}
+
+      - name: negative controls (mutation)
+        run: |
+          DSH_PILOT_PROPERTY_ROUNDS=8 node test/mutation/run.mjs --json test-results/mutations.json || status=$?
+          node -e "
+          const r = require('./test-results/mutations.json');
+          console.log('mutations=' + r.mutations + ' caught=' + r.caught + ' survived=' + r.survived + ' invalid=' + r.invalid);
+          const lines = ['## negative controls (' + process.env.RUNNER_OS + ')', '',
+            '- mutations: ' + r.mutations, '- caught: ' + r.caught, '- survived: ' + r.survived,
+            '- invalid runs (mutation broke the build, or the run produced no tests): ' + r.invalid, '',
+            'Counts are split by KIND because the two prove different things: a production control shows',
+            'this bridge notices its own defect, while a fixture control only shows the fake Host is a',
+            'faithful stand-in and must never be reported as evidence about the bridge.', '',
+            '| mutation | kind | caught | protects | detail |', '| --- | --- | --- | --- | --- |'];
+          for (const m of r.results) lines.push('| ' + m.name + ' | ' + (m.kind ?? 'production') + ' | ' + (m.caught ? 'yes' : m.invalid ? 'INVALID' : 'NO') + ' | ' + (m.protects ?? '-') + ' | ' + String(m.detail).replace(/\\|/g, '\\\\|') + ' |');
+          const obligations = r.obligations ?? [];
+          const uncovered = obligations.filter((o) => !o.covered).map((o) => o.id);
+          lines.push('', 'Required obligations with a caught negative control: ' + (obligations.length - uncovered.length) + '/' + obligations.length);
+          if (uncovered.length) lines.push('NOT covered: ' + uncovered.join(', '));
+          require('fs').appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join('\n') + '\n');
+          process.exit(r.survived > 0 || r.invalid > 0 || uncovered.length > 0 ? 1 : 0);
+          "
+          exit ${status:-0}
+
+      - name: soak runner smoke (bounded, resume-verified)
+        run: node test/soak/run.mjs --smoke --minutes 1 --state-dir test-results/soak
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ matrix.os }}
+          path: test-results/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: report that the live suite was NOT run
+        if: always()
+        run: |
+          echo "The live suite was not run in this job." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "It is opt-in (manual \`workflow_dispatch\` or a local run with \`--live\`), it spends real" >> "$GITHUB_STEP_SUMMARY"
+          echo "provider quota, and its absence must be read as SKIPPED, never as passing." >> "$GITHUB_STEP_SUMMARY"
+
+  package-shape:
+    name: package shape and secret hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: no credential material in tracked files
+        run: |
+          # This job reads no secret. It only checks that none was committed.
+          if git grep -nIE '(sk-[A-Za-z0-9]{20,}|api[_-]?key[[:space:]]*[:=][[:space:]]*["'"'"'][^"'"'"']{12,}|Bearer[[:space:]]+[A-Za-z0-9._-]{20,})' -- . ':!test/security' ':!docs' ':!AGENTS.md'; then
+            echo "credential-shaped material found in tracked files" >&2
+            exit 1
+          fi
+          echo "no credential-shaped literals in tracked sources or tests"
+
+      - name: no company endpoint or hostname in tracked files
+        run: |
+          # Endpoints belong in the operator's environment, never in this repository.
+          if git grep -nIE 'https?://[a-z0-9.-]*(chaitin|baizhi)[a-z0-9.-]*' -- . ':!.local'; then
+            echo "an internal endpoint or hostname appears in tracked files" >&2
+            exit 1
+          fi
+          echo "no internal endpoints in tracked files"
+
+      # The pack check BUILDS, and the build needs `typescript` and `@types/node`, so the dev
+      # tooling has to be installed here too. Without this the step fails with
+      # `TS2688: Cannot find type definition file for 'node'`, which is what this job did on its
+      # first run after the sources became TypeScript — a failure of the workflow, not of the
+      # package, and worth the comment so it is not re-learned.
+      - name: install dev tooling (types only; the runtime keeps zero dependencies)
+        run: npm ci
+
+      - name: npm pack contents are the declared files only
+        run: |
+          npm run build
+          npm pack --dry-run 2>&1 | tail -30
+
+  # The opt-in half of the original gate: a REAL DSH Host with the model route closed to a loopback mock
+  # provider, where a tool call really executes and the file it writes is the oracle. That case fails on the
+  # macOS development host (sandbox-exec: sandbox_apply: Operation not permitted) and the whole layer is
+  # skipped by the matrix jobs above, because it is opt-in — so this job exists to give that one piece of
+  # evidence a place to run on Linux.
+  #
+  # A separate job on purpose. `isolated-host` (the job id) is not one of the three required checks, so the
+  # required names and their content are untouched and a sandbox limitation on one platform cannot look like
+  # a broken deterministic suite. `name:` is display text; the id above is what Actions keys on.
+  #
+  # The Host is installed HERE, ephemerally and pinned, and is NOT a dependency of this package: the bridge
+  # keeps zero runtime dependencies, and `npm i --no-save` leaves the manifest and the lockfile untouched.
+  # The version is asserted rather than assumed, because testing against a different Host than the one under
+  # study would silently change the subject.
+  #
+  # No credential is read, referenced or needed: the mock provider is a local fixture and the value it uses
+  # is synthetic, assembled at runtime. Nothing here contacts port 3080; the rig boots its own Host in its
+  # own DSH_HOME on an OS-assigned port.
+  isolated-host:
+    name: isolated host (ubuntu-latest, real Host + mock provider)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: install dev tooling (types only; the runtime keeps zero dependencies)
+        run: npm ci
+
+      - name: build (TypeScript sources -> dist)
+        run: npm run build
+
+      - name: install the pinned Host, ephemerally (test-only; not a runtime dependency)
+        run: |
+          npm i --no-save --no-audit --no-fund @deepseek-ai/dsh@0.1.1-rc.2
+          node -e "
+            const p = require('@deepseek-ai/dsh/package.json');
+            if (p.version !== '0.1.1-rc.2') {
+              console.error('refusing to test against Host ' + p.version + ': the pin is 0.1.1-rc.2');
+              process.exit(1);
+            }
+            console.log('pinned host: ' + p.name + '@' + p.version);
+          "
+          HOST_BIN="$(node -p "require('node:path').join(require('node:path').dirname(require.resolve('@deepseek-ai/dsh/package.json')),'lib','bin.js')")"
+          test -f "$HOST_BIN" || { echo "the pinned Host binary was not found at $HOST_BIN"; exit 1; }
+          echo "DSH_PILOT_DSH_BIN=$HOST_BIN" >> "$GITHUB_ENV"
+
+      - name: report the Linux sandbox capability (read-only; NO policy is changed)
+        run: |
+          {
+            echo '## Linux sandbox capability and the pinned Host'
+            echo "- runner: $(uname -s) $(uname -r), $(uname -m), node $(node --version)"
+            if command -v bwrap >/dev/null 2>&1; then echo "- bwrap: $(bwrap --version)"; else echo '- bwrap: NOT found (the provider probes it and falls through to the Landlock launcher)'; fi
+            echo "- securityfs: $(ls /sys/kernel/security/ 2>/dev/null || echo 'not mounted')"
+            echo "- landlock platform package: $(ls -d node_modules/@deepseek-ai/node-addon-landlock-run* node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/node-addon-landlock-run* 2>/dev/null | tr '\n' ' ' || echo 'not seen at the usual install paths')"
+            echo "- pinned host: $(node -p "require('@deepseek-ai/dsh/package.json').name + '@' + require('@deepseek-ai/dsh/package.json').version")"
+            echo
+            echo 'Whether a Linux backend can actually confine here is DETERMINED BY THE RUN, not claimed in'
+            echo 'advance. This step only records what the runner looks like; it changes no sysctl, no AppArmor'
+            echo 'profile, no seccomp policy, adds no capability and uses no unconfined fallback. If neither'
+            echo 'backend is usable, the layer reports the Host own SANDBOX_UNAVAILABLE message and the case'
+            echo 'FAILS rather than passing quietly.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: isolated official Host, mock provider (confined tool effect is the oracle)
+        run: node test/run.mjs test/isolated-host --isolated
+
+      - name: report that the live suite was NOT run
+        if: always()
+        run: |
+          {
+            echo ''
+            echo 'The live layer was NOT selected and no paid model quota was spent by this job: it runs the'
+            echo 'isolated layer only, with the provider route closed to a loopback fixture.'
+          } >> "$GITHUB_STEP_SUMMARY"

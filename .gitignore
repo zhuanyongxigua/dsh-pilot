@@ -1,0 +1,30 @@
+# Local scratch — worker-owned, never committed.
+# Status/evidence produced for the coordinator lives here and stays out of git.
+.local/
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Test and tool artifacts
+coverage/
+.nyc_output/
+test-results/
+artifacts/
+*.log
+
+# Local runtime state
+*.sqlite
+*.sqlite-journal
+*.db
+crash-dumps/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Dependency trees (the lockfile is committed; node_modules is not)
+node_modules/
